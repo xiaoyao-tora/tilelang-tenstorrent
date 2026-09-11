@@ -17,7 +17,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `cutedsl` | NVIDIA CUTLASS/CuTe DSL backend. Requires `nvidia-cutlass-dsl`. |
 | `hip` | AMD GPUs via ROCm. Use a config dict for options such as `{"kind": "hip", "mcpu": "gfx90a"}`. |
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
-| `tenstorrent` | Tenstorrent devices. Requires an explicit `arch` of `wormhole_b0` or `blackhole`; registration only, with TTL codegen not implemented yet. |
+| `tenstorrent` | Tenstorrent devices. Requires an explicit `arch` of `wormhole_b0` or `blackhole`; the Phase 0 compiler contract is frozen, while Device TIR lowering and TTL codegen are not implemented. |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
 | `webgpu` | Browser / WebGPU runtimes. |
 | `c` | Emit plain C source for inspection or custom toolchains. |
@@ -52,7 +52,10 @@ invalid attributes are rejected when TVM constructs the target.
 
 Tenstorrent targets accept only the `tenstorrent` target key and require an explicit `arch` of `wormhole_b0` or
 `blackhole`. They are not included in `auto` detection. The backend route and `ttnn` execution contract are
-registered, but compiling a kernel currently fails explicitly because TTL source generation is not implemented.
+registered. The Phase 0 schema, pass order, frontend examples, and direct TTL boundary are frozen in
+`tilelang/tenstorrent/contracts.py` and `docs/compiler_internals/tenstorrent_phase0_contract.md`. The runtime pipeline
+still executes only target binding, and compiling a kernel fails explicitly because Device TIR lowering and TTL
+source generation are not implemented.
 
 Tenstorrent's language facade exposes inter-Core communication topology under `T.comm`:
 

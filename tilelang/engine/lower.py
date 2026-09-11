@@ -89,7 +89,10 @@ def host_codegen(
     return context.codegen_host(host_mod)
 
 
-def _prepare_device_codegen_mod(device_mod: tvm.IRModule) -> tvm.IRModule:
+def _prepare_device_codegen_mod(device_mod: tvm.IRModule, context: BackendContext) -> tvm.IRModule:
+    prepare = context.module.get_device_codegen(context.target).prepare
+    if prepare is not None:
+        return prepare(device_mod, context.target)
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tirx.transform.Simplify()(device_mod)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
@@ -97,12 +100,12 @@ def _prepare_device_codegen_mod(device_mod: tvm.IRModule) -> tvm.IRModule:
 
 
 def device_codegen(device_mod: tvm.IRModule, context: BackendContext) -> tvm.IRModule:
-    device_mod = _prepare_device_codegen_mod(device_mod)
+    device_mod = _prepare_device_codegen_mod(device_mod, context)
     return context.codegen_device(device_mod, compile_device=True)
 
 
 def device_codegen_without_compile(device_mod: tvm.IRModule, context: BackendContext) -> tvm.IRModule:
-    device_mod = _prepare_device_codegen_mod(device_mod)
+    device_mod = _prepare_device_codegen_mod(device_mod, context)
     return context.codegen_device(device_mod, compile_device=False)
 
 

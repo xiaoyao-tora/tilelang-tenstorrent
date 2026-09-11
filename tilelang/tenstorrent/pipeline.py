@@ -8,6 +8,20 @@ from tvm.target import Target
 from tilelang.backend.pass_pipeline import PassPipeline
 
 
+TENSTORRENT_LOWER_PASS_ORDER = (
+    "BindTarget",
+    "ValidateTenstorrentFrontendIR",
+    "NormalizeTenstorrentLaunch",
+    "NormalizeTenstorrentBufferMetadata",
+    "NormalizeTenstorrentRegions",
+    "InferTenstorrentTensorLayout",
+    "LegalizeTenstorrentTileOps",
+    "NormalizeTenstorrentTopology",
+    "FormTenstorrentDeviceProgram",
+    "VerifyTenstorrentDeviceIR",
+)
+
+
 def TenstorrentPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     """Bind the target while preserving canonical TIR for future TT lowering."""
 

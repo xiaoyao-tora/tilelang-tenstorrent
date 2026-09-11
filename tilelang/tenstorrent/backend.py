@@ -15,6 +15,7 @@ BACKEND = register_backend(
             "tenstorrent": DeviceCodegen(
                 "tenstorrent",
                 build_without_compile=codegen.build_ttl_without_compile,
+                prepare=codegen.prepare_ttl_codegen,
             )
         },
         execution_backends=execution_backend.EXECUTION_BACKENDS,

@@ -6,6 +6,12 @@ import importlib.util
 
 from tilelang.backend.execution_backend import ExecutionBackendSpec
 
+from .contracts import (
+    EXECUTION_BACKEND_ORDER,
+    TTNN_ENABLE_DEVICE_COMPILE,
+    TTNN_ENABLE_HOST_CODEGEN,
+)
+
 
 def _is_module_available(module_name: str) -> bool:
     try:
@@ -22,9 +28,9 @@ def is_ttnn_available() -> bool:
 
 EXECUTION_BACKENDS = (
     ExecutionBackendSpec(
-        "ttnn",
+        EXECUTION_BACKEND_ORDER[0],
         is_available=is_ttnn_available,
-        enable_host_codegen=False,
-        enable_device_compile=False,
+        enable_host_codegen=TTNN_ENABLE_HOST_CODEGEN,
+        enable_device_compile=TTNN_ENABLE_DEVICE_COMPILE,
     ),
 )
