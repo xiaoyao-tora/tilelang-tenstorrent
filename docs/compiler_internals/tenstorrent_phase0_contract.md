@@ -76,15 +76,16 @@ format or an input to codegen.
 ## Lowering and codegen boundary
 
 `TENSTORRENT_LOWER_PASS_ORDER` freezes the ten-pass design from `BindTarget`
-through `VerifyTenstorrentDeviceIR`. The registration-stage pipeline currently
-runs only `BindTarget`; the other nine names are design commitments, not
-implemented passes.
+through `VerifyTenstorrentDeviceIR`. Phase 1 now executes the complete sequence
+for its explicit no-op skeleton subset; see
+`docs/compiler_internals/tenstorrent_phase1_device_ir.md` for current
+capabilities and exclusions.
 
 `DeviceCodegen.prepare` lets a backend replace the common
 `LowerIntrin`/`Simplify`/`HoistBroadcastValues` preparation without adding a
-target-kind branch to the shared engine. Tenstorrent's current hook is an
-identity operation that validates target kind and architecture and does not
-import `ttl`.
+target-kind branch to the shared engine. Tenstorrent's current hook validates
+target kind and architecture and reruns the read-only Device TIR verifier
+without importing `ttl`.
 
 The source-only device output format is `ttl`; no host codegen is declared.
 The only compatible execution backend is `ttnn`, and its current declaration
@@ -113,6 +114,6 @@ does not contain a built importable `ttl` package. The reference was therefore
 source-audited but not import- or runtime-validated here. The older planning
 material referenced commit `e49ce12c2bcd2350565632d9b51239e9eafb2546`;
 that drift must be reconciled before Phase 1 relies on unstable TT-Lang APIs.
-TTL codegen, the TTNN execution path, typed Device TIR metadata objects, the
-nine post-`BindTarget` passes, and hardware validation remain blockers beyond
-Phase 0.
+TTL codegen, the TTNN execution path, Add/dataflow lowering, and hardware
+validation remain blockers beyond Phase 1. Typed Device TIR metadata and the
+hardware-independent Phase 1 skeleton pipeline are implemented.

@@ -6,6 +6,7 @@ from tvm import IRModule
 from tvm.target import Target
 
 from .contracts import SUPPORTED_ARCHITECTURES, TARGET_KIND
+from .transform import VerifyTenstorrentDeviceIR
 
 
 TTL_CODEGEN_NOT_IMPLEMENTED = "Tenstorrent Target 已注册，但 TTL codegen 尚未实现"
@@ -26,7 +27,7 @@ def prepare_ttl_codegen(mod: IRModule, target: Target) -> IRModule:
             f"Tenstorrent TTL preparation requires a supported architecture "
             f"({supported}), got {arch!r}."
         )
-    return mod
+    return VerifyTenstorrentDeviceIR()(mod)
 
 
 def build_ttl_without_compile(mod: IRModule, target: Target) -> IRModule:

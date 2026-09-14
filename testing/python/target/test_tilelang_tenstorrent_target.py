@@ -100,7 +100,7 @@ def test_tenstorrent_context_rejects_unavailable_ttnn(monkeypatch):
         )
 
 
-def test_tenstorrent_pipeline_binds_target_without_simt_lowering(monkeypatch):
+def test_tenstorrent_pipeline_forms_phase1_device_ir(monkeypatch):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(
         {"kind": "tenstorrent", "arch": "wormhole_b0"},
@@ -109,24 +109,26 @@ def test_tenstorrent_pipeline_binds_target_without_simt_lowering(monkeypatch):
     )
 
     @T.prim_func
-    def main(A: T.Tensor((1,), "float32")):
+    def main(A: T.Tensor((32, 32), "float32")):
         with T.Kernel(1, 1, threads=1):
-            A[0] = 0.0
+            T.evaluate(0)
 
     lowered = context.lower(tvm.IRModule({"main": main}))
-    lowered_target = lowered["main"].attrs["target"]
-
-    assert lowered_target.kind.name == "tenstorrent"
-    assert str(lowered_target.attrs["arch"]) == "wormhole_b0"
+    assert int(lowered.attrs["tt.device_ir_version"]) == 1
+    assert {str(func.attrs["tt.kernel_slot"]) for func in lowered.functions.values()} == {
+        "trisc",
+        "ncrisc",
+        "brisc",
+    }
 
 
 def test_tenstorrent_compile_fails_at_unimplemented_ttl_codegen(monkeypatch):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
 
     @T.prim_func
-    def main(A: T.Tensor((1,), "float32")):
+    def main(A: T.Tensor((32, 32), "float32")):
         with T.Kernel(1, 1, threads=1):
-            A[0] = 0.0
+            T.evaluate(0)
 
     with pytest.raises(NotImplementedError, match=TTL_CODEGEN_NOT_IMPLEMENTED):
         tilelang.compile(

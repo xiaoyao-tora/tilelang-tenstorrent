@@ -1,6 +1,8 @@
 # Tenstorrent target and frontend intrinsic registrations are hardware-independent.
 file(GLOB TILE_LANG_TENSTORRENT_SRCS
+  src/tenstorrent/ir/*.cc
   src/tenstorrent/op/*.cc
+  src/tenstorrent/transform/*.cc
 )
 list(APPEND TILE_LANG_TENSTORRENT_SRCS
   src/tenstorrent/target.cc

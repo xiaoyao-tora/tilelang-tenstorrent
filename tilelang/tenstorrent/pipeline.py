@@ -1,4 +1,4 @@
-"""Registration-stage Tenstorrent lowering pipeline."""
+"""Tenstorrent Device TIR v1 lowering pipeline."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from tvm import IRModule, tirx
 from tvm.target import Target
 
 from tilelang.backend.pass_pipeline import PassPipeline
+
+from . import transform
 
 
 TENSTORRENT_LOWER_PASS_ORDER = (
@@ -23,9 +25,23 @@ TENSTORRENT_LOWER_PASS_ORDER = (
 
 
 def TenstorrentPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
-    """Bind the target while preserving canonical TIR for future TT lowering."""
+    """Lower the supported Phase 1 frontend subset to verified Device TIR."""
 
-    return tirx.transform.BindTarget(target)(mod)
+    passes = (
+        tirx.transform.BindTarget(target),
+        transform.ValidateTenstorrentFrontendIR(),
+        transform.NormalizeTenstorrentLaunch(),
+        transform.NormalizeTenstorrentBufferMetadata(),
+        transform.NormalizeTenstorrentRegions(),
+        transform.InferTenstorrentTensorLayout(),
+        transform.LegalizeTenstorrentTileOps(),
+        transform.NormalizeTenstorrentTopology(),
+        transform.FormTenstorrentDeviceProgram(),
+        transform.VerifyTenstorrentDeviceIR(),
+    )
+    for compiler_pass in passes:
+        mod = compiler_pass(mod)
+    return mod
 
 
 TENSTORRENT_PIPELINE = PassPipeline("tenstorrent", TenstorrentPassPipelineBody)
