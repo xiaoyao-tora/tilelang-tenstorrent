@@ -47,6 +47,28 @@ TIR_DEFINE_TT_BUILTIN(pipe_send).set_num_inputs(2).set_attr<TCallEffectKind>(
 TIR_DEFINE_TT_BUILTIN(pipe_recv).set_num_inputs(2).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TT_BUILTIN(tile_add).set_num_inputs(3).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_reserve).set_num_inputs(2).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_wait).set_num_inputs(2).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(tensor_to_dfb)
+    .set_num_inputs(6)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_to_tensor)
+    .set_num_inputs(6)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_add).set_num_inputs(4).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
 #undef TIR_DEFINE_TT_BUILTIN
 
 } // namespace tenstorrent

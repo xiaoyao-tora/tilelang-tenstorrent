@@ -134,9 +134,8 @@ def test_phase1_read_only_gates_are_identity_for_supported_subset(monkeypatch):
 @pytest.mark.parametrize(
     ("name", "func", "message"),
     (
-        ("add", FRONTEND_PROGRAMS["add"], "LegalizeTenstorrentTileOps"),
         ("p2p", FRONTEND_PROGRAMS["p2p"], "LegalizeTenstorrentTileOps"),
-        ("store", phase1_store, "compute or dataflow planning"),
+        ("store", phase1_store, "frozen 32x32 Add pattern"),
         ("dfb_only", phase1_dfb_only, "requires Phase 2 transaction planning"),
         ("multicore", phase1_multicore_noop, "multi-Core program formation"),
     ),

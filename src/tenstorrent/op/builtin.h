@@ -39,6 +39,27 @@ TVM_DLL const Op &pipe_dst_range();
 TVM_DLL const Op &pipe_send();
 TVM_DLL const Op &pipe_recv();
 
+/*!
+ * \brief Canonical Phase 2 Add operation over normalized BufferRegions.
+ *
+ * LegalizeTenstorrentTileOps creates this intermediate operation. Program
+ * formation consumes it and replaces it with logical-DFB Device IR ops.
+ */
+TVM_DLL const Op &tile_add();
+
+/*!
+ * \brief Logical-DFB transaction and dataflow operations in Device TIR.
+ *
+ * DFB and Tensor operands are represented by stable module-table indices.
+ * Transfer operations additionally carry a two-dimensional Tensor region as
+ * row start, column start, row extent, and column extent.
+ */
+TVM_DLL const Op &dfb_reserve();
+TVM_DLL const Op &dfb_wait();
+TVM_DLL const Op &tensor_to_dfb();
+TVM_DLL const Op &dfb_to_tensor();
+TVM_DLL const Op &dfb_add();
+
 } // namespace tenstorrent
 } // namespace tl
 } // namespace tvm

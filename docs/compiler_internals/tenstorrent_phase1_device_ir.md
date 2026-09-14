@@ -5,6 +5,11 @@ Frontend TIRX subset to verified Device TIR schema v1. It does not implement
 Add dataflow lowering, TTL MLIR emission, TT-Lang compilation, or TTNN runtime
 execution.
 
+This document records the Phase 1 contract. The current backend also implements
+the Phase 2 canonical Add path described in
+`docs/compiler_internals/tenstorrent_phase2_add_lower.md`; TTL codegen and
+execution remain deferred.
+
 ## Implemented pipeline
 
 The Tenstorrent backend now executes all ten frozen stages in order:
@@ -22,10 +27,11 @@ FormTenstorrentDeviceProgram
 VerifyTenstorrentDeviceIR
 ```
 
-The first six stages validate and normalize the frozen frontend contract.
-`LegalizeTenstorrentTileOps` and `NormalizeTenstorrentTopology` are Phase 1
-read-only capability gates: they return unchanged IR only when no TileOp or
-Pipe construct is present, and report `NotImplementedError` otherwise.
+The first six stages validate and normalize the frozen frontend contract. For
+the Phase 1 no-op subset, `LegalizeTenstorrentTileOps` and
+`NormalizeTenstorrentTopology` are read-only capability gates. Phase 2 extends
+the former to legalize the canonical Add dataflow while Pipe constructs remain
+unsupported.
 
 `FormTenstorrentDeviceProgram` accepts one single-Core operation at a time. It
 consumes the function-level `tt.launch_grid` and typed
@@ -50,7 +56,8 @@ The current positive path is intentionally narrow:
 - deterministic typed metadata, source spans, printing, structural hashing,
   and JSON round-trip.
 
-Unsupported constructs fail before Device TIR is published:
+Constructs unsupported by the Phase 1 subset fail before Device TIR is
+published:
 
 - TileOps, including `T.copy`;
 - Buffer loads/stores and other compute bodies;

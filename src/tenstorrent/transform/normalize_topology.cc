@@ -5,7 +5,7 @@
 
 /*!
  * \file tenstorrent/transform/normalize_topology.cc
- * \brief Phase 1 capability gate for Tenstorrent topology operations.
+ * \brief Capability gate for unsupported Tenstorrent topology operations.
  */
 
 #include "../op/builtin.h"
@@ -43,7 +43,8 @@ public:
   void VisitExpr_(const tirx::CallNode *op) final {
     if (const auto *op_node = op->op.as<OpNode>()) {
       const std::string name = op_node->name;
-      if (name.rfind("tl.tt.", 0) == 0) {
+      if (name.rfind("tl.tt.", 0) == 0 &&
+          !op->op.same_as(tenstorrent::tile_add())) {
         TVM_FFI_THROW(NotImplementedError)
             << "[NormalizeTenstorrentTopology] topology operation '" << name
             << "' is deferred beyond the Phase 1 no-Pipe subset";
