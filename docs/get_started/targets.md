@@ -17,7 +17,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `cutedsl` | NVIDIA CUTLASS/CuTe DSL backend. Requires `nvidia-cutlass-dsl`. |
 | `hip` | AMD GPUs via ROCm. Use a config dict for options such as `{"kind": "hip", "mcpu": "gfx90a"}`. |
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
-| `tenstorrent` | Tenstorrent devices. Requires `wormhole_b0` or `blackhole`; supports a verified no-op skeleton and canonical 32x32 BF16/FP32 Add lowering to Device TIR. TTL codegen remains unimplemented. |
+| `tenstorrent` | Tenstorrent devices. Requires `wormhole_b0` or `blackhole`; supports structured `T.Tiles`/`T.Parallel` lowering and verified no-op or 32x32 BF16/FP32 Add Device TIR. TTL codegen remains unimplemented. |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
 | `webgpu` | Browser / WebGPU runtimes. |
 | `c` | Emit plain C source for inspection or custom toolchains. |
@@ -54,10 +54,12 @@ Tenstorrent targets accept only the `tenstorrent` target key and require an expl
 `blackhole`. They are not included in `auto` detection. The backend route and `ttnn` execution contract are
 registered. The frozen contract is documented in `docs/compiler_internals/tenstorrent_phase0_contract.md`; the
 implemented Phase 1 subset is documented in `docs/compiler_internals/tenstorrent_phase1_device_ir.md`, and the
-canonical Add extension in `docs/compiler_internals/tenstorrent_phase2_add_lower.md`. The ten-pass pipeline can
-lower a single-Core semantic no-op or one canonical 32x32 BF16/FP32 Add into a verified three-slot Device TIR
-module. Other TileOps, Pipe topology, multi-Core programs, and noncanonical compute fail explicitly. Compiling
-still fails at TTL source generation, which is not implemented.
+Add device extension in `docs/compiler_internals/tenstorrent_phase2_add_lower.md`. Both `T.Tiles` and supported
+rank-2 `T.Parallel` maps now share [structured compute lowering](../compiler_internals/tenstorrent_structured_compute.md).
+Multi-tile, broadcast, and compound elementwise expressions retain verified structured IR with
+`tt.ir_stage="structured"`. A single-Core semantic no-op or supported 32x32 BF16/FP32 Add continues into verified
+three-slot Device TIR. Other TileOps and unsupported device dataflow fail explicitly. Compiling still fails
+at TTL source generation, which is not implemented.
 
 Tenstorrent's language facade exposes inter-Core communication topology under `T.comm`:
 

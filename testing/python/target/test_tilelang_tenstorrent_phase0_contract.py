@@ -231,16 +231,18 @@ def test_frozen_target_and_execution_preflight_matches_registered_backend():
     assert backend.execution_backends[0].enable_device_compile is contracts.TTNN_ENABLE_DEVICE_COMPILE
 
 
-def test_frozen_ten_pass_order_is_not_the_registration_stage_execution_list():
+def test_structured_compute_precedes_device_lowering_in_pass_order():
     assert TENSTORRENT_LOWER_PASS_ORDER == (
         "BindTarget",
+        "CanonicalizeTTElementwise",
+        "VerifyTTComputeBlocks",
         "ValidateTenstorrentFrontendIR",
         "NormalizeTenstorrentLaunch",
         "NormalizeTenstorrentBufferMetadata",
         "NormalizeTenstorrentRegions",
-        "InferTenstorrentTensorLayout",
-        "LegalizeTenstorrentTileOps",
         "NormalizeTenstorrentTopology",
+        "LegalizeTenstorrentTileOps",
+        "InferTenstorrentTensorLayout",
         "FormTenstorrentDeviceProgram",
         "VerifyTenstorrentDeviceIR",
     )

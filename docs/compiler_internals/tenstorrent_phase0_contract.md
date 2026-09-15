@@ -75,11 +75,13 @@ format or an input to codegen.
 
 ## Lowering and codegen boundary
 
-`TENSTORRENT_LOWER_PASS_ORDER` freezes the ten-pass design from `BindTarget`
-through `VerifyTenstorrentDeviceIR`. Phase 1 now executes the complete sequence
-for its explicit no-op skeleton subset; see
-`docs/compiler_internals/tenstorrent_phase1_device_ir.md` for current
-capabilities and exclusions.
+`TENSTORRENT_LOWER_PASS_ORDER` records the current sequence from `BindTarget`
+through `VerifyTenstorrentDeviceIR`. It extends the original ten-pass design
+with shared Tiles/Parallel semantic capture and verification; see
+[structured compute lowering](tenstorrent_structured_compute.md) for the
+structured output boundary and
+`docs/compiler_internals/tenstorrent_phase1_device_ir.md` for the no-op Device
+TIR contract.
 
 `DeviceCodegen.prepare` lets a backend replace the common
 `LowerIntrin`/`Simplify`/`HoistBroadcastValues` preparation without adding a

@@ -112,9 +112,7 @@ def test_phase1_pipeline_is_deterministic(monkeypatch):
 
 def test_phase1_read_only_gates_are_identity_for_supported_subset(monkeypatch):
     context = _context(monkeypatch)
-    mod = tirx.transform.BindTarget(context.target)(
-        tvm.IRModule({"phase1_noop": phase1_noop})
-    )
+    mod = tirx.transform.BindTarget(context.target)(tvm.IRModule({"phase1_noop": phase1_noop}))
     for compiler_pass in (
         transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
@@ -134,15 +132,13 @@ def test_phase1_read_only_gates_are_identity_for_supported_subset(monkeypatch):
 @pytest.mark.parametrize(
     ("name", "func", "message"),
     (
-        ("p2p", FRONTEND_PROGRAMS["p2p"], "LegalizeTenstorrentTileOps"),
-        ("store", phase1_store, "frozen 32x32 Add pattern"),
+        ("p2p", FRONTEND_PROGRAMS["p2p"], "NormalizeTenstorrentTopology"),
+        ("store", phase1_store, "structured T.Parallel or T.Tiles operation"),
         ("dfb_only", phase1_dfb_only, "requires Phase 2 transaction planning"),
         ("multicore", phase1_multicore_noop, "multi-Core program formation"),
     ),
 )
-def test_phase1_pipeline_rejects_deferred_capabilities(
-    monkeypatch, name, func, message
-):
+def test_phase1_pipeline_rejects_deferred_capabilities(monkeypatch, name, func, message):
     context = _context(monkeypatch)
     with pytest.raises(NotImplementedError, match=message):
         context.lower(tvm.IRModule({name: func}))
@@ -150,9 +146,7 @@ def test_phase1_pipeline_rejects_deferred_capabilities(
 
 def test_phase1_topology_gate_rejects_pipe_when_called_directly(monkeypatch):
     context = _context(monkeypatch)
-    mod = tirx.transform.BindTarget(context.target)(
-        tvm.IRModule({"p2p": FRONTEND_PROGRAMS["p2p"]})
-    )
+    mod = tirx.transform.BindTarget(context.target)(tvm.IRModule({"p2p": FRONTEND_PROGRAMS["p2p"]}))
     for compiler_pass in (
         transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),

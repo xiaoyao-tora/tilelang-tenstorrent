@@ -105,3 +105,64 @@ def test_alloc_shared_rejects_shape_not_divisible_by_tile():
 def test_alloc_shared_rejects_tensor_backed_in_phase_1():
     with pytest.raises(NotImplementedError, match="tt.tensor_backed"):
         _make_kernel({"tt.tensor_backed": {"tensor": object(), "byte_offset": 0}})
+
+
+def test_lower_opaque_block_preserves_generic_metadata_by_identity_with_local_init():
+    from tilelang import transform
+    from tvm import tirx
+
+    first = tirx.decl_buffer((8,), "float32", name="same_name", scope="local")
+    second = tirx.decl_buffer((8,), "float32", name="same_name", scope="local")
+    block = tirx.SBlock(
+        [],
+        [],
+        [],
+        "root",
+        tirx.Evaluate(0),
+        alloc_buffers=[first, second],
+        annotations={
+            _ALLOC_BUFFER_ANNOTATIONS: {
+                first.data: {"custom.tag": tirx.IntImm("int32", 11)},
+                second.data: {"custom.tag": tirx.IntImm("int32", 22)},
+            },
+            "tl.local_var_init": {first.data: tirx.FloatImm("float32", 1.5)},
+        },
+    )
+    mod = tvm.IRModule({"main": tirx.PrimFunc([], tirx.SBlockRealize([], True, block))})
+    result = transform.LowerOpaqueBlock()(mod)
+    allocations = []
+    tirx.stmt_functor.post_order_visit(
+        result["main"].body,
+        lambda node: allocations.append(node) if isinstance(node, tirx.AllocBuffer) else None,
+    )
+    assert len(allocations) == 2
+    first_alloc = next(node for node in allocations if node.buffer.data.same_as(first.data))
+    second_alloc = next(node for node in allocations if node.buffer.data.same_as(second.data))
+    assert int(first_alloc.annotations["custom.tag"]) == 11
+    assert int(second_alloc.annotations["custom.tag"]) == 22
+    assert float(first_alloc.annotations["tl.local_var_init"].value) == 1.5
+    assert "tl.local_var_init" not in second_alloc.annotations
+
+
+@pytest.mark.parametrize("kind", ["orphan", "schema"])
+def test_lower_opaque_block_rejects_invalid_allocation_metadata(kind):
+    from tilelang import transform
+    from tvm import ir, tirx
+
+    allocated = tirx.decl_buffer((8,), "float32", scope="shared", name="allocated")
+    orphan = tirx.decl_buffer((8,), "float32", scope="shared", name="orphan")
+    metadata = {orphan.data: {"custom.tag": tirx.IntImm("int32", 1)}} if kind == "orphan" else tirx.IntImm("int32", 1)
+    block = tirx.SBlock(
+        [],
+        [],
+        [],
+        "root",
+        tirx.Evaluate(0),
+        alloc_buffers=[allocated],
+        annotations={_ALLOC_BUFFER_ANNOTATIONS: metadata},
+    )
+    mod = tvm.IRModule({"main": tirx.PrimFunc([], tirx.SBlockRealize([], True, block))})
+    before = ir.save_json(mod)
+    with pytest.raises(ValueError, match="LowerOpaqueBlock.*(metadata|tl.alloc_buffer_annotations)"):
+        transform.LowerOpaqueBlock()(mod)
+    assert ir.save_json(mod) == before

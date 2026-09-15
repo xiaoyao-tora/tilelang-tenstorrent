@@ -6,32 +6,38 @@ Add dataflow lowering, TTL MLIR emission, TT-Lang compilation, or TTNN runtime
 execution.
 
 This document records the Phase 1 contract. The current backend also implements
-the Phase 2 canonical Add path described in
-`docs/compiler_internals/tenstorrent_phase2_add_lower.md`; TTL codegen and
-execution remain deferred.
+the Phase 2 Add device path described in
+`docs/compiler_internals/tenstorrent_phase2_add_lower.md` and the shared
+[Tiles/Parallel structured prefix](tenstorrent_structured_compute.md).
+TTL codegen and execution remain deferred.
 
 ## Implemented pipeline
 
-The Tenstorrent backend now executes all ten frozen stages in order:
+The current pipeline extends the original ten-stage design with structured
+compute capture. The no-op and supported Add device paths execute:
 
 ```text
 BindTarget
+CanonicalizeTTElementwise
+VerifyTTComputeBlocks
 ValidateTenstorrentFrontendIR
 NormalizeTenstorrentLaunch
 NormalizeTenstorrentBufferMetadata
 NormalizeTenstorrentRegions
-InferTenstorrentTensorLayout
-LegalizeTenstorrentTileOps
 NormalizeTenstorrentTopology
+LegalizeTenstorrentTileOps
+InferTenstorrentTensorLayout
 FormTenstorrentDeviceProgram
 VerifyTenstorrentDeviceIR
 ```
 
-The first six stages validate and normalize the frozen frontend contract. For
+The prefix validates and normalizes the frontend contract. For
 the Phase 1 no-op subset, `LegalizeTenstorrentTileOps` and
 `NormalizeTenstorrentTopology` are read-only capability gates. Phase 2 extends
 the former to legalize the canonical Add dataflow while Pipe constructs remain
-unsupported.
+unsupported. Valid compute without an implemented device consumer returns
+explicitly marked structured IR before tensor layout and device formation;
+see the structured compute document for that output contract.
 
 `FormTenstorrentDeviceProgram` accepts one single-Core operation at a time. It
 consumes the function-level `tt.launch_grid` and typed

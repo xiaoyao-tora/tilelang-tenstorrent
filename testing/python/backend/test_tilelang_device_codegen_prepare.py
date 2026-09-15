@@ -72,11 +72,22 @@ def test_device_codegen_without_hook_keeps_shared_prepare(monkeypatch):
 
 
 def test_tenstorrent_prepare_is_identity_and_validates_target():
-    mod = tvm.IRModule()
-    target = tvm.target.Target({"kind": "tenstorrent", "arch": "blackhole"})
+    from tilelang.tenstorrent import language as T
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
-    assert prepare_ttl_codegen(mod, target) is mod
+    @T.prim_func
+    def noop():
+        with T.Kernel(1, 1, threads=1):
+            T.evaluate(0)
+
+    target = tvm.target.Target({"kind": "tenstorrent", "arch": "blackhole"})
+    mod = TenstorrentPassPipelineBody(tvm.IRModule({"noop": noop}), target)
+
+    assert prepare_ttl_codegen(mod, target).same_as(mod)
     assert get_backend("tenstorrent").get_device_codegen(target).prepare is prepare_ttl_codegen
 
     with pytest.raises(ValueError, match="requires target kind 'tenstorrent'"):
         prepare_ttl_codegen(mod, tvm.target.Target("llvm"))
+
+    with pytest.raises(ValueError, match="tt.device_ir_version"):
+        prepare_ttl_codegen(tvm.IRModule(), target)

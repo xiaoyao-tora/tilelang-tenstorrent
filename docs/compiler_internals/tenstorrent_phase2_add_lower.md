@@ -18,14 +18,19 @@ The positive path is intentionally exact:
 - 32x32 tiled, interleaved, unsharded Tensor layout;
 - a static DFB block count of two.
 
-`LegalizeTenstorrentTileOps` recognizes the canonical scalar BufferStore loop
-and replaces it with the intermediate `tl.tt.tile_add` operation. Program
+`CanonicalizeTTElementwise` first captures either frontend
+form as a verified structured elementwise block. `LegalizeTenstorrentTileOps`
+consumes that block using the shared single-tile Add instruction capability
+and emits the intermediate `tl.tt.tile_add` operation. Program
 formation consumes that intermediate operation atomically; final Device TIR
 must not retain it.
 
-Shape mismatch, broadcast, partial regions, additional compute, non-unit tile
-grids, multi-Core launch, Pipe topology, and other tile operations fail at the
-owning validation, legalization, or formation boundary.
+The original frontend-specific four-statement Add matcher has been removed.
+Unsupported accesses and malformed device dataflow fail at the owning pass.
+Valid broadcasts, compound expressions, and larger elementwise tile grids
+remain at the explicitly marked structured IR boundary described in
+[structured compute lowering](tenstorrent_structured_compute.md). They do not
+claim support for the Device TIR protocol below.
 
 ## Logical dataflow
 

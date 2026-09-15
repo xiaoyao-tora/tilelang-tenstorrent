@@ -8,6 +8,20 @@ from . import _ffi_api
 tvm_ffi.register_error("NotImplementedError", NotImplementedError)
 
 
+def CanonicalizeTTElementwise():
+    """Capture Tiles and supported Parallel loops as structured compute blocks.
+
+    Run after BindTarget and before frontend normalization or loop/block
+    lowering so the shared analysis can preserve logical access relations.
+    """
+    return _ffi_api.CanonicalizeTTElementwise()  # type: ignore[attr-defined]
+
+
+def VerifyTTComputeBlocks():
+    """Verify structured expression templates, effects and access descriptors."""
+    return _ffi_api.VerifyTTComputeBlocks()  # type: ignore[attr-defined]
+
+
 def ValidateTenstorrentFrontendIR():
     return _ffi_api.ValidateTenstorrentFrontendIR()  # type: ignore[attr-defined]
 
@@ -45,6 +59,8 @@ def VerifyTenstorrentDeviceIR():
 
 
 __all__ = (
+    "CanonicalizeTTElementwise",
+    "VerifyTTComputeBlocks",
     "FormTenstorrentDeviceProgram",
     "InferTenstorrentTensorLayout",
     "LegalizeTenstorrentTileOps",

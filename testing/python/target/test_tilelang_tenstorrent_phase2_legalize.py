@@ -115,6 +115,8 @@ def single_buffer_add(
 def _normalized(func):
     mod = tirx.transform.BindTarget(TARGET)(tvm.IRModule({"main": func}))
     for compiler_pass in (
+        transform.CanonicalizeTTElementwise(),
+        transform.VerifyTTComputeBlocks(),
         transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
@@ -138,9 +140,7 @@ def _calls(func):
 
 def _nodes(func, node_type):
     nodes = []
-    tirx.stmt_functor.post_order_visit(
-        func.body, lambda node: nodes.append(node) if isinstance(node, node_type) else None
-    )
+    tirx.stmt_functor.post_order_visit(func.body, lambda node: nodes.append(node) if isinstance(node, node_type) else None)
     return nodes
 
 
@@ -151,7 +151,7 @@ def _nodes(func, node_type):
         (float32_add, "float32"),
     ),
 )
-def test_legalize_frozen_add_to_one_canonical_tile_operation(func, dtype):
+def test_legalize_structured_add_to_one_canonical_tile_operation(func, dtype):
     before = _normalized(func)
     before_table = before["main"].attrs["tt.buffer_metadata_table"]
 
@@ -183,9 +183,7 @@ def test_legalize_frozen_add_to_one_canonical_tile_operation(func, dtype):
 
 
 def test_legalize_is_idempotent_deterministic_and_json_round_trips():
-    once = transform.LegalizeTenstorrentTileOps()(
-        _normalized(FRONTEND_PROGRAMS["add"])
-    )
+    once = transform.LegalizeTenstorrentTileOps()(_normalized(FRONTEND_PROGRAMS["add"]))
     twice = transform.LegalizeTenstorrentTileOps()(once)
 
     ir.assert_structural_equal(twice, once)
@@ -195,21 +193,52 @@ def test_legalize_is_idempotent_deterministic_and_json_round_trips():
     ir.assert_structural_equal(restored, once)
 
 
-@pytest.mark.parametrize(
-    ("func", "message"),
-    (
-        (subtract, "direct binary Add"),
-        (broadcast_add, "corresponding Parallel loop variable"),
-        (partial_copy_add, "region extent axis 0 must equal 32"),
-        (single_buffer_add, "DFB block count must equal 2"),
-    ),
-)
-def test_legalize_rejects_noncanonical_add_variants(func, message):
-    with pytest.raises(NotImplementedError, match=message):
-        transform.LegalizeTenstorrentTileOps()(_normalized(func))
+@pytest.mark.parametrize("func", [subtract, broadcast_add])
+def test_legalize_preserves_valid_operations_pending_device_support(func):
+    normalized = _normalized(func)
+    result = transform.LegalizeTenstorrentTileOps()(normalized)
+    ir.assert_structural_equal(result, normalized)
+    assert any("tl.tt.compute_kind" in node.annotations for node in _nodes(result["main"], tirx.SBlock))
+    assert not any(call.op.name == "tl.tt.tile_add" for call in _calls(result["main"]))
 
 
-def test_legalize_keeps_other_tileops_outside_the_phase2_subset():
-    normalized = _normalized(FRONTEND_PROGRAMS["p2p"])
-    with pytest.raises(NotImplementedError, match="outside the frozen 32x32 Add pattern"):
+@pytest.mark.parametrize("func", [partial_copy_add])
+def test_legalize_leaves_transaction_constraints_to_device_formation(func):
+    # Compute instruction selection does not inspect surrounding copies or ABI.
+    result = transform.LegalizeTenstorrentTileOps()(_normalized(func))
+    assert sum(call.op.name == "tl.tt.tile_add" for call in _calls(result["main"])) == 1
+
+
+def test_legalize_keeps_other_tileops_outside_the_device_subset():
+    @T.prim_func
+    def fill():
+        with T.Kernel(1, 1, threads=1):
+            a = _shared()
+            T.fill(a, 0)
+
+    normalized = _normalized(fill)
+    with pytest.raises(NotImplementedError, match="no structured Device TIR lowering"):
         transform.LegalizeTenstorrentTileOps()(normalized)
+
+
+def test_topology_capabilities_are_checked_by_the_topology_pass():
+    normalized = _normalized(FRONTEND_PROGRAMS["p2p"])
+    ir.assert_structural_equal(transform.LegalizeTenstorrentTileOps()(normalized), normalized)
+    with pytest.raises(NotImplementedError, match="NormalizeTenstorrentTopology"):
+        transform.NormalizeTenstorrentTopology()(normalized)
+
+
+def test_partial_copy_is_rejected_at_transaction_planning_boundary():
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
+
+    with pytest.raises(ValueError, match="FormTenstorrentDeviceProgram.*regions disagree"):
+        TenstorrentPassPipelineBody(tvm.IRModule({"main": partial_copy_add}), TARGET)
+
+
+def test_one_block_dfb_capacity_is_not_an_add_frontend_restriction():
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
+
+    result = TenstorrentPassPipelineBody(tvm.IRModule({"main": single_buffer_add}), TARGET)
+    assert str(result.attrs["tt.ir_stage"]) == "structured"
+    transform.VerifyTTComputeBlocks()(result)
+    assert any("tl.tt.compute_kind" in block.annotations for block in _nodes(result["main"], tirx.SBlock))

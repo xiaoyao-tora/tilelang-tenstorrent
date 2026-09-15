@@ -47,9 +47,7 @@ def add_fp32(
 
 
 def _context(monkeypatch):
-    monkeypatch.setattr(
-        execution_backend.importlib.util, "find_spec", lambda _: object()
-    )
+    monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     return create_backend_context(
         TARGET_CONFIG,
         target_host="c",
@@ -81,9 +79,7 @@ def _body_calls(func):
         ("add_fp32", add_fp32, "float32"),
     ),
 )
-def test_form_add_builds_three_dfbs_and_canonical_slots(
-    monkeypatch, name, func, dtype
-):
+def test_form_add_builds_three_dfbs_and_canonical_slots(monkeypatch, name, func, dtype):
     context = _context(monkeypatch)
     lowered = context.lower(tvm.IRModule({name: func}))
 
@@ -121,9 +117,7 @@ def test_form_add_builds_three_dfbs_and_canonical_slots(
     assert len(functions["trisc"].params) == 0
     assert len(functions["ncrisc"].params) == 3
     assert len(functions["brisc"].params) == 0
-    assert [
-        int(index) for index in functions["ncrisc"].attrs["tt.tensor_arg_indices"]
-    ] == [
+    assert [int(index) for index in functions["ncrisc"].attrs["tt.tensor_arg_indices"]] == [
         0,
         1,
         2,
@@ -184,10 +178,10 @@ def test_form_add_is_deterministic(monkeypatch):
 
 def test_form_add_rejects_incomplete_dataflow_without_mutating_input(monkeypatch):
     context = _context(monkeypatch)
-    malformed = tirx.transform.BindTarget(context.target)(
-        tvm.IRModule({"add": FRONTEND_PROGRAMS["add"]})
-    )
+    malformed = tirx.transform.BindTarget(context.target)(tvm.IRModule({"add": FRONTEND_PROGRAMS["add"]}))
     for compiler_pass in (
+        transform.CanonicalizeTTElementwise(),
+        transform.VerifyTTComputeBlocks(),
         transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
