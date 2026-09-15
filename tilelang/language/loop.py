@@ -107,8 +107,8 @@ def Tiles(
 
     if not extents:
         raise ValueError("Tiles domain must be non-empty")
-    if len(extents) != 2:
-        raise ValueError("Tiles domain must have rank 2 in Phase 1")
+    if len(extents) < 2:
+        raise ValueError("Tiles domain must have rank at least 2")
 
     annotations = {
         "tl.tt.tiles_parallel": tirx.IntImm("int32", int(parallel)),

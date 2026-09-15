@@ -48,6 +48,18 @@ TVM_DLL const Op &pipe_recv();
 TVM_DLL const Op &tile_add();
 
 /*!
+ * \brief General computation over full normalized BufferRegions.
+ *
+ * Operands are output followed by inputs. Legalization fixes operation kind,
+ * dtypes, logical domain and operation-specific parameters in annotations.
+ * Formation replaces regions with versioned DFB IDs in dfb_compute, and
+ * expression BufferLoads with pure dfb_load values. No frontend block survives.
+ */
+TVM_DLL const Op &tile_compute();
+TVM_DLL const Op &dfb_compute();
+TVM_DLL const Op &dfb_load();
+
+/*!
  * \brief Logical-DFB transaction and dataflow operations in Device TIR.
  *
  * DFB and Tensor operands are represented by stable module-table indices.
@@ -59,6 +71,15 @@ TVM_DLL const Op &dfb_wait();
 TVM_DLL const Op &tensor_to_dfb();
 TVM_DLL const Op &dfb_to_tensor();
 TVM_DLL const Op &dfb_add();
+
+/*!
+ * \brief Schema v2 transfers with rank-preserving Tensor slices.
+ *
+ * Arguments are tensor/DFB (or DFB/tensor), then (minimum, extent) pairs
+ * for every logical Tensor axis. The entire logical DFB value is transferred.
+ */
+TVM_DLL const Op &tensor_to_dfb_nd();
+TVM_DLL const Op &dfb_to_tensor_nd();
 
 } // namespace tenstorrent
 } // namespace tl

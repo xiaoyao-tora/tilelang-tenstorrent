@@ -126,9 +126,13 @@ public:
       plan.domain = values.value();
     }
     Stmt body = root;
-    for (size_t axis = 0; axis < 2; ++axis) {
+    for (size_t axis = 0;
+         tiles ? axis < plan.domain.size()
+               : body.as<ForNode>() &&
+                     body.as<ForNode>()->kind == ForKind::kParallel;
+         ++axis) {
       const auto *node = body.as<ForNode>();
-      Require(node != nullptr, "expected a direct rank-2 loop chain");
+      Require(node != nullptr, "expected a direct loop chain");
       For loop = ffi::GetRef<For>(node);
       Require(Static(loop->min, "loop minimum") == 0,
               "loop minimum must be zero");
@@ -159,17 +163,18 @@ public:
                 "elementwise Phase 1 path");
         plan.domain.push_back(loop->extent);
       }
-      Require(plan.domain.size() == 2 || !tiles,
-              "logical domain must have rank 2");
+      Require(plan.domain.size() >= 2 || !tiles,
+              "logical domain must have rank at least 2");
       Require(analyzer_.CanProveEqual(loop->extent, plan.domain[axis]),
               "loop extent disagrees with domain");
       plan.variables.push_back(loop->loop_var);
       body = loop->body;
     }
-    Require(plan.domain.size() == 2, "logical domain must have rank 2");
-    for (const PrimExpr &extent : plan.domain) {
-      int64_t size = Static(extent, "logical domain");
-      Require(size > 0 && size % 32 == 0,
+    Require(plan.domain.size() >= 2,
+            "logical domain must have rank at least 2");
+    for (size_t axis = 0; axis < plan.domain.size(); ++axis) {
+      int64_t size = Static(plan.domain[axis], "logical domain");
+      Require(size > 0 && (axis + 2 < plan.domain.size() || size % 32 == 0),
               "logical domain must be positive and divisible by 32");
     }
     const auto *store = body.as<BufferStoreNode>();
@@ -182,12 +187,6 @@ public:
             "store expression dtype mismatch");
     RecordAccess(plan, store->buffer, store->indices, false);
     AnalyzeExpression(plan, store->value);
-    bool has_read = false;
-    for (const Access &access : plan.accesses)
-      has_read |= access.read;
-    Require(
-        has_read,
-        "elementwise expression requires at least one input buffer operand");
     return plan;
   }
 
@@ -222,7 +221,8 @@ private:
     Require(buffer.scope() == "shared" || buffer.scope() == "shared.dyn",
             "buffer '" + std::string(buffer->name) +
                 "' must have shared scope");
-    Require(buffer->shape.size() == 2, "buffer shape must have rank 2");
+    Require(buffer->shape.size() == domain.size(),
+            "buffer shape must match logical domain rank");
     Require(buffer->dtype.lanes() == 1,
             "elementwise buffers must have scalar element dtypes");
     auto allocation = allocation_.allocations.find(buffer->data);
@@ -234,15 +234,20 @@ private:
     Require(analyzer_.CanProveEqual(buffer->elem_offset, 0),
             "storage offset must be zero");
     if (!buffer->strides.empty()) {
-      Require(
-          buffer->strides.size() == 2 &&
-              analyzer_.CanProveEqual(buffer->strides[1], 1) &&
-              analyzer_.CanProveEqual(buffer->strides[0], buffer->shape[1]),
-          "storage must have compact strides; strided aliases are unsupported");
+      Require(buffer->strides.size() == domain.size(),
+              "storage strides must match rank");
+      PrimExpr stride = Integer(1);
+      for (int axis = static_cast<int>(domain.size()) - 1; axis >= 0; --axis) {
+        Require(analyzer_.CanProveEqual(buffer->strides[axis], stride),
+                "storage must have compact strides; strided aliases are "
+                "unsupported");
+        stride = stride * buffer->shape[axis];
+      }
     }
-    for (size_t axis = 0; axis < 2; ++axis) {
+    for (size_t axis = 0; axis < domain.size(); ++axis) {
+      int64_t padding = axis + 2 < domain.size() ? 1 : 32;
       int64_t expected =
-          axes[axis]->value < 0 ? 32 : Static(domain[axis], "domain");
+          axes[axis]->value < 0 ? padding : Static(domain[axis], "domain");
       Require(Static(buffer->shape[axis], "buffer shape") == expected,
               "buffer '" + std::string(buffer->name) +
                   "' shape does not match identity or compact padded broadcast "
@@ -288,9 +293,10 @@ private:
 
   void RecordAccess(ScopePlan &plan, const Buffer &buffer,
                     const Array<PrimExpr> &indices, bool read) {
-    Require(indices.size() == 2, "buffer access indices must have rank 2");
+    Require(indices.size() == plan.domain.size(),
+            "buffer access rank must match logical domain");
     Array<Integer> axes;
-    for (size_t axis = 0; axis < 2; ++axis) {
+    for (size_t axis = 0; axis < plan.domain.size(); ++axis) {
       ValidateIndex(indices[axis]);
       if (analyzer_.CanProveEqual(indices[axis], plan.variables[axis])) {
         axes.push_back(Integer(axis));
@@ -339,6 +345,8 @@ private:
     TT_BINARY(SubNode)
     TT_BINARY(MulNode)
     TT_BINARY(DivNode)
+    TT_BINARY(MinNode)
+    TT_BINARY(MaxNode)
 #undef TT_BINARY
     if (const auto *call = expr.as<CallNode>()) {
       Require(call->annotations.empty(),
@@ -403,7 +411,7 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
     Array<Range> ranges;
     Array<PrimExpr> logical, physical_tiles;
     Array<Integer> broadcast_axes;
-    for (size_t axis = 0; axis < 2; ++axis) {
+    for (size_t axis = 0; axis < plan.domain.size(); ++axis) {
       PrimExpr extent = access.axes[axis]->value < 0
                             ? make_const(plan.domain[axis].dtype(), 1)
                             : plan.domain[axis];
@@ -411,7 +419,8 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
       logical.push_back(extent);
       physical_tiles.push_back(
           make_const(access.buffer->shape[axis].dtype(),
-                     Static(access.buffer->shape[axis], "shape") / 32));
+                     Static(access.buffer->shape[axis], "shape") /
+                         (axis + 2 < plan.domain.size() ? 1 : 32)));
       if (access.axes[axis]->value < 0)
         broadcast_axes.push_back(Integer(axis));
     }
@@ -422,9 +431,12 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
       writes.push_back(region);
     maps.Set(access.buffer->data, access.axes);
     if (!broadcast_axes.empty()) {
-      String kind = broadcast_axes.size() == 2
-                        ? "scalar"
-                        : (broadcast_axes[0]->value == 0 ? "row" : "column");
+      String kind =
+          plan.domain.size() == 2
+              ? (broadcast_axes.size() == 2
+                     ? "scalar"
+                     : (broadcast_axes[0]->value == 0 ? "row" : "column"))
+              : "batch";
       recipes.Set(access.buffer->data,
                   {{"broadcast_kind", kind},
                    {"broadcast_axes", broadcast_axes},
@@ -434,9 +446,13 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
     }
   }
   Array<PrimExpr> block_shape;
-  for (size_t axis = 0; axis < 2; ++axis) {
-    block_shape.push_back(make_const(plan.domain[axis].dtype(),
-                                     Static(plan.domain[axis], "domain") / 32));
+  Array<String> iterator_types;
+  for (size_t axis = 0; axis < plan.domain.size(); ++axis) {
+    iterator_types.push_back("parallel");
+    block_shape.push_back(
+        make_const(plan.domain[axis].dtype(),
+                   Static(plan.domain[axis], "domain") /
+                       (axis + 2 < plan.domain.size() ? 1 : 32)));
   }
   Map<String, ffi::Any> annotations{
       {kTTComputeKind, String("elementwise")},
@@ -444,7 +460,7 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
       {kTTLogicalDomain, plan.domain},
       {kTTPhysicalTileShape, Array<PrimExpr>{Integer(32), Integer(32)}},
       {kTTBlockShape, block_shape},
-      {kTTIteratorTypes, Array<String>{"parallel", "parallel"}},
+      {kTTIteratorTypes, iterator_types},
       {kTTAccessMaps, maps},
       {kTTBroadcastRecipes, recipes}};
   TemplateBuilder builder;
@@ -506,12 +522,13 @@ public:
 private:
   Array<PrimExpr> RestoreIndices(const Buffer &buffer,
                                  const Array<PrimExpr> &indices) {
-    Require(indices.size() == 2, "structured template access must have rank 2");
+    Require(indices.size() == variables_.size(),
+            "structured template access rank must match domain");
     auto axes = maps_.Get(buffer->data);
-    Require(axes.has_value() && axes.value().size() == 2,
+    Require(axes.has_value() && axes.value().size() == variables_.size(),
             "structured template buffer is missing tl.tt.access_maps");
     Array<PrimExpr> restored;
-    for (size_t axis = 0; axis < 2; ++axis) {
+    for (size_t axis = 0; axis < variables_.size(); ++axis) {
       Require(Static(indices[axis], "structured template index") == 0,
               "structured template indices must be zero");
       int64_t mapped = axes.value()[axis]->value;
@@ -567,7 +584,7 @@ public:
     auto domain = op->annotations.at(kTTLogicalDomain).as<Array<PrimExpr>>();
     auto maps = op->annotations.at(kTTAccessMaps).as<AxisMaps>();
     Require(
-        domain.has_value() && domain.value().size() == 2 && maps.has_value(),
+        domain.has_value() && domain.value().size() >= 2 && maps.has_value(),
         "invalid structured tl.tt.logical_domain or tl.tt.access_maps schema");
     Array<Var> variables;
     for (const PrimExpr &extent : domain.value()) {
@@ -576,7 +593,7 @@ public:
     }
     TemplateRestorer restorer(maps.value(), variables);
     Stmt body = restorer(op->body);
-    for (int axis = 1; axis >= 0; --axis) {
+    for (int axis = static_cast<int>(variables.size()) - 1; axis >= 0; --axis) {
       body = For(variables[axis], make_zero(variables[axis].dtype()),
                  domain.value()[axis], ForKind::kParallel, body);
     }

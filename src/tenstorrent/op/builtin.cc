@@ -50,8 +50,29 @@ TIR_DEFINE_TT_BUILTIN(pipe_recv).set_num_inputs(2).set_attr<TCallEffectKind>(
 TIR_DEFINE_TT_BUILTIN(tile_add).set_num_inputs(3).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TT_BUILTIN(dfb_reserve).set_num_inputs(2).set_attr<TCallEffectKind>(
-    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TT_BUILTIN(tile_compute)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_compute)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_load).set_num_inputs(1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kPure));
+
+TIR_DEFINE_TT_BUILTIN(tensor_to_dfb_nd)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_to_tensor_nd)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_reserve)
+    .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TT_BUILTIN(dfb_wait).set_num_inputs(2).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));

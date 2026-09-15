@@ -111,12 +111,15 @@ def _normalize_alloc_shared_annotations(
     if _TT_TILE_SHAPE in normalized:
         normalized[_TT_TILE_SHAPE] = [IntImm("int32", value) for value in tile_shape]
 
-    if len(buffer.shape) != 2:
+    if not buffer.shape:
         raise ValueError(
-            "Tenstorrent DFB metadata requires a 2D shared buffer, "
+            "Tenstorrent DFB metadata requires a non-scalar shared buffer, "
             f"got rank {len(buffer.shape)}."
         )
-    for axis, (extent, tile_extent) in enumerate(zip(buffer.shape, tile_shape)):
+    for axis, extent in enumerate(buffer.shape):
+        # Leading batch axes are untiled. Rank-one reduction results have an
+        # implicit padded row; their only explicit axis uses the tile width.
+        tile_extent = 32 if axis + 2 >= len(buffer.shape) else 1
         if isinstance(extent, IntImm) and extent.value % tile_extent != 0:
             raise ValueError(
                 f"Shared buffer shape axis {axis} ({extent.value}) must be divisible by "

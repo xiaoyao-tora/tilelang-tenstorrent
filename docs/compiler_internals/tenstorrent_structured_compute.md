@@ -1,6 +1,6 @@
 # Tenstorrent structured elementwise lowering
 
-`T.Tiles` and rank-2 `T.Parallel` elementwise maps share one structured TIRX
+`T.Tiles` and rank-2-or-higher `T.Parallel` elementwise maps share one structured TIRX
 contract. This extends the original Tiles design to the existing Tenstorrent
 Device TIR pipeline without retaining the frontend Add pattern matcher.
 All stages described here run without Tenstorrent hardware, TT-Lang, or TTNN.
@@ -68,7 +68,7 @@ analysis does not partially mutate its input.
 
 ## Supported semantic subset
 
-Scopes must have static, positive, rank-2 domains divisible by `(32, 32)`, one
+Scopes must have static, positive domains with at least two axes, last two axes divisible by `(32, 32)`, one
 store, and shared or `shared.dyn` buffers with compatible tile metadata.
 Supported expressions include arithmetic, casts, compile-time scalar values,
 and supported pure unary calls. An output can also be read for an in-place
@@ -123,25 +123,12 @@ Tiles must provide explicit tile metadata, while ordinary Parallel may use
 backend defaults. Placing metadata normalization ahead of capture could erase
 that distinction by supplying defaults too early.
 
-`LegalizeTenstorrentTileOps` consumes verified structured operations using
-backend instruction capabilities. Its current Device TIR instruction set
-supports direct, identity-map, single-tile BF16/FP32 Add. This consumer is
-shared by both frontends; it does not match `T.Parallel`, recover access maps
-from scalar stores, or require a four-statement frontend layout.
+`LegalizeTenstorrentTileOps` consumes verified structured operations into explicit
+computation calls with scalar expression DAGs, access maps, shapes and dtypes.
+It preserves the classic Add operation for compatible v1 programs and uses the
+[Phase 4 Device contract](tenstorrent_phase4_lower.md) for general computation.
 
-Device consumption currently requires one computation with distinct input and
-output buffers and DFB capacity two, matching the existing Device TIR verifier.
-Multiple computations, in-place updates, repeated operands, and other valid
-capacities retain structured IR. Ordinary Parallel allocations may use the
-backend's default tile metadata; Tiles requires explicit tile metadata.
-
-If any computation needs a future consumer, the pipeline returns the complete
-normalized structured module from before instruction consumption, with module
-attribute `tt.ir_stage="structured"`. Standalone shared-buffer computations
-without a Tensor ABI also stop at this boundary. No partly consumed module is
-returned. This is successful structured lowering, not executable Device IR.
-
-Otherwise, the pipeline continues through:
+Every complete pipeline invocation continues through:
 
 ```text
 InferTenstorrentTensorLayout
@@ -149,11 +136,11 @@ FormTenstorrentDeviceProgram
 VerifyTenstorrentDeviceIR
 ```
 
-These stages preserve the existing no-op and single-Core Add Device TIR schema,
-including Tensor ABI, dataflow, transfer, DFB, and slot-protocol validation.
-Malformed device dataflow still raises at its owning pass; exceptions are not
-caught and converted into successful structured lowering. Device output is
-identified by its existing `tt.device_ir_version` contract.
+The result has `tt.device_ir_version=1` (legacy Add/no-op) or `2` (general
+computation). Unsupported input raises a diagnostic; the pipeline no longer
+returns a structured fallback. Standalone uninitialized shared computations
+fail read-before-write checks. Clients that only need capture use
+`CanonicalizeTTElementwise` and `VerifyTTComputeBlocks` directly.
 
 SIMT layout inference, generic simplification, `LowerOpaqueBlock`, buffer
 flattening, and scalar loop lowering do not run on the structured templates.

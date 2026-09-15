@@ -5,6 +5,7 @@
 
 #include "../ir/device_ir.h"
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
 #include <tvm/ir/transform.h>
@@ -88,13 +89,33 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
     ThrowUnsupported("sharded layout for buffer '" + buffer_id +
                      "' is not implemented in the Phase 1 basic path");
   }
-  if (metadata->buffer->shape.size() != 2) {
+  const size_t rank = metadata->buffer->shape.size();
+  if (rank == 0) {
     ThrowUnsupported("buffer '" + buffer_id +
-                     "' must be two-dimensional in Phase 1");
+                     "' must have at least one logical axis");
+  }
+  arith::Analyzer analyzer;
+  const Buffer &buffer = metadata->buffer;
+  if (metadata->alias_of.has_value() || !buffer->axis_separators.empty() ||
+      !analyzer.CanProveEqual(buffer->elem_offset, 0)) {
+    ThrowUnsupported("buffer '" + buffer_id +
+                     "' uses a storage alias/view; use the same Buffer for "
+                     "supported in-place updates");
+  }
+  if (!buffer->strides.empty()) {
+    if (buffer->strides.size() != rank)
+      ThrowMalformed("buffer '" + buffer_id + "' stride rank mismatch");
+    PrimExpr stride = Integer(1);
+    for (size_t axis = rank; axis-- > 0;) {
+      if (!analyzer.CanProveEqual(buffer->strides[axis], stride))
+        ThrowUnsupported("buffer '" + buffer_id +
+                         "' requires compact row-major strides");
+      stride = stride * buffer->shape[axis];
+    }
   }
   if (!IsSupportedDType(metadata->buffer->dtype)) {
     ThrowUnsupported("buffer '" + buffer_id +
-                     "' has an unsupported dtype; Phase 1 supports "
+                     "' has an unsupported dtype; Device Lower supports "
                      "bfloat16 and float32");
   }
 
@@ -116,31 +137,34 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
     }
     if (tile_extent->value != 32) {
       ThrowUnsupported("buffer '" + buffer_id +
-                       "' does not use the Phase 1 32x32 tile shape");
+                       "' does not use the supported 32x32 tile shape");
     }
   }
 
   ffi::Array<PrimExpr> tile_grid_shape;
-  for (size_t axis = 0; axis < 2; ++axis) {
+  for (size_t axis = 0; axis < rank; ++axis) {
     int64_t element_extent =
         RequireStaticExtent(metadata->buffer->shape[axis], buffer_id, axis);
-    if (element_extent % 32 != 0) {
+    // Batch axes are not tiled. A rank-one reduction result occupies logical
+    // row zero of a padded 32xN physical value; the row axis is implicit.
+    const int64_t tile_extent = axis + 2 >= rank ? 32 : 1;
+    if (element_extent % tile_extent != 0) {
       ThrowUnsupported("buffer '" + buffer_id + "' shape axis " +
                        std::to_string(axis) + " (" +
                        std::to_string(element_extent) +
                        ") requires a padding/mask contract");
     }
-    tile_grid_shape.push_back(
-        IntImm(metadata->buffer->shape[axis].dtype(), element_extent / 32));
+    tile_grid_shape.push_back(IntImm(metadata->buffer->shape[axis].dtype(),
+                                     element_extent / tile_extent));
   }
   if (metadata->tile_grid_shape.empty()) {
     *changed = true;
   } else {
-    if (metadata->tile_grid_shape.size() != 2) {
+    if (metadata->tile_grid_shape.size() != rank) {
       ThrowMalformed("buffer '" + buffer_id +
-                     "' tile-grid shape must have rank two");
+                     "' tile-grid rank must match its logical shape");
     }
-    for (size_t axis = 0; axis < 2; ++axis) {
+    for (size_t axis = 0; axis < rank; ++axis) {
       const auto *existing = metadata->tile_grid_shape[axis].as<IntImmNode>();
       const auto *inferred = tile_grid_shape[axis].as<IntImmNode>();
       if (existing == nullptr || existing->value != inferred->value) {

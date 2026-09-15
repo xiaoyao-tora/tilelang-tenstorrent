@@ -5,10 +5,11 @@
 
 /*!
  * \file tenstorrent/transform/verify_device_ir.cc
- * \brief Read-only verifier for the Tenstorrent Device TIR v1 schema.
+ * \brief Read-only verifier for the Tenstorrent Device TIR v1/v2 schemas.
  */
 #include "verify_device_ir.h"
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
 #include <tvm/ir/op.h>
@@ -22,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <sstream>
 #include <string>
@@ -138,7 +140,7 @@ void VerifyNoForbiddenOps(const tirx::PrimFunc &func,
       Check(!HasForbiddenPrefix(op_name), "PrimFunc `" + symbol +
                                               "` contains forbidden op `" +
                                               op_name + "`");
-      Check(op_name != "tl.tt.tile_add",
+      Check(op_name != "tl.tt.tile_add" && op_name != "tl.tt.tile_compute",
             "PrimFunc `" + symbol +
                 "` retains intermediate op `tl.tt.tile_add`");
     }
@@ -149,7 +151,8 @@ using TensorTable = std::unordered_map<int64_t, TensorDescriptor>;
 using DFBTable = std::unordered_map<int64_t, DFBDescriptor>;
 
 TensorTable VerifyTensorTable(const ffi::Array<TensorDescriptor> &tensors,
-                              const CoreCoord &launch_grid) {
+                              const CoreCoord &launch_grid,
+                              bool general = false) {
   TensorTable table;
   for (const TensorDescriptor &tensor : tensors) {
     const std::string label =
@@ -161,7 +164,8 @@ TensorTable VerifyTensorTable(const ffi::Array<TensorDescriptor> &tensors,
     VerifyPositiveShape(tensor->shape, label + " shape");
     VerifyPositiveShape(tensor->tile_shape, label + " tile_shape");
     VerifyPositiveShape(tensor->tile_grid_shape, label + " tile_grid_shape");
-    Check(tensor->tile_shape.size() == tensor->shape.size(),
+    Check(general ? tensor->tile_shape.size() == 2
+                  : tensor->tile_shape.size() == tensor->shape.size(),
           label + " tile_shape rank does not match shape rank");
     Check(tensor->tile_grid_shape.size() == tensor->shape.size(),
           label + " tile_grid_shape rank does not match shape rank");
@@ -193,14 +197,13 @@ TensorTable VerifyTensorTable(const ffi::Array<TensorDescriptor> &tensors,
 
 DFBTable VerifyDFBTable(const ffi::Array<DFBDescriptor> &dfbs,
                         const TensorTable &tensors,
-                        const CoreCoord &launch_grid) {
+                        const CoreCoord &launch_grid, bool general = false) {
   DFBTable table;
   std::unordered_set<std::string> source_buffer_ids;
   for (const DFBDescriptor &dfb : dfbs) {
     const std::string label = "DFB " + std::to_string(dfb->dfb_id);
     Check(dfb->dfb_id >= 0, label + " has a negative dfb_id");
-    Check(table.emplace(dfb->dfb_id, dfb).second,
-          label + " duplicates dfb_id");
+    Check(table.emplace(dfb->dfb_id, dfb).second, label + " duplicates dfb_id");
     Check(!dfb->source_buffer_identity.empty(),
           label + " has no source_buffer_identity");
     Check(source_buffer_ids.insert(dfb->source_buffer_identity).second,
@@ -210,7 +213,8 @@ DFBTable VerifyDFBTable(const ffi::Array<DFBDescriptor> &dfbs,
     VerifyPositiveShape(dfb->tile_shape, label + " tile_shape");
     VerifyPositiveShape(dfb->block_shape_in_tiles,
                         label + " block_shape_in_tiles");
-    Check(dfb->tile_shape.size() == dfb->block_shape_in_tiles.size(),
+    Check(general ? dfb->tile_shape.size() == 2
+                  : dfb->tile_shape.size() == dfb->block_shape_in_tiles.size(),
           label + " block_shape_in_tiles rank does not match tile_shape");
     Check(dfb->block_count.defined(), label + " has no block_count");
     if (const int64_t *count = tirx::as_const_int(dfb->block_count)) {
@@ -242,7 +246,7 @@ DFBTable VerifyDFBTable(const ffi::Array<DFBDescriptor> &dfbs,
     Check(IsSupportedSlot(dfb->consumer_slot),
           label + " has invalid consumer_slot `" +
               std::string(dfb->consumer_slot) + "`");
-    Check(dfb->producer_slot != dfb->consumer_slot,
+    Check(general || dfb->producer_slot != dfb->consumer_slot,
           label + " must have distinct SPSC producer and consumer slots");
     VerifyDomain(dfb->producer_domain, launch_grid, label + " producer_domain");
     VerifyDomain(dfb->consumer_domain, launch_grid, label + " consumer_domain");
@@ -252,8 +256,7 @@ DFBTable VerifyDFBTable(const ffi::Array<DFBDescriptor> &dfbs,
 }
 
 void VerifyPipeTable(const ffi::Array<PipeDescriptor> &pipes,
-                     const DFBTable &dfbs,
-                     const CoreCoord &launch_grid) {
+                     const DFBTable &dfbs, const CoreCoord &launch_grid) {
   std::unordered_set<std::string> event_ids;
   std::unordered_map<int64_t, int64_t> next_event;
   for (const PipeDescriptor &pipe : pipes) {
@@ -406,8 +409,7 @@ Phase2AddPlan VerifyPhase2AddDescriptors(
             tensor_a->dtype == DataType::Float(32),
         "Phase 2 Add supports only bfloat16 and float32 Tensors");
   Check(ffi::StructuralEqual()(tensor_a->tile_shape, tensor_b->tile_shape) &&
-            ffi::StructuralEqual()(tensor_a->tile_shape,
-                                   tensor_c->tile_shape),
+            ffi::StructuralEqual()(tensor_a->tile_shape, tensor_c->tile_shape),
         "Phase 2 Add Tensor tile shapes must match");
   Check(tensor_a->tile_shape.size() == 2 &&
             RequireStaticInteger(tensor_a->tile_shape[0],
@@ -438,8 +440,9 @@ Phase2AddPlan VerifyPhase2AddDescriptors(
         "Phase 2 Add tile-grid extents must be positive");
   Check(tile_rows == 1 && tile_cols == 1,
         "Phase 2 Add Tensor tile-grid shape must be [1, 1]");
-  return {std::move(input_a), std::move(input_b), std::move(output), rows,
-          cols, tile_rows * tile_cols};
+  return {
+      std::move(input_a),   std::move(input_b), std::move(output), rows, cols,
+      tile_rows * tile_cols};
 }
 
 enum class MarkerKind {
@@ -471,8 +474,7 @@ const char *MarkerName(MarkerKind kind) {
   return "<unknown>";
 }
 
-MarkerKind ParseMarkerKind(const tirx::Call &call,
-                           const std::string &symbol) {
+MarkerKind ParseMarkerKind(const tirx::Call &call, const std::string &symbol) {
   if (call->op.same_as(dfb_reserve())) {
     return MarkerKind::kDFBReserve;
   }
@@ -489,11 +491,10 @@ MarkerKind ParseMarkerKind(const tirx::Call &call,
     return MarkerKind::kDFBAdd;
   }
   const auto *op = call->op.as<OpNode>();
-  const std::string name =
-      op == nullptr ? std::string(call->op->GetTypeKey())
-                    : std::string(op->name);
-  Fail("Phase 2 PrimFunc `" + symbol + "` contains non-canonical op `" +
-       name + "`");
+  const std::string name = op == nullptr ? std::string(call->op->GetTypeKey())
+                                         : std::string(op->name);
+  Fail("Phase 2 PrimFunc `" + symbol + "` contains non-canonical op `" + name +
+       "`");
 }
 
 size_t MarkerArity(MarkerKind kind) {
@@ -556,9 +557,8 @@ void VerifyMarkerSequence(const std::vector<Marker> &actual,
             std::to_string(expected.size()));
   for (size_t index = 0; index < expected.size(); ++index) {
     Check(actual[index].kind == expected[index].kind,
-          "Phase 2 PrimFunc `" + symbol + "` marker " +
-              std::to_string(index) + " must be `" +
-              MarkerName(expected[index].kind) + "`");
+          "Phase 2 PrimFunc `" + symbol + "` marker " + std::to_string(index) +
+              " must be `" + MarkerName(expected[index].kind) + "`");
     Check(actual[index].args == expected[index].args,
           "Phase 2 PrimFunc `" + symbol + "` marker `" +
               MarkerName(expected[index].kind) + "` has wrong arguments");
@@ -573,8 +573,9 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
   const int64_t input_b_id = plan.input_b->dfb_id;
   const int64_t output_id = plan.output->dfb_id;
   if (slot == "trisc") {
-    Check(logical_kernel->kind == "compute" && logical_kernel->role == "add",
-          "Phase 2 trisc LogicalKernel must have kind `compute` and role `add`");
+    Check(
+        logical_kernel->kind == "compute" && logical_kernel->role == "add",
+        "Phase 2 trisc LogicalKernel must have kind `compute` and role `add`");
     VerifyMarkerSequence(
         ParseMarkers(func->body, symbol),
         {{MarkerKind::kDFBReserve, {output_id, 1}},
@@ -590,18 +591,17 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
               logical_kernel->role == "tensor_io",
           "Phase 2 ncrisc LogicalKernel must have kind `datamovement` and role "
           "`tensor_io`");
-    VerifyMarkerSequence(
-        ParseMarkers(func->body, symbol),
-        {{MarkerKind::kDFBReserve, {input_a_id, 1}},
-         {MarkerKind::kTensorToDFB,
-          {0, input_a_id, 0, 0, plan.rows, plan.cols}},
-         {MarkerKind::kDFBReserve, {input_b_id, 1}},
-         {MarkerKind::kTensorToDFB,
-          {1, input_b_id, 0, 0, plan.rows, plan.cols}},
-         {MarkerKind::kDFBWait, {output_id, 1}},
-         {MarkerKind::kDFBToTensor,
-          {output_id, 2, 0, 0, plan.rows, plan.cols}}},
-        symbol);
+    VerifyMarkerSequence(ParseMarkers(func->body, symbol),
+                         {{MarkerKind::kDFBReserve, {input_a_id, 1}},
+                          {MarkerKind::kTensorToDFB,
+                           {0, input_a_id, 0, 0, plan.rows, plan.cols}},
+                          {MarkerKind::kDFBReserve, {input_b_id, 1}},
+                          {MarkerKind::kTensorToDFB,
+                           {1, input_b_id, 0, 0, plan.rows, plan.cols}},
+                          {MarkerKind::kDFBWait, {output_id, 1}},
+                          {MarkerKind::kDFBToTensor,
+                           {output_id, 2, 0, 0, plan.rows, plan.cols}}},
+                         symbol);
     return;
   }
   Check(logical_kernel->kind == "idle" && logical_kernel->role == "idle",
@@ -652,7 +652,7 @@ void VerifyFunctionABI(const tirx::PrimFunc &func, const std::string &symbol,
 
 void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
                      const CoreCoord &launch_grid, const TensorTable &tensors,
-                     const Phase2AddPlan *phase2_plan) {
+                     const Phase2AddPlan *phase2_plan, bool general = false) {
   std::unordered_set<std::string> slots;
   std::unordered_set<std::string> symbols;
   std::unordered_set<std::string> kernel_ids;
@@ -751,8 +751,8 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
                   tensor_arg_indices[2]->value == 2,
               "Phase 2 ncrisc must own Tensor ABI indices [0, 1, 2]");
       } else {
-        Check(tensor_arg_indices.empty(), "Phase 2 " + std::string(slot) +
-                                              " must not own Tensor ABI args");
+        Check(tensor_arg_indices.empty(),
+              "Phase 2 " + std::string(slot) + " must not own Tensor ABI args");
       }
     }
     Check(IsVoidType(func->ret_type),
@@ -760,7 +760,7 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
     VerifyNoForbiddenOps(func, symbol);
     if (phase2_plan != nullptr) {
       VerifyPhase2Body(func, symbol, slot, logical_kernel, *phase2_plan);
-    } else {
+    } else if (!general) {
       Check(IsCanonicalNoOp(func->body),
             "Phase 1 PrimFunc `" + symbol +
                 "` body must be the canonical Evaluate(0) no-op");
@@ -795,11 +795,624 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
         "operation must contain exactly trisc, ncrisc, and brisc slots");
 }
 
+using namespace tirx;
+
+ffi::String ComputeString(const Call &call, const char *key) {
+  auto value = call->annotations.Get(key);
+  Check(value.has_value(),
+        std::string("dfb_compute missing annotation ") + key);
+  const auto *text = value.value().as<StringImmNode>();
+  Check(text != nullptr,
+        std::string("dfb_compute annotation must be StringImm: ") + key);
+  return text->value;
+}
+
+int64_t ComputeInteger(const Call &call, const char *key) {
+  auto value = call->annotations.Get(key);
+  Check(value.has_value(),
+        std::string("dfb_compute missing annotation ") + key);
+  auto expr = value.value().as<PrimExpr>();
+  Check(expr.has_value(),
+        std::string("dfb_compute invalid integer annotation ") + key);
+  return RequireStaticInteger(expr.value(), key);
+}
+
+ffi::Array<PrimExpr> CheckedShape(const ffi::Any &value,
+                                  const std::string &owner) {
+  auto array = value.as<ffi::Array<ffi::Any>>();
+  Check(array.has_value(), owner + " annotation must be an Array");
+  ffi::Array<PrimExpr> shape;
+  for (const ffi::Any &item : array.value()) {
+    auto extent = item.as<PrimExpr>();
+    Check(extent.has_value(), owner + " shape entries must be PrimExpr");
+    shape.push_back(extent.value());
+  }
+  return shape;
+}
+
+ffi::Array<ffi::Array<PrimExpr>> CheckedShapes(const ffi::Any &value,
+                                               const std::string &owner) {
+  auto array = value.as<ffi::Array<ffi::Any>>();
+  Check(array.has_value(), owner + " annotation must be an Array");
+  ffi::Array<ffi::Array<PrimExpr>> result;
+  for (const ffi::Any &item : array.value())
+    result.push_back(CheckedShape(item, owner));
+  return result;
+}
+
+ffi::Array<ffi::Array<Integer>> CheckedMaps(const ffi::Any &value) {
+  auto arrays = CheckedShapes(value, "tt.access_maps");
+  ffi::Array<ffi::Array<Integer>> maps;
+  for (const auto &array : arrays) {
+    ffi::Array<Integer> axes;
+    for (const PrimExpr &axis : array) {
+      auto integer = axis.as<IntImm>();
+      Check(integer.has_value(), "tt.access_maps entries must be IntImm");
+      axes.push_back(integer.value());
+    }
+    maps.push_back(axes);
+  }
+  return maps;
+}
+
+ffi::Array<PrimExpr> ComputeShape(const Call &call, const char *key) {
+  auto value = call->annotations.Get(key);
+  Check(value.has_value(),
+        std::string("dfb_compute missing annotation ") + key);
+  return CheckedShape(value.value(), key);
+}
+
+bool SupportedComputeDType(DataType dtype) {
+  return dtype == DataType::BFloat(16) || dtype == DataType::Float(32);
+}
+
+void VerifyTileGrid(const ffi::Array<PrimExpr> &shape,
+                    const ffi::Array<PrimExpr> &grid,
+                    const std::string &owner) {
+  Check(shape.size() == grid.size() && !shape.empty(),
+        owner + " shape/grid rank mismatch");
+  for (size_t i = 0; i < shape.size(); ++i) {
+    int64_t extent = RequireStaticInteger(shape[i], owner + " shape extent");
+    int64_t tile = i + 2 >= shape.size() ? 32 : 1;
+    Check(extent > 0 && (extent == 1 || extent % tile == 0),
+          owner + " unsupported logical extent");
+    int64_t expected = (extent + tile - 1) / tile;
+    Check(RequireStaticInteger(grid[i], owner + " tile-grid extent") ==
+              expected,
+          owner + " logical shape disagrees with tile-grid metadata");
+  }
+}
+
+void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
+  Check(!call->args.empty(), "dfb_compute must have an output DFB");
+  std::vector<DFBDescriptor> operands;
+  std::unordered_set<int64_t> input_ids;
+  for (size_t i = 0; i < call->args.size(); ++i) {
+    int64_t id = RequireStaticInteger(call->args[i], "dfb_compute resource ID");
+    Check(dfbs.count(id), "dfb_compute references missing DFB");
+    operands.push_back(dfbs.at(id));
+    if (i)
+      input_ids.insert(id);
+  }
+  Check(!input_ids.count(operands[0]->dfb_id),
+        "dfb_compute output must be a fresh generation");
+  const DFBDescriptor &output = operands[0];
+  ffi::String dtype = ComputeString(call, "tt.compute_dtype");
+  Check(dtype == (output->element_dtype == DataType::BFloat(16) ? "bfloat16"
+                                                                : "float32"),
+        "dfb_compute dtype annotation disagrees with output DFB");
+  auto tile = ComputeShape(call, "tt.compute_tile_shape");
+  Check(ffi::StructuralEqual()(tile, output->tile_shape),
+        "dfb_compute tile shape mismatch");
+  auto shape = ComputeShape(call, "tt.logical_domain");
+  VerifyTileGrid(shape, output->block_shape_in_tiles, "dfb_compute output");
+  auto maps_value = call->annotations.Get("tt.access_maps");
+  Check(maps_value.has_value(), "dfb_compute missing tt.access_maps");
+  auto maps = CheckedMaps(maps_value.value());
+  Check(maps.size() + 1 == operands.size(),
+        "dfb_compute access maps must cover every input operand");
+  ffi::String kind = ComputeString(call, "tt.compute_kind");
+  auto input_shapes_value = call->annotations.Get("tt.input_shapes");
+  Check(input_shapes_value.has_value(), "dfb_compute missing tt.input_shapes");
+  auto input_shapes =
+      CheckedShapes(input_shapes_value.value(), "tt.input_shapes");
+  Check(input_shapes.size() + 1 == operands.size(),
+        "dfb_compute input shape count mismatch");
+  std::unordered_map<int64_t, ffi::Array<Integer>> maps_by_id;
+  for (size_t i = 0; i < maps.size(); ++i) {
+    auto input_shape = input_shapes[i];
+    VerifyTileGrid(input_shape, operands[i + 1]->block_shape_in_tiles,
+                   "dfb_compute input");
+    Check(maps[i].size() == input_shape.size(),
+          "dfb_compute access map rank disagrees with input");
+    auto [previous, inserted] =
+        maps_by_id.emplace(operands[i + 1]->dfb_id, maps[i]);
+    Check(inserted || ffi::StructuralEqual()(previous->second, maps[i]),
+          "one DFB input has conflicting access maps");
+    if (kind == "elementwise" || kind == "typecast" || kind == "fill") {
+      std::unordered_set<int64_t> mapped;
+      for (size_t axis = 0; axis < maps[i].size(); ++axis) {
+        int64_t output_axis = maps[i][axis]->value;
+        Check(output_axis >= -1 &&
+                  output_axis < static_cast<int64_t>(shape.size()),
+              "dfb_compute access map axis is out of range");
+        if (output_axis >= 0) {
+          Check(mapped.insert(output_axis).second,
+                "dfb_compute access map duplicates an output axis");
+          Check(ffi::StructuralEqual()(input_shape[axis], shape[output_axis]),
+                "dfb_compute mapped input extent disagrees with output");
+        }
+      }
+    }
+  }
+  bool scalar = kind == "elementwise" || kind == "fill" || kind == "typecast";
+  Check(scalar || kind == "copy" || kind == "transpose" || kind == "gemm" ||
+            kind == "reduce",
+        "dfb_compute has unknown compute kind");
+  if (scalar) {
+    auto expression_value = call->annotations.Get("tt.expression");
+    Check(expression_value.has_value(), "scalar dfb_compute has no expression");
+    auto expression = expression_value.value().as<PrimExpr>();
+    Check(expression.has_value(), "scalar dfb_compute has invalid expression");
+    Check(expression.value().dtype() == output->element_dtype,
+          "dfb_compute expression dtype disagrees with output");
+    std::unordered_set<int64_t> used;
+    PostOrderVisit(expression.value(), [&](const ffi::ObjectRef &object) {
+      Check(!object.as<BufferLoadNode>() && !object.as<VarNode>(),
+            "Device expression retains BufferLoad or free scalar Var");
+      if (auto expr = object.as<PrimExpr>()) {
+        Check(object.as<IntImmNode>() ||
+                  SupportedComputeDType(expr.value().dtype()),
+              "Device expression has unsupported intermediate dtype");
+        Check(object.as<IntImmNode>() || object.as<FloatImmNode>() ||
+                  object.as<CastNode>() || object.as<CallNode>() ||
+                  object.as<AddNode>() || object.as<SubNode>() ||
+                  object.as<MulNode>() || object.as<DivNode>() ||
+                  object.as<MinNode>() || object.as<MaxNode>(),
+              "Device expression contains an unsupported expression node");
+        if (const auto *cast = object.as<CastNode>())
+          Check(cast->annotations.empty(),
+                "Device Cast annotations are unsupported");
+      }
+      if (const auto *node = object.as<CallNode>()) {
+        Check(node->annotations.empty(),
+              "Device scalar Call annotations are unsupported");
+        const auto *operation = node->op.as<OpNode>();
+        Check(operation != nullptr,
+              "Device expression contains an external call");
+        if (node->op.same_as(dfb_load())) {
+          Check(node->args.size() == 1, "dfb_load must have one resource ID");
+          int64_t id =
+              RequireStaticInteger(node->args[0], "dfb_load resource ID");
+          Check(input_ids.count(id),
+                "dfb_load references an undeclared input DFB");
+          Check(node->dtype == dfbs.at(id)->element_dtype,
+                "dfb_load dtype mismatch");
+          used.insert(id);
+        } else {
+          Check(
+              node->args.size() == 1 && node->args[0].dtype() == node->dtype,
+              "Device unary operation requires one operand of the same dtype");
+          const std::string name = operation->name;
+          Check(name == "tirx.exp" || name == "tirx.log" ||
+                    name == "tirx.sqrt" || name == "tirx.tanh" ||
+                    name == "tirx.rsqrt" || name == "tirx.floor" ||
+                    name == "tirx.ceil" || name == "tirx.exp2" ||
+                    name == "tirx.log2" || name == "tirx.sin" ||
+                    name == "tirx.cos" || name == "tirx.fabs",
+                "Device expression contains unsupported scalar operation " +
+                    name);
+        }
+      }
+    });
+    Check(used == input_ids,
+          "dfb_compute has unused declared expression inputs");
+    Check(kind != "fill" || input_ids.empty(), "fill must not read DFB inputs");
+  } else if (kind == "copy" || kind == "transpose") {
+    Check(operands.size() == 2, "copy/transpose requires one input");
+    Check(operands[1]->element_dtype == output->element_dtype,
+          "copy/transpose dtype mismatch");
+    auto expected = operands[1]->block_shape_in_tiles;
+    if (kind == "transpose") {
+      Check(expected.size() >= 2, "transpose requires rank at least two");
+      auto axes_value = call->annotations.Get("tt.axes");
+      Check(axes_value.has_value(), "transpose missing tt.axes");
+      auto axes = CheckedShape(axes_value.value(), "tt.axes");
+      Check(axes.size() == expected.size(), "transpose axes rank mismatch");
+      for (size_t i = 0; i < expected.size(); ++i) {
+        int64_t axis = i + 2 < expected.size()
+                           ? i
+                           : (i + 1 == expected.size() ? i - 1 : i + 1);
+        Check(RequireStaticInteger(axes[i], "transpose axis") == axis,
+              "transpose supports only last-two-axis permutation");
+      }
+      PrimExpr last = expected[expected.size() - 1];
+      expected.Set(expected.size() - 1, expected[expected.size() - 2]);
+      expected.Set(expected.size() - 2, last);
+    }
+    Check(ffi::StructuralEqual()(expected, output->block_shape_in_tiles),
+          "copy/transpose input-output tile-grid mismatch");
+  } else {
+    int64_t clear = ComputeInteger(call, "tt.clear");
+    Check(clear == 0 || clear == 1, "compute tt.clear must be Boolean");
+    ffi::String accumulation = ComputeString(call, "tt.accum_dtype");
+    Check(accumulation == "float32" ||
+              (kind == "reduce" &&
+               ComputeString(call, "tt.reduce_kind") != "sum" &&
+               accumulation == dtype),
+          "unsupported accumulation dtype");
+    size_t count = kind == "gemm" ? 3 : 2;
+    Check(operands.size() == count + (clear ? 0 : 1),
+          "GEMM/reduce operand count mismatch");
+    if (!clear) {
+      Check(operands.back()->element_dtype == output->element_dtype &&
+                ffi::StructuralEqual()(operands.back()->block_shape_in_tiles,
+                                       output->block_shape_in_tiles),
+            "accumulation input must match output DFB");
+    }
+    if (kind == "gemm") {
+      Check(output->element_dtype == DataType::Float(32),
+            "GEMM output must be float32");
+      Check(operands[1]->element_dtype == operands[2]->element_dtype,
+            "GEMM input dtype mismatch");
+      int64_t ta = ComputeInteger(call, "tt.transpose_a"),
+              tb = ComputeInteger(call, "tt.transpose_b");
+      Check((ta == 0 || ta == 1) && (tb == 0 || tb == 1),
+            "GEMM transpose flags must be Boolean");
+      auto a = operands[1]->block_shape_in_tiles,
+           b = operands[2]->block_shape_in_tiles;
+      auto c = output->block_shape_in_tiles;
+      Check(a.size() >= 2 && a.size() == b.size() && a.size() == c.size(),
+            "GEMM rank mismatch");
+      size_t n = a.size();
+      Check(ffi::StructuralEqual()(a[n - (ta ? 2 : 1)], b[n - (tb ? 1 : 2)]) &&
+                ffi::StructuralEqual()(a[n - (ta ? 1 : 2)], c[n - 2]) &&
+                ffi::StructuralEqual()(b[n - (tb ? 2 : 1)], c[n - 1]),
+            "GEMM M/N/K tile-grid mismatch");
+      for (size_t i = 0; i + 2 < n; ++i)
+        Check(ffi::StructuralEqual()(a[i], b[i]) &&
+                  ffi::StructuralEqual()(a[i], c[i]),
+              "GEMM batch tile-grid mismatch");
+    } else {
+      int64_t axis = ComputeInteger(call, "tt.reduce_axis");
+      auto input = input_shapes[0];
+      Check(axis >= 0 && axis < static_cast<int64_t>(input.size()),
+            "reduction axis out of range");
+      ffi::String reduction = ComputeString(call, "tt.reduce_kind");
+      Check(reduction == "sum" || reduction == "max" || reduction == "min",
+            "unsupported reduction kind");
+      int64_t nan = ComputeInteger(call, "tt.nan_propagate");
+      Check(nan == 0 || nan == 1, "reduction nan propagation must be Boolean");
+      ffi::Array<PrimExpr> expected;
+      for (size_t i = 0; i < input.size(); ++i)
+        if (static_cast<int64_t>(i) != axis)
+          expected.push_back(input[i]);
+      Check(ffi::StructuralEqual()(expected, shape),
+            "reduction output logical shape mismatch");
+    }
+  }
+}
+
+void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
+                          const DFBTable &dfbs) {
+  // Verify an independent structured iteration by induction: every active
+  // slot has the same loop boundary, each resource is defined and fully used
+  // in one iteration, and no DFB value escapes that iteration. Tensor inout
+  // dependencies remain ordered in the NCRISC stream.
+  bool has_loop = false;
+  for (const auto &[global, base] : mod->functions)
+    has_loop |= Downcast<PrimFunc>(base)->body.as<ForNode>() != nullptr;
+  if (has_loop) {
+    ffi::Optional<For> boundary;
+    IRModule iteration = mod;
+    iteration.CopyOnWrite();
+    for (const auto &[global, base] : mod->functions) {
+      PrimFunc func = Downcast<PrimFunc>(base);
+      if (IsCanonicalNoOp(func->body))
+        continue;
+      auto loop_value = func->body.as<For>();
+      Check(loop_value.has_value(),
+            "structured iteration must enclose every active slot");
+      For loop = loop_value.value();
+      Check(loop->kind == ForKind::kSerial && loop->annotations.empty() &&
+                !loop->thread_binding.has_value() &&
+                (!loop->step.has_value() || is_one(loop->step.value())),
+            "Device structured iteration requires an unannotated unit-step "
+            "serial loop");
+      int64_t extent =
+          RequireStaticInteger(loop->extent, "structured loop extent");
+      RequireStaticInteger(loop->min, "structured loop minimum");
+      Check(extent > 0 && extent <= 1024,
+            "structured loop extent must be in [1,1024]");
+      Check(!UsesVar(loop->body,
+                     [&](const VarNode *var) {
+                       return ffi::GetRef<Var>(var).same_as(loop->loop_var);
+                     }),
+            "structured iteration body must be independent of its loop index");
+      if (boundary.has_value()) {
+        Check(
+            ffi::StructuralEqual()(boundary.value()->min, loop->min) &&
+                ffi::StructuralEqual()(boundary.value()->extent, loop->extent),
+            "structured slot loop boundaries disagree");
+      } else {
+        boundary = loop;
+      }
+      func.CopyOnWrite()->body = loop->body;
+      iteration->Update(global, func);
+    }
+    DFBTable local;
+    for (const auto &[id, dfb] : dfbs) {
+      Check(ffi::StructuralEqual()(dfb->transaction_count_or_loop_relation,
+                                   boundary.value()->extent),
+            "DFB transaction relation disagrees with structured loop extent");
+      local.emplace(id, DFBDescriptor(dfb->dfb_id, dfb->source_buffer_identity,
+                                      dfb->element_dtype, dfb->tile_shape,
+                                      dfb->block_shape_in_tiles,
+                                      dfb->block_count, dfb->tensor_backing,
+                                      dfb->producer_slot, dfb->producer_domain,
+                                      dfb->consumer_slot, dfb->consumer_domain,
+                                      Integer(1), dfb->source_span));
+    }
+    VerifyGeneralProgram(iteration, tensors, local);
+    return;
+  }
+  struct Event {
+    Call call;
+    std::string slot;
+  };
+  std::vector<Event> events;
+  std::vector<std::vector<size_t>> dependencies;
+  std::unordered_map<int64_t, size_t> producers;
+  std::unordered_map<int64_t, size_t> reserves;
+  std::unordered_map<int64_t, size_t> use_count;
+  std::unordered_map<int64_t, std::string> consumers;
+  std::unordered_map<int64_t, int> effects;
+  std::unordered_map<int64_t, ffi::Array<PrimExpr>> logical_shapes;
+  for (const auto &[id, tensor] : tensors) {
+    Check(SupportedComputeDType(tensor->dtype),
+          "Phase 4 Tensor dtype unsupported");
+    Check(tensor->tile_shape.size() == 2 &&
+              RequireStaticInteger(tensor->tile_shape[0], "Tensor tile rows") ==
+                  32 &&
+              RequireStaticInteger(tensor->tile_shape[1],
+                                   "Tensor tile columns") == 32,
+          "Phase 4 Tensor physical tile shape must be [32,32]");
+    Check(tensor->alias_group == id,
+          "Phase 4 cross-parameter storage aliases are unsupported");
+    if (!tensor->strides.empty()) {
+      arith::Analyzer analyzer;
+      PrimExpr stride = Integer(1);
+      for (size_t axis = tensor->shape.size(); axis-- > 0;) {
+        Check(analyzer.CanProveEqual(tensor->strides[axis], stride),
+              "Phase 4 Tensor requires compact row-major strides");
+        stride = stride * tensor->shape[axis];
+      }
+    }
+    Check(tensor->memory_space == "dram" &&
+              tensor->memory_layout == "interleaved",
+          "Phase 4 Tensor layout unsupported");
+    Check(!tensor->shard_spec.has_value(),
+          "Phase 4 sharded Tensor unsupported");
+    VerifyTileGrid(tensor->shape, tensor->tile_grid_shape,
+                   "Tensor " + std::to_string(id));
+  }
+  for (const auto &[id, dfb] : dfbs) {
+    Check(SupportedComputeDType(dfb->element_dtype),
+          "Phase 4 DFB dtype unsupported");
+    int64_t capacity =
+        RequireStaticInteger(dfb->block_count, "DFB block count");
+    Check(capacity >= 1 && capacity <= 32,
+          "Phase 4 DFB block count must be in [1,32]");
+    Check(dfb->tile_shape.size() == 2 &&
+              RequireStaticInteger(dfb->tile_shape[0], "tile rows") == 32 &&
+              RequireStaticInteger(dfb->tile_shape[1], "tile cols") == 32,
+          "Phase 4 physical tile shape must be [32,32]");
+    Check(RequireStaticInteger(dfb->transaction_count_or_loop_relation,
+                               "transaction count") == 1,
+          "Phase 4 immutable generation has exactly one publication");
+    Check(ffi::StructuralEqual()(dfb->producer_domain, dfb->consumer_domain),
+          "Phase 4 resource domains must match");
+    if (dfb->tensor_backing.has_value()) {
+      const auto &backing = dfb->tensor_backing.value();
+      const TensorDescriptor &tensor = tensors.at(backing->global_arg_index);
+      Check(RequireStaticInteger(backing->byte_offset, "backing byte offset") ==
+                0,
+            "Phase 4 backing offset must be zero");
+      Check(dfb->element_dtype == tensor->dtype &&
+                ffi::StructuralEqual()(dfb->block_shape_in_tiles,
+                                       tensor->tile_grid_shape),
+            "DFB Tensor backing metadata mismatch");
+    }
+  }
+  for (const auto &[global, base] : mod->functions) {
+    PrimFunc function = Downcast<PrimFunc>(base);
+    std::string slot = function->GetAttr<ffi::String>(kKernelSlotAttr).value();
+    auto tensor_indices =
+        function->GetAttr<ffi::Array<Integer>>(kTensorArgIndicesAttr).value();
+    Check(slot == "ncrisc" || tensor_indices.empty(),
+          "Phase 4 Tensor ABI belongs exclusively to ncrisc");
+    if (slot == "brisc") {
+      Check(IsCanonicalNoOp(function->body), "Phase 4 brisc must be idle");
+      continue;
+    }
+    if (IsCanonicalNoOp(function->body))
+      continue;
+    ffi::Array<Stmt> statements;
+    if (const auto *seq = function->body.as<SeqStmtNode>())
+      statements = seq->seq;
+    else
+      statements.push_back(function->body);
+    std::unordered_set<int64_t> waited;
+    size_t previous = events.size();
+    bool first = true;
+    for (const Stmt &statement : statements) {
+      const auto *evaluate = statement.as<EvaluateNode>();
+      Check(evaluate != nullptr,
+            "Phase 4 slot body must contain only scheduled Device operations");
+      const auto *node = evaluate->value.as<CallNode>();
+      Check(node && node->dtype.is_void(),
+            "Phase 4 Device operation must be a void intrinsic");
+      Call call = ffi::GetRef<Call>(node);
+      size_t event = events.size();
+      events.push_back({call, slot});
+      dependencies.emplace_back();
+      if (!first)
+        dependencies[event].push_back(previous);
+      first = false;
+      previous = event;
+      auto id_at = [&](size_t index) {
+        Check(index < call->args.size(),
+              "Device operation missing resource ID");
+        int64_t id = RequireStaticInteger(call->args[index], "resource ID");
+        Check(dfbs.count(id),
+              "Device operation references missing DFB " + std::to_string(id));
+        return id;
+      };
+      auto read = [&](int64_t id) {
+        Check(waited.count(id),
+              "DFB use must be preceded by dfb_wait in consumer slot");
+        Check(dfbs.at(id)->consumer_slot == slot,
+              "DFB consumer slot metadata mismatch");
+        ++use_count[id];
+        consumers[id] = slot;
+      };
+      auto publish = [&](int64_t id) {
+        Check(reserves.count(id),
+              "DFB publication must be preceded by dfb_reserve");
+        Check(dfbs.at(id)->producer_slot == slot,
+              "DFB producer slot metadata mismatch");
+        Check(producers.emplace(id, event).second,
+              "DFB generation published more than once");
+      };
+      if (call->op.same_as(dfb_reserve()) || call->op.same_as(dfb_wait())) {
+        Check(call->args.size() == 2 &&
+                  RequireStaticInteger(call->args[1], "transaction count") == 1,
+              "immutable DFB reserve/wait must request one transaction");
+        int64_t id = id_at(0);
+        if (call->op.same_as(dfb_reserve())) {
+          Check(dfbs.at(id)->producer_slot == slot,
+                "DFB reserve in wrong slot");
+          Check(reserves.emplace(id, event).second,
+                "DFB generation reserved more than once");
+        } else {
+          Check(dfbs.at(id)->consumer_slot == slot, "DFB wait in wrong slot");
+          waited.insert(id);
+        }
+      } else if (call->op.same_as(dfb_compute())) {
+        Check(slot == "trisc", "dfb_compute must execute in trisc");
+        VerifyGeneralCompute(call, dfbs);
+        logical_shapes[id_at(0)] = ComputeShape(call, "tt.logical_domain");
+        for (size_t i = 1; i < call->args.size(); ++i)
+          read(id_at(i));
+        publish(id_at(0));
+      } else if (call->op.same_as(tensor_to_dfb_nd()) ||
+                 call->op.same_as(dfb_to_tensor_nd())) {
+        Check(slot == "ncrisc", "Tensor transfer must execute in ncrisc");
+        bool input = call->op.same_as(tensor_to_dfb_nd());
+        int64_t id = id_at(input ? 1 : 0);
+        int64_t tensor_id =
+            RequireStaticInteger(call->args[input ? 0 : 1], "Tensor ID");
+        Check(tensors.count(tensor_id), "transfer references missing Tensor");
+        auto tensor = tensors.at(tensor_id);
+        Check(call->args.size() == 2 + 2 * tensor->shape.size(),
+              "ND transfer rank/arity mismatch");
+        for (size_t axis = 0; axis < tensor->shape.size(); ++axis) {
+          Check(RequireStaticInteger(call->args[2 + 2 * axis],
+                                     "transfer start") == 0 &&
+                    ffi::StructuralEqual()(call->args[3 + 2 * axis],
+                                           tensor->shape[axis]),
+                "ND transfer must cover full Tensor");
+        }
+        auto dfb = dfbs.at(id);
+        Check(dfb->tensor_backing.has_value() &&
+                  dfb->tensor_backing.value()->global_arg_index == tensor_id,
+              "transfer disagrees with DFB Tensor backing");
+        effects[tensor_id] |= input ? 1 : 2;
+        if (input) {
+          logical_shapes[id] = tensor->shape;
+          publish(id);
+        } else
+          read(id);
+      } else {
+        Fail("Phase 4 slot retains an unsupported Device operation");
+      }
+    }
+  }
+  for (const auto &[id, descriptor] : dfbs) {
+    Check(producers.count(id) && reserves.count(id),
+          "DFB generation is never published");
+    Check(use_count[id] > 0, "DFB generation is never consumed");
+  }
+  for (size_t i = 0; i < events.size(); ++i) {
+    if (events[i].call->op.same_as(dfb_wait())) {
+      int64_t id = RequireStaticInteger(events[i].call->args[0], "wait ID");
+      dependencies[i].push_back(producers.at(id));
+    }
+  }
+  for (const Event &event : events) {
+    const Call &call = event.call;
+    if (call->op.same_as(dfb_compute())) {
+      auto shapes = Downcast<ffi::Array<ffi::Array<PrimExpr>>>(
+          call->annotations.at("tt.input_shapes"));
+      for (size_t i = 1; i < call->args.size(); ++i) {
+        int64_t id = RequireStaticInteger(call->args[i], "input DFB ID");
+        Check(logical_shapes.count(id) &&
+                  ffi::StructuralEqual()(logical_shapes.at(id), shapes[i - 1]),
+              "dfb_compute input logical shape disagrees with its producer");
+      }
+    } else if (call->op.same_as(dfb_to_tensor_nd())) {
+      int64_t id = RequireStaticInteger(call->args[0], "export DFB ID");
+      int64_t tensor = RequireStaticInteger(call->args[1], "export Tensor ID");
+      Check(logical_shapes.count(id) &&
+                ffi::StructuralEqual()(logical_shapes.at(id),
+                                       tensors.at(tensor)->shape),
+            "export logical shape disagrees with its producer");
+    }
+  }
+  // Check the combined slot-order and wait-for graph: individually legal
+  // streams can still deadlock when their cross-slot dependencies form a cycle.
+  std::vector<int> state(events.size(), 0);
+  std::function<void(size_t)> visit = [&](size_t event) {
+    Check(state[event] != 1,
+          "Device transaction dependency cycle (cross-slot deadlock)");
+    if (state[event] == 2)
+      return;
+    state[event] = 1;
+    for (size_t dependency : dependencies[event])
+      visit(dependency);
+    state[event] = 2;
+  };
+  for (size_t i = 0; i < events.size(); ++i)
+    visit(i);
+  for (const auto &[id, tensor] : tensors) {
+    ffi::String expected = effects[id] == 3   ? "inout"
+                           : effects[id] == 2 ? "output"
+                                              : "input";
+    Check(tensor->effect == expected,
+          "Tensor effect disagrees with scheduled dataflow");
+  }
+  for (const auto &[global, base] : mod->functions) {
+    PrimFunc function = Downcast<PrimFunc>(base);
+    if (function->GetAttr<ffi::String>(kKernelSlotAttr).value() != "ncrisc")
+      continue;
+    std::unordered_set<int64_t> declared;
+    for (const Integer &id :
+         function->GetAttr<ffi::Array<Integer>>(kTensorArgIndicesAttr).value())
+      declared.insert(id->value);
+    std::unordered_set<int64_t> used;
+    for (const auto &[id, access] : effects)
+      if (access)
+        used.insert(id);
+    Check(declared == used,
+          "NCRISC Tensor ABI must contain exactly the used Tensor arguments");
+  }
+}
+
 IRModule VerifyModule(IRModule mod) {
   Integer version = RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr);
-  Check(version->value == kDeviceIRVersion,
+  Check(version->value == kDeviceIRVersion || version->value == 2,
         "unsupported tt.device_ir_version " + std::to_string(version->value) +
-            "; expected 1");
+            "; expected 1 or 2");
 
   ffi::String target_arch =
       RequireModuleAttr<ffi::String>(mod, kTargetArchAttr);
@@ -829,10 +1442,16 @@ IRModule VerifyModule(IRModule mod) {
             kernel_order[1] == "ncrisc" && kernel_order[2] == "brisc",
         "tt.kernel_order must be exactly [trisc, ncrisc, brisc]");
 
-  TensorTable tensor_table = VerifyTensorTable(tensors, launch_grid);
-  DFBTable dfb_table = VerifyDFBTable(dfbs, tensor_table, launch_grid);
+  const bool general = version->value == 2;
+  TensorTable tensor_table = VerifyTensorTable(tensors, launch_grid, general);
+  DFBTable dfb_table = VerifyDFBTable(dfbs, tensor_table, launch_grid, general);
   VerifyPipeTable(pipes, dfb_table, launch_grid);
-  if (dfbs.empty()) {
+  if (general) {
+    Check(launch_grid->x == 1 && launch_grid->y == 1 && pipes.empty(),
+          "Phase 4 is single-Core without Pipe communication");
+    VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr, true);
+    VerifyGeneralProgram(mod, tensor_table, dfb_table);
+  } else if (dfbs.empty()) {
     Check(pipes.empty(), "Device IR without DFBs must not contain Pipes");
     VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr);
   } else {

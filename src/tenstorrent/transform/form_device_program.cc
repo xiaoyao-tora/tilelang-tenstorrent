@@ -14,22 +14,27 @@
 #include "../op/builtin.h"
 #include "verify_device_ir.h"
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
 #include <tvm/ir/function.h>
 #include <tvm/ir/module.h>
 #include <tvm/ir/transform.h>
 #include <tvm/target/target.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/stmt_functor.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -72,8 +77,7 @@ struct AddDataflowPlan {
 
 [[noreturn]] void ThrowUnsupported(const std::string &message) {
   TVM_FFI_THROW(NotImplementedError)
-      << "[FormTenstorrentDeviceProgram] unsupported program: "
-      << message;
+      << "[FormTenstorrentDeviceProgram] unsupported program: " << message;
 }
 
 int64_t RequirePositiveStaticInteger(const PrimExpr &value,
@@ -222,18 +226,18 @@ Region2D RequireFullRegion(const BufferRegion &region,
     ThrowUnsupported(owner + " must be a rank-2 region");
   }
   for (size_t axis = 0; axis < 2; ++axis) {
-    const int64_t start = RequireStaticInteger(
-        region->region[axis]->min,
-        owner + " start axis " + std::to_string(axis));
-    const int64_t extent = RequireStaticInteger(
-        region->region[axis]->extent,
-        owner + " extent axis " + std::to_string(axis));
-    const int64_t shape = RequireStaticInteger(
-        region->buffer->shape[axis],
-        owner + " buffer shape axis " + std::to_string(axis));
+    const int64_t start =
+        RequireStaticInteger(region->region[axis]->min,
+                             owner + " start axis " + std::to_string(axis));
+    const int64_t extent =
+        RequireStaticInteger(region->region[axis]->extent,
+                             owner + " extent axis " + std::to_string(axis));
+    const int64_t shape = RequireStaticInteger(region->buffer->shape[axis],
+                                               owner + " buffer shape axis " +
+                                                   std::to_string(axis));
     if (start != 0 || extent != shape) {
       ThrowUnsupported(owner + " must cover the complete Buffer; partial Add "
-                                "tiles are deferred beyond Phase 2");
+                               "tiles are deferred beyond Phase 2");
     }
   }
   return {region->region[0]->min, region->region[1]->min,
@@ -349,7 +353,8 @@ AnalyzeAddDataflow(const PrimFunc &frontend, const Stmt &kernel_body,
   Copy input_b = Downcast<Copy>(ParseOperator(input_b_call));
   Copy output = Downcast<Copy>(ParseOperator(output_call));
   if (add_call->args.size() != 3) {
-    ThrowMalformed("canonical tl.tt.tile_add must have three BufferRegion args");
+    ThrowMalformed(
+        "canonical tl.tt.tile_add must have three BufferRegion args");
   }
   BufferRegion add_a =
       NormalizeToAccessRegion(add_call->args[0], kAccessRead).region;
@@ -384,7 +389,8 @@ AnalyzeAddDataflow(const PrimFunc &frontend, const Stmt &kernel_body,
   AddDataflowPlan plan;
   plan.tensor_regions[0] = RequireFullRegion(input_a_source, "input A Tensor");
   plan.tensor_regions[1] = RequireFullRegion(input_b_source, "input B Tensor");
-  plan.tensor_regions[2] = RequireFullRegion(output_destination, "output C Tensor");
+  plan.tensor_regions[2] =
+      RequireFullRegion(output_destination, "output C Tensor");
   RequireFullRegion(add_a, "input A DFB");
   RequireFullRegion(add_b, "input B DFB");
   RequireFullRegion(add_c, "output C DFB");
@@ -393,7 +399,8 @@ AnalyzeAddDataflow(const PrimFunc &frontend, const Stmt &kernel_body,
   plan.tensors = {
       RequireMetadata(metadata_by_buffer, input_a_source->buffer, "input A"),
       RequireMetadata(metadata_by_buffer, input_b_source->buffer, "input B"),
-      RequireMetadata(metadata_by_buffer, output_destination->buffer, "output C")};
+      RequireMetadata(metadata_by_buffer, output_destination->buffer,
+                      "output C")};
   plan.dfbs = {
       RequireMetadata(metadata_by_buffer, add_a->buffer, "input A DFB"),
       RequireMetadata(metadata_by_buffer, add_b->buffer, "input B DFB"),
@@ -403,7 +410,8 @@ AnalyzeAddDataflow(const PrimFunc &frontend, const Stmt &kernel_body,
     const TTBufferMetadata &tensor = plan.tensors[index];
     const TTBufferMetadata &dfb = plan.dfbs[index];
     if (tensor->kind != "tensor" || !tensor->global_arg_index.has_value() ||
-        tensor->global_arg_index.value()->value != static_cast<int64_t>(index)) {
+        tensor->global_arg_index.value()->value !=
+            static_cast<int64_t>(index)) {
       ThrowMalformed("Add Tensor operands must follow ABI order A=0, B=1, C=2");
     }
     if (dfb->kind != "logical_dfb_candidate" ||
@@ -437,11 +445,9 @@ AnalyzeAddDataflow(const PrimFunc &frontend, const Stmt &kernel_body,
   return plan;
 }
 
-ffi::Array<TensorDescriptor>
-BuildTensorTable(const PrimFunc &func,
-                 const ffi::Array<TTBufferMetadata> &buffer_table,
-                 const ffi::Array<ffi::String> &effects,
-                 bool allow_dfb_candidates) {
+ffi::Array<TensorDescriptor> BuildTensorTable(
+    const PrimFunc &func, const ffi::Array<TTBufferMetadata> &buffer_table,
+    const ffi::Array<ffi::String> &effects, bool allow_dfb_candidates) {
   if (effects.size() != func->params.size()) {
     ThrowMalformed("Tensor effect plan does not cover every ABI parameter");
   }
@@ -481,8 +487,8 @@ BuildTensorTable(const PrimFunc &func,
         global_arg_index, buffer->shape, buffer->dtype, buffer->strides,
         metadata->tile_shape, metadata->tile_grid_shape, "dram",
         metadata->memory_layout, metadata->shard_spec,
-        effects[expected_tensor_index],
-        global_arg_index, std::move(source_span)));
+        effects[expected_tensor_index], global_arg_index,
+        std::move(source_span)));
     ++expected_tensor_index;
   }
   if (expected_tensor_index != func->params.size()) {
@@ -513,8 +519,7 @@ ffi::Array<DFBDescriptor> BuildAddDFBTable(const AddDataflowPlan &plan,
   return result;
 }
 
-Stmt MakeDeviceCall(const Op &op, ffi::Array<PrimExpr> args,
-                    const Span &span) {
+Stmt MakeDeviceCall(const Op &op, ffi::Array<PrimExpr> args, const Span &span) {
   return Evaluate(Call(DataType::Void(), op, std::move(args), {}, span), span);
 }
 
@@ -554,16 +559,492 @@ Stmt BuildAddNCRISCBody(const AddDataflowPlan &plan) {
       {MakeDeviceCall(tenstorrent::dfb_reserve(), {Integer(0), Integer(1)},
                       span),
        MakeDeviceCall(tenstorrent::tensor_to_dfb(),
-                      MakeTransferArgs(0, 0, plan.tensor_regions[0], true), span),
+                      MakeTransferArgs(0, 0, plan.tensor_regions[0], true),
+                      span),
        MakeDeviceCall(tenstorrent::dfb_reserve(), {Integer(1), Integer(1)},
                       span),
        MakeDeviceCall(tenstorrent::tensor_to_dfb(),
-                      MakeTransferArgs(1, 1, plan.tensor_regions[1], true), span),
+                      MakeTransferArgs(1, 1, plan.tensor_regions[1], true),
+                      span),
        MakeDeviceCall(tenstorrent::dfb_wait(), {Integer(2), Integer(1)}, span),
        MakeDeviceCall(tenstorrent::dfb_to_tensor(),
                       MakeTransferArgs(2, 2, plan.tensor_regions[2], false),
                       span)},
       span);
+}
+
+// Phase 4 assigns an immutable resource to every write.  This deliberately
+// avoids capacity reuse, cyclic schedules, and cross-Core communication.
+struct ResourceVersion {
+  TTBufferMetadata metadata;
+  ffi::String producer;
+  ffi::String consumer;
+  ffi::Optional<TensorBacking> backing;
+};
+
+class DeviceExpressionRewriter : public StmtExprMutator {
+public:
+  explicit DeviceExpressionRewriter(
+      const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
+                               ffi::ObjectPtrEqual> &inputs)
+      : inputs_(inputs) {}
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    auto found = inputs_.find(op->buffer);
+    if (found == inputs_.end()) {
+      ThrowMalformed("compute expression reads an undeclared input");
+    }
+    return Call(op->dtype, tenstorrent::dfb_load(), {Integer(found->second)},
+                {}, op->span);
+  }
+
+private:
+  const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
+                           ffi::ObjectPtrEqual> &inputs_;
+};
+
+class GeneralDataflowPlanner {
+public:
+  GeneralDataflowPlanner(const PrimFunc &frontend,
+                         const ffi::Array<TTBufferMetadata> &metadata)
+      : frontend_(frontend), metadata_(IndexBufferMetadata(metadata)),
+        tensor_reads_(frontend->params.size(), false),
+        tensor_writes_(frontend->params.size(), false) {}
+
+  void EliminateDeadWrites() {
+    std::unordered_set<int64_t> live;
+    std::unordered_map<int64_t, std::vector<int64_t>> inputs;
+    for (const Stmt &statement : compute_) {
+      const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
+      if (call->op.same_as(tenstorrent::dfb_compute())) {
+        int64_t output = *as_const_int(call->args[0]);
+        for (size_t i = 1; i < call->args.size(); ++i)
+          inputs[output].push_back(*as_const_int(call->args[i]));
+      }
+    }
+    std::function<void(int64_t)> mark = [&](int64_t id) {
+      if (!live.insert(id).second)
+        return;
+      for (int64_t input : inputs[id])
+        mark(input);
+    };
+    for (const Stmt &statement : transfer_) {
+      const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
+      if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
+        mark(*as_const_int(call->args[0]));
+    }
+    auto filter = [&](const ffi::Array<Stmt> &body) {
+      ffi::Array<Stmt> result;
+      for (const Stmt &statement : body) {
+        const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
+        size_t arg = call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ? 1 : 0;
+        if (live.count(*as_const_int(call->args[arg])))
+          result.push_back(statement);
+      }
+      return result;
+    };
+    compute_ = filter(compute_);
+    transfer_ = filter(transfer_);
+    live_ = std::move(live);
+    std::fill(tensor_reads_.begin(), tensor_reads_.end(), false);
+    for (const Stmt &statement : transfer_) {
+      const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
+      if (call->op.same_as(tenstorrent::tensor_to_dfb_nd()))
+        tensor_reads_[*as_const_int(call->args[0])] = true;
+    }
+  }
+
+  void Plan(const Stmt &stmt) {
+    if (++statement_count_ > 65536) {
+      ThrowUnsupported(
+          "static control-flow expansion exceeds 65536 statements");
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq)
+        Plan(child);
+      return;
+    }
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+      if (!realize->iter_values.empty() || !is_one(realize->predicate) ||
+          !realize->block->iter_vars.empty() ||
+          realize->block->init.has_value() ||
+          !realize->block->match_buffers.empty()) {
+        ThrowUnsupported(
+            "non-canonical block realization or match-buffer alias");
+      }
+      if (realize->block->annotations.count("tt.compute_kind")) {
+        ThrowMalformed(
+            "unconsumed compute block; run LegalizeTenstorrentTileOps");
+      }
+      Plan(realize->block->body);
+      return;
+    }
+    if (const auto *loop = stmt.as<ForNode>()) {
+      if (loop->kind != ForKind::kSerial && loop->kind != ForKind::kUnrolled) {
+        ThrowUnsupported(
+            "control flow must use a static serial or unrolled loop");
+      }
+      if (!loop->annotations.empty() ||
+          (loop->step.has_value() && !is_one(loop->step.value()))) {
+        ThrowUnsupported("serial computation requires unit step and no "
+                         "pipeline/scheduling annotations");
+      }
+      int64_t minimum = RequireStaticInteger(loop->min, "serial loop minimum");
+      int64_t extent =
+          RequirePositiveStaticInteger(loop->extent, "serial loop extent");
+      if (extent > 1024)
+        ThrowUnsupported("serial loop extent exceeds 1024");
+      for (int64_t i = 0; i < extent; ++i) {
+        ffi::Map<Var, PrimExpr> replacement{
+            {loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + i)}};
+        Plan(Substitute(loop->body, replacement));
+      }
+      return;
+    }
+    if (const auto *branch = stmt.as<IfThenElseNode>()) {
+      arith::Analyzer analyzer;
+      PrimExpr condition = analyzer.Simplify(branch->condition);
+      if (!as_const_int(condition)) {
+        ThrowUnsupported(
+            "data-dependent control flow requires a proven balanced "
+            "cross-slot transaction schedule");
+      }
+      if (is_one(condition))
+        Plan(branch->then_case);
+      else if (branch->else_case.has_value())
+        Plan(branch->else_case.value());
+      return;
+    }
+    const auto *evaluate = stmt.as<EvaluateNode>();
+    if (!evaluate)
+      ThrowUnsupported(std::string("unconsumed statement ") +
+                       stmt->GetTypeKey());
+    if (is_zero(evaluate->value))
+      return;
+    const auto *node = evaluate->value.as<CallNode>();
+    if (!node)
+      ThrowUnsupported("non-call Evaluate in compute dataflow");
+    Call call = ffi::GetRef<Call>(node);
+    if (call->op.same_as(Copy::Get())) {
+      PlanCopy(Downcast<Copy>(ParseOperator(call)), call);
+    } else if (call->op.same_as(tenstorrent::tile_add())) {
+      BufferRegion a =
+          NormalizeToAccessRegion(call->args[0], kAccessRead).region;
+      BufferRegion b =
+          NormalizeToAccessRegion(call->args[1], kAccessRead).region;
+      BufferRegion c =
+          NormalizeToAccessRegion(call->args[2], kAccessWrite).region;
+      ffi::Array<PrimExpr> zero(a->buffer->shape.size(), Integer(0));
+      ffi::Array<Integer> identity;
+      for (size_t i = 0; i < zero.size(); ++i)
+        identity.push_back(Integer(i));
+      auto attrs = call->annotations;
+      attrs.Set("tt.compute_kind", StringImm("elementwise"));
+      attrs.Set("tt.logical_domain", c->buffer->shape);
+      attrs.Set("tt.access_maps",
+                ffi::Array<ffi::Array<Integer>>{identity, identity});
+      attrs.Set("tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>{
+                                       a->buffer->shape, b->buffer->shape});
+      attrs.Set("tt.expression",
+                Add(BufferLoad(a->buffer, zero), BufferLoad(b->buffer, zero)));
+      PlanCompute(Call(DataType::Void(), tenstorrent::tile_compute(),
+                       {call->args[2], call->args[0], call->args[1]}, attrs,
+                       call->span));
+    } else if (call->op.same_as(tenstorrent::tile_compute())) {
+      PlanCompute(call);
+    } else {
+      ThrowUnsupported(
+          "unconsumed operation; expected legalized tile_compute or Copy");
+    }
+  }
+
+  ffi::Array<ffi::String> Effects() const {
+    ffi::Array<ffi::String> effects;
+    for (int access : TensorAccesses()) {
+      effects.push_back(access == 3   ? "inout"
+                        : access == 2 ? "output"
+                                      : "input");
+    }
+    return effects;
+  }
+
+  ffi::Array<Integer> UsedTensorIndices() const {
+    ffi::Array<Integer> indices;
+    auto accesses = TensorAccesses();
+    for (size_t index = 0; index < accesses.size(); ++index)
+      if (accesses[index])
+        indices.push_back(Integer(index));
+    return indices;
+  }
+
+  ffi::Array<DFBDescriptor> Descriptors(const CoreDomain &domain) const {
+    ffi::Array<DFBDescriptor> result;
+    for (size_t i = 0; i < resources_.size(); ++i) {
+      if (!live_.count(i))
+        continue;
+      const ResourceVersion &resource = resources_[i];
+      if (resource.consumer.empty()) {
+        ThrowUnsupported(
+            "DFB generation " + std::to_string(i) +
+            " has no consumer (dead writes must be removed before formation)");
+      }
+      const TTBufferMetadata &metadata = resource.metadata;
+      result.push_back(DFBDescriptor(
+          i, metadata->buffer_id + ".v" + std::to_string(i),
+          metadata->buffer->dtype, metadata->tile_shape,
+          metadata->tile_grid_shape, metadata->dfb_block_count.value(),
+          resource.backing, resource.producer, domain, resource.consumer,
+          domain, Integer(1),
+          RequireSourceSpan(metadata->source_span, frontend_->span,
+                            "DFB generation")));
+    }
+    return result;
+  }
+
+  Stmt ComputeBody() const { return Body(compute_); }
+  Stmt TransferBody() const { return Body(transfer_); }
+
+private:
+  std::vector<int> TensorAccesses() const {
+    std::vector<int> accesses(frontend_->params.size(), 0);
+    for (const Stmt &statement : transfer_) {
+      const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
+      if (call->op.same_as(tenstorrent::tensor_to_dfb_nd()))
+        accesses[*as_const_int(call->args[0])] |= 1;
+      if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
+        accesses[*as_const_int(call->args[1])] |= 2;
+    }
+    return accesses;
+  }
+
+  Stmt Body(const ffi::Array<Stmt> &statements) const {
+    if (statements.empty())
+      return Evaluate(Integer(0), frontend_->span);
+    if (statements.size() == 1)
+      return statements[0];
+    return SeqStmt(statements, frontend_->span);
+  }
+
+  void FullRegion(const BufferRegion &region) const {
+    if (region->region.size() != region->buffer->shape.size())
+      ThrowMalformed("region rank disagrees with buffer rank");
+    for (size_t i = 0; i < region->region.size(); ++i) {
+      arith::Analyzer analyzer;
+      if (!analyzer.CanProveEqual(region->region[i]->min, Integer(0)) ||
+          !analyzer.CanProveEqual(region->region[i]->extent,
+                                  region->buffer->shape[i]))
+        ThrowUnsupported("Phase 4 dataflow requires complete Buffer regions; "
+                         "partial alias/view is unsupported");
+    }
+  }
+
+  int64_t Read(const Buffer &buffer, const ffi::String &consumer) {
+    auto found = current_.find(buffer->data);
+    if (found == current_.end())
+      ThrowMalformed("read-before-write of DFB buffer '" +
+                     std::string(buffer->name) + "'");
+    ResourceVersion &resource = resources_[found->second];
+    if (resource.metadata->buffer->dtype != buffer->dtype ||
+        !ffi::StructuralEqual()(resource.metadata->buffer->shape,
+                                buffer->shape))
+      ThrowUnsupported("alias must preserve full Buffer shape and dtype");
+    if (!resource.consumer.empty() && resource.consumer != consumer)
+      ThrowUnsupported("DFB generation has consumers in multiple slots");
+    resource.consumer = consumer;
+    return found->second;
+  }
+
+  int64_t Write(const Buffer &buffer, const ffi::String &producer,
+                ffi::Optional<TensorBacking> backing = std::nullopt,
+                bool publish_current = true) {
+    const TTBufferMetadata &metadata =
+        RequireMetadata(metadata_, buffer, "DFB write");
+    if (metadata->kind != "logical_dfb_candidate" ||
+        !metadata->dfb_block_count.has_value())
+      ThrowUnsupported(
+          "compute and dataflow destinations must be shared DFB buffers");
+    RequirePositiveStaticInteger(metadata->dfb_block_count.value(),
+                                 "DFB block count");
+    int64_t id = resources_.size();
+    resources_.push_back({metadata, producer, "", backing});
+    if (publish_current)
+      current_[buffer->data] = id;
+    return id;
+  }
+
+  void Wait(ffi::Array<Stmt> *body, int64_t id, const Span &span) {
+    body->push_back(MakeDeviceCall(tenstorrent::dfb_wait(),
+                                   {Integer(id), Integer(1)}, span));
+  }
+  void Reserve(ffi::Array<Stmt> *body, int64_t id, const Span &span) {
+    body->push_back(MakeDeviceCall(tenstorrent::dfb_reserve(),
+                                   {Integer(id), Integer(1)}, span));
+  }
+
+  void PlanCompute(const Call &call) {
+    if (call->args.empty())
+      ThrowMalformed("tile_compute has no output region");
+    BufferRegion output =
+        NormalizeToAccessRegion(call->args[0], kAccessWrite).region;
+    FullRegion(output);
+    ffi::Array<PrimExpr> args;
+    std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+        inputs;
+    for (size_t i = 1; i < call->args.size(); ++i) {
+      BufferRegion input =
+          NormalizeToAccessRegion(call->args[i], kAccessRead).region;
+      FullRegion(input);
+      int64_t id = Read(input->buffer, "trisc");
+      inputs.emplace(input->buffer, id);
+      args.push_back(Integer(id));
+      Wait(&compute_, id, call->span);
+    }
+    int64_t output_id = Write(output->buffer, "trisc");
+    Reserve(&compute_, output_id, call->span);
+    ffi::Array<PrimExpr> device_args{Integer(output_id)};
+    for (const PrimExpr &arg : args)
+      device_args.push_back(arg);
+    auto annotations = call->annotations;
+    auto expression = annotations.Get("tt.expression");
+    if (expression.has_value()) {
+      DeviceExpressionRewriter rewriter(inputs);
+      annotations.Set("tt.expression",
+                      rewriter(Downcast<PrimExpr>(expression.value())));
+    }
+    compute_.push_back(
+        Evaluate(Call(DataType::Void(), tenstorrent::dfb_compute(), device_args,
+                      annotations, call->span),
+                 call->span));
+  }
+
+  void PlanCopy(const Copy &copy, const Call &call) {
+    BufferRegion source(copy->src, copy->src_range);
+    BufferRegion destination(copy->dst, copy->dst_range);
+    FullRegion(source);
+    FullRegion(destination);
+    const TTBufferMetadata &src =
+        RequireMetadata(metadata_, copy->src, "copy source");
+    const TTBufferMetadata &dst =
+        RequireMetadata(metadata_, copy->dst, "copy destination");
+    if (copy->src->dtype != copy->dst->dtype ||
+        !ffi::StructuralEqual()(copy->src->shape, copy->dst->shape))
+      ThrowUnsupported("copy requires matching complete shapes and dtypes");
+    if (src->kind == "tensor" && dst->kind == "logical_dfb_candidate") {
+      int64_t tensor = src->global_arg_index.value()->value;
+      tensor_reads_[tensor] = true;
+      int64_t id =
+          Write(copy->dst, "ncrisc", TensorBacking(tensor, Integer(0)));
+      Reserve(&transfer_, id, call->span);
+      ffi::Array<PrimExpr> args{Integer(tensor), Integer(id)};
+      for (const Range &range : source->region) {
+        args.push_back(range->min);
+        args.push_back(range->extent);
+      }
+      transfer_.push_back(
+          MakeDeviceCall(tenstorrent::tensor_to_dfb_nd(), args, call->span));
+      return;
+    }
+    if (src->kind == "logical_dfb_candidate" && dst->kind == "tensor") {
+      int64_t tensor = dst->global_arg_index.value()->value;
+      tensor_writes_[tensor] = true;
+      // A separate immutable export snapshot keeps every resource single-slot
+      // consumer, even when the original value is used by later computation.
+      int64_t input = Read(copy->src, "trisc");
+      int64_t output =
+          Write(copy->src, "trisc", TensorBacking(tensor, Integer(0)), false);
+      resources_[output].consumer = "ncrisc";
+      Wait(&compute_, input, call->span);
+      Reserve(&compute_, output, call->span);
+      ffi::Array<Integer> identity;
+      for (size_t axis = 0; axis < copy->src->shape.size(); ++axis)
+        identity.push_back(Integer(axis));
+      ffi::Map<ffi::String, ffi::ObjectRef> annotations{
+          {"tt.compute_kind", StringImm("copy")},
+          {"tt.compute_dtype",
+           StringImm(copy->src->dtype == DataType::BFloat(16) ? "bfloat16"
+                                                              : "float32")},
+          {"tt.compute_tile_shape", src->tile_shape},
+          {"tt.logical_domain", copy->src->shape},
+          {"tt.input_shapes",
+           ffi::Array<ffi::Array<PrimExpr>>{copy->src->shape}},
+          {"tt.access_maps", ffi::Array<ffi::Array<Integer>>{identity}}};
+      compute_.push_back(Evaluate(
+          Call(DataType::Void(), tenstorrent::dfb_compute(),
+               {Integer(output), Integer(input)}, annotations, call->span),
+          call->span));
+      Wait(&transfer_, output, call->span);
+      ffi::Array<PrimExpr> args{Integer(output), Integer(tensor)};
+      for (const Range &range : destination->region) {
+        args.push_back(range->min);
+        args.push_back(range->extent);
+      }
+      transfer_.push_back(
+          MakeDeviceCall(tenstorrent::dfb_to_tensor_nd(), args, call->span));
+      return;
+    }
+    ThrowUnsupported("Copy must connect Tensor and DFB; shared Copy requires "
+                     "compute legalization");
+  }
+
+  PrimFunc frontend_;
+  BufferMetadataMap metadata_;
+  std::unordered_map<Var, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      current_;
+  std::vector<ResourceVersion> resources_;
+  std::vector<bool> tensor_reads_, tensor_writes_;
+  ffi::Array<Stmt> compute_, transfer_;
+  size_t statement_count_{0};
+  std::unordered_set<int64_t> live_;
+};
+
+bool HasGeneralCompute(const Stmt &body) {
+  bool found = false;
+  PostOrderVisit(body, [&](const ffi::ObjectRef &object) {
+    if (const auto *call = object.as<CallNode>())
+      found |= call->op.same_as(tenstorrent::tile_compute());
+  });
+  return found;
+}
+
+// A complete iteration can retain its structured loop without constructing
+// loop-carried DFB state. Tensor inout remains ordered by the NCRISC stream.
+ffi::Optional<For> FindIndependentLoop(const Stmt &body) {
+  Stmt candidate = body;
+  while (const auto *realize = candidate.as<SBlockRealizeNode>()) {
+    if (!realize->iter_values.empty() || !is_one(realize->predicate) ||
+        !realize->block->iter_vars.empty() ||
+        realize->block->init.has_value() ||
+        !realize->block->match_buffers.empty()) {
+      return std::nullopt;
+    }
+    candidate = realize->block->body;
+  }
+  auto loop = candidate.as<For>();
+  if (!loop.has_value() || loop.value()->kind != ForKind::kSerial ||
+      !loop.value()->annotations.empty() ||
+      (loop.value()->step.has_value() && !is_one(loop.value()->step.value()))) {
+    return std::nullopt;
+  }
+  For value = loop.value();
+  if (!as_const_int(value->min) || !as_const_int(value->extent) ||
+      *as_const_int(value->extent) <= 0 ||
+      *as_const_int(value->extent) > 1024 ||
+      UsesVar(value->body, [&](const VarNode *var) {
+        return ffi::GetRef<Var>(var).same_as(value->loop_var);
+      })) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+Stmt WrapIndependentLoop(Stmt body, const For &loop) {
+  if (const auto *evaluate = body.as<EvaluateNode>()) {
+    if (is_zero(evaluate->value))
+      return body;
+  }
+  // Each function owns its binder, even though the body does not use it.
+  return For(Var("tt_iteration", loop->loop_var.dtype()), loop->min,
+             loop->extent, ForKind::kSerial, std::move(body), std::nullopt, {},
+             std::nullopt, loop->span);
 }
 
 PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
@@ -626,8 +1107,9 @@ IRModule FormProgram(const IRModule &input) {
                        std::string(global_var->name_hint) + "'");
     }
     if (frontend_func.has_value()) {
-      ThrowUnsupported("multiple frontend PrimFuncs; the current backend forms one "
-                       "operation at a time");
+      ThrowUnsupported(
+          "multiple frontend PrimFuncs; the current backend forms one "
+          "operation at a time");
     }
     frontend_global = global_var;
     frontend_func = func.value();
@@ -673,7 +1155,22 @@ IRModule FormProgram(const IRModule &input) {
 
   Stmt kernel_body = StripLogicalCoreLoops(frontend, launch_grid.value());
   const size_t tile_add_count = TileAddCounter::Count(kernel_body);
-  if (tile_add_count > 1) {
+  bool legacy_add = tile_add_count == 1 && frontend->params.size() == 3 &&
+                    buffer_table.value().size() == 6;
+  if (const auto *realize = kernel_body.as<SBlockRealizeNode>()) {
+    auto statements = RequireSequence(realize->block->body);
+    legacy_add &= statements.size() == 4;
+    if (statements.size() == 4) {
+      const auto *evaluate = statements[2].as<EvaluateNode>();
+      const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+      legacy_add &= call && call->op.same_as(tenstorrent::tile_add());
+    }
+  } else {
+    legacy_add = false;
+  }
+  const bool general_compute =
+      HasGeneralCompute(kernel_body) || (tile_add_count > 0 && !legacy_add);
+  if (!general_compute && tile_add_count > 1) {
     ThrowUnsupported("Phase 2 supports exactly one canonical Add operation");
   }
 
@@ -689,7 +1186,41 @@ IRModule FormProgram(const IRModule &input) {
   PrimFunc ncrisc;
   PrimFunc brisc;
   Stmt idle = Evaluate(IntImm(DataType::Int(32), 0), frontend->span);
-  if (tile_add_count == 0) {
+  if (general_compute) {
+    GeneralDataflowPlanner planner(frontend, buffer_table.value());
+    ffi::Optional<For> independent_loop = FindIndependentLoop(kernel_body);
+    planner.Plan(independent_loop.has_value() ? independent_loop.value()->body
+                                              : kernel_body);
+    planner.EliminateDeadWrites();
+    tensors = BuildTensorTable(frontend, buffer_table.value(),
+                               planner.Effects(), true);
+    dfbs = planner.Descriptors(domain);
+    Stmt compute_body = planner.ComputeBody();
+    Stmt transfer_body = planner.TransferBody();
+    if (independent_loop.has_value()) {
+      const For &loop = independent_loop.value();
+      ffi::Array<DFBDescriptor> repeated;
+      for (const DFBDescriptor &dfb : dfbs) {
+        repeated.push_back(DFBDescriptor(
+            dfb->dfb_id, dfb->source_buffer_identity, dfb->element_dtype,
+            dfb->tile_shape, dfb->block_shape_in_tiles, dfb->block_count,
+            dfb->tensor_backing, dfb->producer_slot, dfb->producer_domain,
+            dfb->consumer_slot, dfb->consumer_domain, loop->extent,
+            dfb->source_span));
+      }
+      dfbs = std::move(repeated);
+      compute_body = WrapIndependentLoop(std::move(compute_body), loop);
+      transfer_body = WrapIndependentLoop(std::move(transfer_body), loop);
+    }
+    ffi::Array<Integer> tensor_indices = planner.UsedTensorIndices();
+    trisc = MakeSlotFunction(frontend, target.value(), domain, operation,
+                             "trisc", "compute", std::nullopt, {}, "compute",
+                             "general", std::move(compute_body));
+    ncrisc =
+        MakeSlotFunction(frontend, target.value(), domain, operation, "ncrisc",
+                         "datamovement", Integer(0), tensor_indices,
+                         "datamovement", "tensor_io", std::move(transfer_body));
+  } else if (tile_add_count == 0) {
     ffi::Array<ffi::String> effects;
     ffi::Array<Integer> all_tensor_indices;
     for (size_t index = 0; index < frontend->params.size(); ++index) {
@@ -703,9 +1234,9 @@ IRModule FormProgram(const IRModule &input) {
                              "trisc", "compute", /*noc_index=*/std::nullopt,
                              all_tensor_indices, "compute", "phase1_skeleton",
                              idle);
-    ncrisc = MakeSlotFunction(frontend, target.value(), domain, operation,
-                              "ncrisc", "datamovement", Integer(0), {}, "idle",
-                              "idle", idle);
+    ncrisc =
+        MakeSlotFunction(frontend, target.value(), domain, operation, "ncrisc",
+                         "datamovement", Integer(0), {}, "idle", "idle", idle);
   } else {
     AddDataflowPlan plan =
         AnalyzeAddDataflow(frontend, kernel_body, buffer_table.value());
@@ -714,22 +1245,22 @@ IRModule FormProgram(const IRModule &input) {
                                /*allow_dfb_candidates=*/true);
     dfbs = BuildAddDFBTable(plan, domain, frontend);
     trisc = MakeSlotFunction(frontend, target.value(), domain, operation,
-                             "trisc", "compute", /*noc_index=*/std::nullopt,
-                             {}, "compute", "add", BuildAddTRISCBody(plan));
+                             "trisc", "compute", /*noc_index=*/std::nullopt, {},
+                             "compute", "add", BuildAddTRISCBody(plan));
     ncrisc = MakeSlotFunction(
         frontend, target.value(), domain, operation, "ncrisc", "datamovement",
         Integer(0), {Integer(0), Integer(1), Integer(2)}, "datamovement",
         "tensor_io", BuildAddNCRISCBody(plan));
   }
-  brisc = MakeSlotFunction(frontend, target.value(), domain, operation, "brisc",
-                           "datamovement", Integer(1), {}, "idle", "idle",
-                           idle);
+  brisc =
+      MakeSlotFunction(frontend, target.value(), domain, operation, "brisc",
+                       "datamovement", Integer(1), {}, "idle", "idle", idle);
   functions.Set(GlobalVar(operation + "_trisc"), std::move(trisc));
   functions.Set(GlobalVar(operation + "_ncrisc"), std::move(ncrisc));
   functions.Set(GlobalVar(operation + "_brisc"), std::move(brisc));
 
   ffi::Map<ffi::String, ffi::Any> attrs = {
-      {kDeviceIRVersionAttr, Integer(kDeviceIRVersion)},
+      {kDeviceIRVersionAttr, Integer(general_compute ? 2 : kDeviceIRVersion)},
       {kTargetArchAttr, target_arch.value()},
       {kLaunchGridAttr, launch},
       {kOperationIdentityAttr,

@@ -17,6 +17,10 @@ TTNN_ENABLE_HOST_CODEGEN = False
 TTNN_ENABLE_DEVICE_COMPILE = False
 
 DEVICE_IR_VERSION = 1
+# Version 1 remains the construction default for existing Add/idle modules.
+# General computation uses version 2; consumers must dispatch on the version.
+GENERAL_DEVICE_IR_VERSION = 2
+SUPPORTED_DEVICE_IR_VERSIONS = (DEVICE_IR_VERSION, GENERAL_DEVICE_IR_VERSION)
 
 MODULE_FIELDS = (
     "tt.device_ir_version",
@@ -138,6 +142,8 @@ TTLANG_LOWERING_PIPELINE = "ttl-to-ttkernel-pipeline"
 __all__ = (
     "DEFERRED_FRONTEND_CAPABILITIES",
     "DEVICE_IR_VERSION",
+    "GENERAL_DEVICE_IR_VERSION",
+    "SUPPORTED_DEVICE_IR_VERSIONS",
     "DEVICE_OUTPUT_FORMAT",
     "DFB_DESCRIPTOR_FIELDS",
     "EXECUTION_BACKEND_ORDER",

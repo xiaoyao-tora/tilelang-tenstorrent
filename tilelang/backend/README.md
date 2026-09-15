@@ -291,7 +291,7 @@ and the selected execution backend decides whether and when it is invoked.
 | `tilelang/cpu` | `c`, `llvm` | CPU pipeline, codegen, and scalar CPU tile-op implementations. |
 | `tilelang/metal` | `metal` | Metal pipeline, codegen, host hook, and Metal language extensions. |
 | `tilelang/webgpu/backend.py` | `webgpu` | WebGPU compiler component registration. |
-| `tilelang/tenstorrent` | `tenstorrent` | `CanonicalizeTTElementwise` captures `T.Tiles` and rank-2 `T.Parallel` after target binding; verified no-op and 32x32 BF16/FP32 Add Device TIR for `wormhole_b0` and `blackhole`. Other supported elementwise expressions retain structured IR; TTL codegen and TTNN execution are not implemented yet. |
+| `tilelang/tenstorrent` | `tenstorrent` | Single-Core BF16/FP32 Device Lower for equivalent `T.Tiles`/`T.Parallel`, multi-tile expressions, broadcast, Fill, Typecast, Transpose, rank-2 GEMM with FP32 accumulation, Reduction, batch dimensions and bounded control flow. Device IR v1 preserves Add; v2 carries general computation and versioned DFB dependencies. TTL codegen and TTNN execution are not implemented. |
 
 ## Common Backend Infrastructure
 

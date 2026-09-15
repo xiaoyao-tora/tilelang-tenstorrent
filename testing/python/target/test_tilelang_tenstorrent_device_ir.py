@@ -135,7 +135,7 @@ def test_valid_three_slot_skeleton_round_trips_and_verifier_is_read_only():
     ("mutate", "message"),
     [
         (lambda mod: mod.without_attr("tt.target_arch"), "tt.target_arch"),
-        (lambda mod: mod.with_attr("tt.device_ir_version", 2), "expected 1"),
+        (lambda mod: mod.with_attr("tt.device_ir_version", 99), "expected 1"),
         (
             lambda mod: mod.with_attr("tt.kernel_order", ["brisc", "ncrisc", "trisc"]),
             "tt.kernel_order",

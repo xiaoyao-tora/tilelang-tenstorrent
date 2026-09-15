@@ -65,9 +65,9 @@ def test_tiles_explicit_domain_and_parallel_false():
     _assert_tiles_annotations(outer, inner, [4, 8], 0)
 
 
-@pytest.mark.parametrize("domain", [[], [4], [4, 8, 16]])
+@pytest.mark.parametrize("domain", [[], [4]])
 def test_tiles_rejects_unsupported_domain_rank(domain):
-    expected = "non-empty" if not domain else "rank 2"
+    expected = "non-empty" if not domain else "rank at least 2"
     with pytest.raises(ValueError, match=expected):
 
         @T.prim_func

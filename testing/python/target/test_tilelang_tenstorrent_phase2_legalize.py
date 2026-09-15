@@ -194,12 +194,11 @@ def test_legalize_is_idempotent_deterministic_and_json_round_trips():
 
 
 @pytest.mark.parametrize("func", [subtract, broadcast_add])
-def test_legalize_preserves_valid_operations_pending_device_support(func):
+def test_legalize_consumes_subtract_and_broadcast(func):
     normalized = _normalized(func)
     result = transform.LegalizeTenstorrentTileOps()(normalized)
-    ir.assert_structural_equal(result, normalized)
-    assert any("tl.tt.compute_kind" in node.annotations for node in _nodes(result["main"], tirx.SBlock))
-    assert not any(call.op.name == "tl.tt.tile_add" for call in _calls(result["main"]))
+    assert not any("tl.tt.compute_kind" in node.annotations for node in _nodes(result["main"], tirx.SBlock))
+    assert sum(call.op.name == "tl.tt.tile_compute" for call in _calls(result["main"])) == 1
 
 
 @pytest.mark.parametrize("func", [partial_copy_add])
@@ -209,7 +208,7 @@ def test_legalize_leaves_transaction_constraints_to_device_formation(func):
     assert sum(call.op.name == "tl.tt.tile_add" for call in _calls(result["main"])) == 1
 
 
-def test_legalize_keeps_other_tileops_outside_the_device_subset():
+def test_legalize_consumes_fill_tileop():
     @T.prim_func
     def fill():
         with T.Kernel(1, 1, threads=1):
@@ -217,8 +216,8 @@ def test_legalize_keeps_other_tileops_outside_the_device_subset():
             T.fill(a, 0)
 
     normalized = _normalized(fill)
-    with pytest.raises(NotImplementedError, match="no structured Device TIR lowering"):
-        transform.LegalizeTenstorrentTileOps()(normalized)
+    legalized = transform.LegalizeTenstorrentTileOps()(normalized)
+    assert sum(call.op.name == "tl.tt.tile_compute" for call in _calls(legalized["main"])) == 1
 
 
 def test_topology_capabilities_are_checked_by_the_topology_pass():
@@ -239,6 +238,6 @@ def test_one_block_dfb_capacity_is_not_an_add_frontend_restriction():
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
     result = TenstorrentPassPipelineBody(tvm.IRModule({"main": single_buffer_add}), TARGET)
-    assert str(result.attrs["tt.ir_stage"]) == "structured"
-    transform.VerifyTTComputeBlocks()(result)
-    assert any("tl.tt.compute_kind" in block.annotations for block in _nodes(result["main"], tirx.SBlock))
+    assert int(result.attrs["tt.device_ir_version"]) == 2
+    assert "tt.ir_stage" not in result.attrs
+    transform.VerifyTenstorrentDeviceIR()(result)

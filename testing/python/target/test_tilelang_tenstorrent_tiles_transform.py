@@ -254,7 +254,7 @@ def test_allocation_metadata_survives_canonicalization_and_lower_opaque_block(fl
         assert int(allocation.annotations["tt.dfb_block_count"]) == (3 if allocation.buffer.name == "A" else 2)
 
 
-@pytest.mark.parametrize("shape", [(32,), (32, 32, 32), (48, 64)])
+@pytest.mark.parametrize("shape", [(32,), (48, 64)])
 def test_reject_unsupported_domain_geometry(shape):
     _reject(_module(shape), "rank|[Rr]ank|divisib|32")
 
@@ -425,21 +425,17 @@ def test_real_frontend_canonicalizes_before_scalar_simplification():
     assert all(_integers([dim.extent for dim in region.region]) == [64, 64] for region in [*block.reads, *block.writes])
 
 
-def test_pipeline_keeps_structured_blocks_without_codegen_or_simt(monkeypatch):
+def test_pipeline_rejects_uninitialized_compute_without_codegen_or_simt(monkeypatch):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
 
     def forbidden(*args, **kwargs):
-        pytest.fail("Structured Tiles lowering must not invoke SIMT or code generation")
+        pytest.fail("Device Lower must not invoke SIMT or code generation")
 
     monkeypatch.setattr(transform, "LayoutInference", forbidden)
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     monkeypatch.setattr(type(context), "codegen_device", forbidden)
-    lowered = context.lower(tvm.IRModule({"main": _frontend_function()}))
-    assert lowered["main"].attrs["target"].kind.name == "tenstorrent"
-    (block,) = _blocks(lowered)
-    assert _integers(block.annotations["tl.tt.block_shape"]) == [2, 2]
-    assert any(ALLOCATIONS in node.annotations for node in _nodes(lowered["main"], tirx.SBlock))
-    ir.assert_structural_equal(lowered, _canonicalize(lowered))
+    with pytest.raises((ValueError, NotImplementedError), match="producer|initializ|dataflow|copies|read-before-write"):
+        context.lower(tvm.IRModule({"main": _frontend_function()}))
 
 
 def test_algebraically_equivalent_indices_are_accepted():
@@ -453,8 +449,12 @@ def test_reject_serial_tiles_annotation():
     _reject(_module(parallel=False), "parallel|Phase 1")
 
 
-def test_reject_constant_only_expression_without_input_buffer():
-    _reject(_module(expression=lambda a, b, c, ij: tirx.const(2, "float32")), "input|read|operand")
+def test_constant_only_expression_captures_fill_semantics():
+    result = _canonicalize(_module(expression=lambda a, b, c, ij: tirx.const(2, "float32")))
+    (block,) = _blocks(result)
+    assert not block.reads
+    assert float(block.body.value) == 2.0
+    transform.VerifyTTComputeBlocks()(result)
 
 
 @pytest.mark.parametrize("kind", ["stage", "domain", "min", "step", "inner_stage", "wrapper"])
@@ -820,11 +820,8 @@ def test_pipeline_executes_elementwise_once_before_verification_and_consumption(
     # backend pipeline stages separately from those implementation details.
     names = [name for name in recorder.top_level_names if name in TENSTORRENT_LOWER_PASS_ORDER]
     expected = list(TENSTORRENT_LOWER_PASS_ORDER)
-    if size == 64:
-        expected = expected[: expected.index("InferTenstorrentTensorLayout")] + ["VerifyTTComputeBlocks"]
-        assert str(lowered.attrs["tt.ir_stage"]) == "structured"
-    else:
-        assert "tt.device_ir_version" in lowered.attrs
+    assert "tt.device_ir_version" in lowered.attrs
+    assert "tt.ir_stage" not in lowered.attrs
     assert names == expected
     assert recorder.names.count("CanonicalizeTTElementwise") == 1
 
@@ -847,30 +844,32 @@ def test_parallel_and_tiles_add_produce_equivalent_device_ir(monkeypatch):
 
 @pytest.mark.parametrize("frontend", ["tiles", "parallel"])
 @pytest.mark.parametrize("size,compound,mixed", [(64, False, False), (32, True, False), (64, True, False), (32, False, True)])
-def test_pipeline_preserves_complete_structured_dataflow(monkeypatch, frontend, size, compound, mixed):
+def test_pipeline_consumes_complete_compute_dataflow(monkeypatch, frontend, size, compound, mixed):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     lowered = context.lower(tvm.IRModule({"main": _io_function(frontend, size, compound, mixed)}))
-    assert str(lowered.attrs["tt.ir_stage"]) == "structured"
-    blocks = _blocks(lowered)
-    assert len(blocks) == (2 if mixed else 1)
-    assert all(_integers(block.annotations["tl.tt.logical_domain"]) == [size, size] for block in blocks)
-    calls = [node for node in _nodes(lowered["main"], tirx.Call) if isinstance(node.op, ir.Op)]
-    assert sum(call.op.name == "tl.tileop.copy" for call in calls) == 3
-    assert not any(call.op.name == "tl.tt.tile_add" for call in calls)
-    transform.VerifyTTComputeBlocks()(lowered)
+    assert int(lowered.attrs["tt.device_ir_version"]) == 2
+    assert "tt.ir_stage" not in lowered.attrs
+    calls = [call for func in lowered.functions.values() for call in _nodes(func, tirx.Call) if isinstance(call.op, ir.Op)]
+    computes = [call for call in calls if call.op.name == "tl.tt.dfb_compute" and str(call.annotations["tt.compute_kind"].value) != "copy"]
+    assert len(computes) == (2 if mixed else 1)
+    assert all(_integers(call.annotations["tt.logical_domain"]) == [size, size] for call in computes)
+    assert not any(call.op.name.startswith("tl.tileop.") for call in calls)
+    from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
+    VerifyTenstorrentDeviceIR()(lowered)
 
 
-def test_pipeline_parallel_default_allocation_metadata_is_structured(monkeypatch):
+def test_pipeline_parallel_default_allocation_metadata_reaches_device(monkeypatch):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     lowered = context.lower(tvm.IRModule({"main": _io_function("parallel", explicit_metadata=False)}))
-    assert str(lowered.attrs["tt.ir_stage"]) == "structured"
-    assert len(_blocks(lowered)) == 1
-    transform.VerifyTTComputeBlocks()(lowered)
+    assert int(lowered.attrs["tt.device_ir_version"]) == 2
+    assert "tt.ir_stage" not in lowered.attrs
+    from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
+    VerifyTenstorrentDeviceIR()(lowered)
 
 
-def test_pipeline_module_stays_at_one_structured_stage(monkeypatch):
+def test_pipeline_rejects_multiple_operations_atomically(monkeypatch):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     raw = tvm.IRModule(
@@ -879,15 +878,13 @@ def test_pipeline_module_stays_at_one_structured_stage(monkeypatch):
             "large": _io_function("tiles", 64).with_attr("global_symbol", "large"),
         }
     )
-    lowered = context.lower(raw)
-    assert str(lowered.attrs["tt.ir_stage"]) == "structured"
-    for func in lowered.functions.values():
-        assert sum("tl.tt.compute_kind" in block.annotations for block in _nodes(func, tirx.SBlock)) == 1
-        assert not any(isinstance(call.op, ir.Op) and call.op.name == "tl.tt.tile_add" for call in _nodes(func, tirx.Call))
-    transform.VerifyTTComputeBlocks()(lowered)
+    before = ir.save_json(raw)
+    with pytest.raises(NotImplementedError, match="multiple frontend PrimFuncs"):
+        context.lower(raw)
+    assert ir.save_json(raw) == before
 
 
-def test_standalone_single_tile_stays_structured_and_codegen_is_explicit(monkeypatch):
+def test_standalone_uninitialized_compute_is_not_device_success(monkeypatch):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
 
@@ -900,11 +897,8 @@ def test_standalone_single_tile_stays_structured_and_codegen_is_explicit(monkeyp
             for i, j in T.Tiles(c):
                 c[i, j] = a[i, j] + b[i, j]
 
-    lowered = context.lower(tvm.IRModule({"main": main}))
-    assert str(lowered.attrs["tt.ir_stage"]) == "structured"
-    assert len(_blocks(lowered)) == 1
-    with pytest.raises(NotImplementedError, match="structured|compute|TTL|lowering"):
-        context.codegen_device(lowered, compile_device=False)
+    with pytest.raises((ValueError, NotImplementedError), match="producer|initializ|dataflow|copies|read-before-write"):
+        context.lower(tvm.IRModule({"main": main}))
 
 
 @pytest.mark.parametrize("outer", [True, False])
@@ -947,7 +941,7 @@ def test_reject_allocation_metadata_without_owning_allocation():
     _reject(malformed, "metadata.*(allocation|owner)|allocation.*metadata")
 
 
-def test_two_single_tile_adds_preserve_structured_stage(monkeypatch):
+def test_two_single_tile_adds_reach_device_stage(monkeypatch):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     func = _io_function("parallel")
@@ -962,11 +956,12 @@ def test_two_single_tile_adds_preserve_structured_stage(monkeypatch):
             return tirx.SeqStmt([node, node])
         return None
 
-    func = func.with_body(tirx.stmt_functor.ir_transform(func.body, None, duplicate_compute))
+    func = func.with_body(tirx.stmt_functor.ir_transform(func.body, None, duplicate_compute), func.span)
     lowered = context.lower(tvm.IRModule({"main": func}))
-    assert str(lowered.attrs["tt.ir_stage"]) == "structured"
-    assert len(_blocks(lowered)) == 2
-    transform.VerifyTTComputeBlocks()(lowered)
+    assert int(lowered.attrs["tt.device_ir_version"]) == 2
+    assert "tt.ir_stage" not in lowered.attrs
+    from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
+    VerifyTenstorrentDeviceIR()(lowered)
 
 
 @pytest.mark.parametrize("frontend", ["tiles", "parallel"])
@@ -975,14 +970,15 @@ def test_pipeline_preserves_padded_broadcast_recipe(monkeypatch, frontend, size)
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     lowered = context.lower(tvm.IRModule({"main": _io_function(frontend, size, broadcast=True)}))
-    assert str(lowered.attrs["tt.ir_stage"]) == "structured"
-    (block,) = _blocks(lowered)
-    operand = next(region for region in block.reads if _integers(block.annotations["tl.tt.access_maps"][region.buffer.data]) == [-1, 1])
-    recipe = block.annotations["tl.tt.broadcast_recipes"][operand.buffer.data]
-    assert _integers(recipe["physical_shape"]) == [32, size]
-    assert _integers(recipe["logical_region"]) == [1, size]
-    assert str(recipe["broadcast_kind"]) == "row"
-    transform.VerifyTTComputeBlocks()(lowered)
+    assert int(lowered.attrs["tt.device_ir_version"]) == 2
+    computes = [call for func in lowered.functions.values() for call in _nodes(func, tirx.Call)
+                if isinstance(call.op, ir.Op) and call.op.name == "tl.tt.dfb_compute"
+                and str(call.annotations["tt.compute_kind"].value) == "elementwise"]
+    assert len(computes) == 1
+    assert [-1, 1] in [_integers(axes) for axes in computes[0].annotations["tt.access_maps"]]
+    assert _integers(computes[0].annotations["tt.logical_domain"]) == [size, size]
+    from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
+    VerifyTenstorrentDeviceIR()(lowered)
 
 
 def test_invalid_frontend_access_reports_source_and_buffer():

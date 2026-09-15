@@ -1,4 +1,4 @@
-"""Tenstorrent structured elementwise and Device TIR v1 lowering pipeline."""
+"""Tenstorrent computation capture and complete Device TIR lowering."""
 
 from __future__ import annotations
 
@@ -39,13 +39,18 @@ def _has_compute_blocks(func: tirx.PrimFunc) -> bool:
 
 
 def TenstorrentPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
-    """Capture elementwise semantics, then consume supported device operations.
+    """Lower a complete supported program, or diagnose the unsupported input.
 
-    Modules with deferred compute return normalized structured IR marked with
-    ``tt.ir_stage=structured``. Their expression templates and full effects
-    remain intact for a future device consumer. No generic block erasure,
-    scalar simplification, or SIMT layout inference runs on those templates.
+    Capture-only clients can invoke CanonicalizeTTElementwise followed by
+    VerifyTTComputeBlocks directly. This pipeline always returns verified
+    Device IR, including when called on an existing Device module.
     """
+
+    if mod.attrs is not None and "tt.device_ir_version" in mod.attrs:
+        verified = transform.VerifyTenstorrentDeviceIR()(mod)
+        if str(verified.attrs["tt.target_arch"]) != str(target.attrs["arch"]):
+            raise ValueError("Tenstorrent Device IR architecture disagrees with lowering target")
+        return verified
 
     passes = (
         tirx.transform.BindTarget(target),
@@ -62,18 +67,10 @@ def TenstorrentPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     for compiler_pass in passes:
         mod = compiler_pass(mod)
 
-    # Keep the whole module at one semantic stage. In particular, a module
-    # containing a deferred block must not retain partially lowered tile_adds.
-    structured = mod
     mod = transform.LegalizeTenstorrentTileOps()(mod)
     deferred = any(_has_compute_blocks(func) for func in mod.functions.values() if isinstance(func, tirx.PrimFunc))
-    # Standalone shared-buffer computations have no Tensor ABI/data movement
-    # from which DeviceProgram formation could build an executable operation.
-    standalone = any(
-        not func.params and _has_compute_blocks(func) for func in structured.functions.values() if isinstance(func, tirx.PrimFunc)
-    )
-    if deferred or standalone:
-        return transform.VerifyTTComputeBlocks()(structured).with_attr("tt.ir_stage", "structured")
+    if deferred:
+        raise NotImplementedError("LegalizeTenstorrentTileOps left an unconsumed compute block; complete Device Lower is unsupported")
 
     for compiler_pass in (
         transform.InferTenstorrentTensorLayout(),

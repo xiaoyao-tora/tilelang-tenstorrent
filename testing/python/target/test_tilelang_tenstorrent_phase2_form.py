@@ -194,7 +194,7 @@ def test_form_add_rejects_incomplete_dataflow_without_mutating_input(monkeypatch
 
     changed = False
 
-    def drop_output_copy(node):
+    def drop_input_copy(node):
         nonlocal changed
         if isinstance(node, tirx.SeqStmt) and len(node.seq) == 4:
             candidate = node.seq[2]
@@ -205,16 +205,16 @@ def test_form_add_rejects_incomplete_dataflow_without_mutating_input(monkeypatch
                 and candidate.value.op.name == "tl.tt.tile_add"
             ):
                 changed = True
-                return tirx.SeqStmt(list(node.seq[:3]))
+                return tirx.SeqStmt(list(node.seq[1:]))
         return None
 
     func = malformed["add"]
-    body = tirx.stmt_functor.ir_transform(func.body, None, drop_output_copy)
+    body = tirx.stmt_functor.ir_transform(func.body, None, drop_input_copy)
     assert changed
     malformed["add"] = func.with_body(body, func.span)
     before = ir.save_json(malformed)
 
-    with pytest.raises(NotImplementedError, match="two input copies, one Add"):
+    with pytest.raises(ValueError, match="read-before-write"):
         transform.FormTenstorrentDeviceProgram()(malformed)
 
     assert ir.save_json(malformed) == before
