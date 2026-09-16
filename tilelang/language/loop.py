@@ -100,7 +100,7 @@ def Tiles(
 
     if isinstance(domain, tirx.Buffer):
         extents = tuple(domain.shape)
-    elif isinstance(domain, Iterable):
+    elif isinstance(domain, Iterable) and not isinstance(domain, (str, bytes)):
         extents = tuple(domain)
     else:
         raise TypeError("domain must be a tirx.Buffer or an iterable of extents")
@@ -109,6 +109,15 @@ def Tiles(
         raise ValueError("Tiles domain must be non-empty")
     if len(extents) < 2:
         raise ValueError("Tiles domain must have rank at least 2")
+    for axis, extent in enumerate(extents):
+        if isinstance(extent, bool) or not isinstance(extent, (int, tirx.PrimExpr)):
+            raise TypeError(f"Tiles domain extent {axis} must be a scalar integer")
+        if isinstance(extent, tirx.PrimExpr) and (
+            not (extent.dtype.startswith("int") or extent.dtype.startswith("uint")) or "x" in extent.dtype
+        ):
+            raise TypeError(f"Tiles domain extent {axis} must be a scalar integer")
+        if isinstance(extent, (int, tirx.IntImm)) and int(extent) <= 0:
+            raise ValueError(f"Tiles domain extent {axis} must be positive")
 
     annotations = {
         "tl.tt.tiles_parallel": tirx.IntImm("int32", int(parallel)),

@@ -85,7 +85,7 @@ def test_alloc_shared_keeps_metadata_separate_for_multiple_buffers():
     assert metadata_by_buffer[second.data]["tt.dfb_block_count"].value == 3
 
 
-@pytest.mark.parametrize("block_count", [0, 33, 1.5, True])
+@pytest.mark.parametrize("block_count", [0, 33, 1.5, True, tvm.tirx.IntImm("bool", True)])
 def test_alloc_shared_rejects_invalid_dfb_block_count(block_count):
     with pytest.raises((TypeError, ValueError), match="tt.dfb_block_count"):
         _make_kernel({"tt.dfb_block_count": block_count})
@@ -100,6 +100,22 @@ def test_alloc_shared_rejects_unsupported_tile_shape(tile_shape):
 def test_alloc_shared_rejects_shape_not_divisible_by_tile():
     with pytest.raises(ValueError, match="must be divisible"):
         _make_kernel({"tt.tile_shape": (32, 32)}, shape=(48, 128))
+
+
+@pytest.mark.parametrize("shape", [(0, 32), (-32, 32), (tvm.tirx.Var("n", "int32"), 32)])
+def test_alloc_shared_tt_metadata_requires_positive_static_shape(shape):
+    with pytest.raises(ValueError, match="positive compile-time shape extents"):
+        _make_kernel({"tt.dfb_block_count": 2}, shape=shape)
+
+
+def test_alloc_shared_tt_metadata_rejects_non_shared_scope():
+    with pytest.raises(ValueError, match="requires a shared or shared.dyn buffer"):
+
+        @T.prim_func
+        def kernel():
+            with T.Kernel(1, threads=1):
+                buffer = T.alloc_shared((32, 32), "float32", scope="local", annotations={"tt.dfb_block_count": 2})
+                T.evaluate(buffer[0, 0])
 
 
 def test_alloc_shared_rejects_tensor_backed_in_phase_1():

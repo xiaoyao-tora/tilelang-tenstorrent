@@ -150,8 +150,8 @@ def _validate_in_grid(net: PipeNet) -> None:
     grid: list[int] = []
     for block_frame in block_frames:
         extent = block_frame.doms[0].extent
-        if not isinstance(extent, tirx.IntImm):
-            raise ValueError("T.comm topology primitives require compile-time constant T.Kernel grid extents")
+        if not isinstance(extent, tirx.IntImm) or extent.dtype == "bool" or extent.value <= 0:
+            raise ValueError("T.comm topology primitives require positive compile-time integer T.Kernel grid extents")
         grid.append(int(extent.value))
 
     def check_coord(coord: CoreCoord, name: str) -> None:

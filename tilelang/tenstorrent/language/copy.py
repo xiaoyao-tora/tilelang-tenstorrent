@@ -39,6 +39,11 @@ def _validate_payload(value: object) -> tirx.Buffer:
     scope = value.scope()
     if scope not in ("shared", "shared.dyn"):
         raise ValueError(f"T.copy with PipeRef requires a shared or shared.dyn payload buffer, got scope {scope!r}")
+    if len(value.shape) != 2:
+        raise ValueError("T.copy with PipeRef requires a rank-2 payload buffer")
+    for extent in value.shape:
+        if not isinstance(extent, tirx.IntImm) or extent.value <= 0 or extent.value % 32:
+            raise ValueError("T.copy with PipeRef requires positive static payload extents divisible by the 32x32 tile shape")
     return value
 
 

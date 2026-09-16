@@ -1661,7 +1661,12 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   for (const auto &[key, pipe] : ordered_pipes)
     pipes.push_back(pipe);
   if (senders.size() != receivers.size())
-    ThrowMalformed("Pipe producer/consumer transaction count mismatch");
+    ThrowMalformed(
+        "Pipe producer/consumer transaction count mismatch (" +
+        std::to_string(senders.size()) + " send occurrences, " +
+        std::to_string(receivers.size()) +
+        " receive occurrences); each repeated transaction occurrence "
+        "requires a matching peer");
   for (const auto &[id, sender] : senders) {
     auto receiver = receivers.find(id);
     if (receiver == receivers.end())

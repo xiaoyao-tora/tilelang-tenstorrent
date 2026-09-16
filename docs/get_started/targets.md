@@ -57,10 +57,13 @@ implemented Phase 1 subset is documented in `docs/compiler_internals/tenstorrent
 Add device extension in `docs/compiler_internals/tenstorrent_phase2_add_lower.md`. Both `T.Tiles` and supported
 `T.Parallel` maps share [structured compute capture](../compiler_internals/tenstorrent_structured_compute.md),
 followed by complete [Phase 4 Device Lower](../compiler_internals/tenstorrent_phase4_lower.md).
-Multi-tile expressions, broadcast, Fill, Typecast, Transpose, rank-2 GEMM with FP32 accumulation,
+Multi-tile expressions, broadcast, Fill, Typecast, Transpose, rank-2 shared-output GEMM with BF16/FP32 accumulation,
 Reduction, logical batch dimensions, and bounded control flow reach verified three-slot Device IR.
 Full lowering diagnoses unsupported input; it never returns `tt.ir_stage="structured"` as success.
 Capture-only clients invoke the capture and compute verifier passes directly.
+GEMM fragments have a separate [frontend precision and lifetime contract](../developer_guide/tenstorrent_frontend.md).
+`VerifyTTGemmAccumulators` validates that contract, while complete Device Lower rejects the currently
+unsupported fragment lifetime schedule instead of silently lowering its precision.
 TTL source generation and hardware execution remain unimplemented.
 
 Tenstorrent's language facade exposes inter-Core communication topology under `T.comm`:

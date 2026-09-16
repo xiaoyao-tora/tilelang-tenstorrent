@@ -228,6 +228,15 @@ private:
 };
 
 PrimFunc NormalizeRegions(PrimFunc func) {
+  auto accumulators =
+      func->GetAttr<ffi::Array<ffi::Map<ffi::String, ffi::ObjectRef>>>(
+          "tt.gemm_accumulator_requirements");
+  if (accumulators.has_value() && !accumulators.value().empty()) {
+    ThrowUnsupported(
+        "GEMM compute_fragment has no accumulator lifetime "
+        "schedule in Device TIR; cannot lower final materialization "
+        "while guaranteeing accumulation precision");
+  }
   RegionNormalizer normalizer;
   Stmt body = normalizer(func->body);
   if (body.same_as(func->body)) {

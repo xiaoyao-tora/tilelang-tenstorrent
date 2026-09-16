@@ -17,6 +17,7 @@ TENSTORRENT_LOWER_PASS_ORDER = (
     "ValidateTenstorrentFrontendIR",
     "NormalizeTenstorrentLaunch",
     "NormalizeTenstorrentBufferMetadata",
+    "VerifyTTGemmAccumulators",
     "NormalizeTenstorrentTopology",
     "NormalizeTenstorrentRegions",
     "LegalizeTenstorrentTileOps",
@@ -71,6 +72,7 @@ def TenstorrentPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
+        transform.VerifyTTGemmAccumulators(),
         transform.NormalizeTenstorrentTopology(),
         transform.NormalizeTenstorrentRegions(),
     )

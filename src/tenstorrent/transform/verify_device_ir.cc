@@ -1069,6 +1069,8 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
     Check(clear == 0 || clear == 1, "compute tt.clear must be Boolean");
     ffi::String accumulation = ComputeString(call, "tt.accum_dtype");
     Check(accumulation == "float32" ||
+              (kind == "gemm" && accumulation == "bfloat16" &&
+               dtype == "bfloat16") ||
               (kind == "reduce" &&
                ComputeString(call, "tt.reduce_kind") != "sum" &&
                accumulation == dtype),
@@ -1083,8 +1085,25 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
             "accumulation input must match output DFB");
     }
     if (kind == "gemm") {
-      Check(output->element_dtype == DataType::Float(32),
-            "GEMM output must be float32");
+      Check(accumulation == dtype,
+            "GEMM accumulation dtype must match its materialized output");
+      Check(ComputeString(call, "tt.input_dtype") ==
+                    (operands[1]->element_dtype == DataType::BFloat(16)
+                         ? "bfloat16"
+                         : "float32") &&
+                ComputeString(call, "tt.output_dtype") == dtype,
+            "GEMM input/output dtype requirements disagree with DFBs");
+      Check(dtype == "float32" ||
+                operands[1]->element_dtype == DataType::BFloat(16),
+            "BF16 GEMM accumulation requires BF16 inputs");
+      Check(
+          ComputeString(call, "tt.dest_precision_requirement") ==
+              (accumulation == "float32" ? "bits32_required"
+                                         : "bits16_required"),
+          "GEMM hard precision requirement conflicts with accumulation dtype");
+      if (accumulation == "bfloat16")
+        Check(ComputeString(call, "tt.matmul_full_fp32") == "forbidden",
+              "BF16 GEMM forbids matmul_full_fp32");
       Check(operands[1]->element_dtype == operands[2]->element_dtype,
             "GEMM input dtype mismatch");
       int64_t ta = ComputeInteger(call, "tt.transpose_a"),

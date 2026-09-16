@@ -46,6 +46,24 @@ void Require(bool condition, const std::string &message) {
     ThrowElementwiseError(message);
 }
 
+bool HasFrontendTilesAnnotations(const Entries &annotations) {
+  return annotations.count(kTTTilesScope) ||
+         annotations.count(kTTTilesDomain) ||
+         annotations.count(kTTTilesParallel) ||
+         annotations.count(kTTTilesStage);
+}
+
+bool HasStructuredComputeAnnotations(const Entries &annotations) {
+  return annotations.count(kTTComputeKind) ||
+         annotations.count(kTTTilesStage) ||
+         annotations.count(kTTLogicalDomain) ||
+         annotations.count(kTTPhysicalTileShape) ||
+         annotations.count(kTTBlockShape) ||
+         annotations.count(kTTIteratorTypes) ||
+         annotations.count(kTTAccessMaps) ||
+         annotations.count(kTTBroadcastRecipes);
+}
+
 class AllocationCollector : public StmtVisitor {
 public:
   void Collect(const Stmt &body) { VisitStmt(body); }
@@ -229,6 +247,19 @@ private:
 
   void ValidateBuffer(const Buffer &buffer, const Array<Integer> &axes,
                       const Array<PrimExpr> &domain) {
+    // Keep the original allocation identity, so its storage descriptor must
+    // remain valid after the logical coordinate binders have been removed.
+    // Check the unsimplified expressions so canceled free variables cannot
+    // bypass verification of an already-structured block either.
+    auto is_variable = [](const VarNode *) { return true; };
+    Require(!UsesVar(buffer->elem_offset, is_variable),
+            "buffer storage offset must be static and cannot reference loop "
+            "variables");
+    for (const PrimExpr &stride : buffer->strides) {
+      Require(!UsesVar(stride, is_variable),
+              "buffer storage strides must be static and cannot reference loop "
+              "variables");
+    }
     Require(buffer.scope() == "shared" || buffer.scope() == "shared.dyn",
             "buffer '" + std::string(buffer->name) +
                 "' must have shared scope");
@@ -503,6 +534,8 @@ public:
       ScopeAnalyzer analyzer(allocation_, tiles, scalar_parameters_);
       return ApplyPlan(analyzer.Analyze(ffi::GetRef<For>(op), tiles));
     }
+    Require(!HasFrontendTilesAnnotations(op->annotations),
+            "orphan frontend T.Tiles annotations without a tiles_scope root");
     bool scalar = IsStaticScalarLoop(ffi::GetRef<For>(op));
     if (scalar)
       scalar_parameters_.push_back(op->loop_var);
@@ -575,7 +608,7 @@ public:
     allocation_.Collect(func->body);
   }
   void VisitStmt_(const ForNode *op) final {
-    Require(!op->annotations.count(kTTTilesScope),
+    Require(!HasFrontendTilesAnnotations(op->annotations),
             "uncanonicalized frontend T.Tiles scope");
     bool scalar = IsStaticScalarLoop(ffi::GetRef<For>(op));
     if (scalar)
@@ -594,6 +627,8 @@ public:
   }
   void VisitStmt_(const SBlockNode *op) final {
     if (!op->annotations.count(kTTComputeKind)) {
+      Require(!HasStructuredComputeAnnotations(op->annotations),
+              "structured block missing metadata tl.tt.compute_kind");
       StmtVisitor::VisitStmt_(op);
       return;
     }

@@ -239,6 +239,7 @@ def test_structured_compute_precedes_device_lowering_in_pass_order():
         "ValidateTenstorrentFrontendIR",
         "NormalizeTenstorrentLaunch",
         "NormalizeTenstorrentBufferMetadata",
+        "VerifyTTGemmAccumulators",
         "NormalizeTenstorrentTopology",
         "NormalizeTenstorrentRegions",
         "LegalizeTenstorrentTileOps",

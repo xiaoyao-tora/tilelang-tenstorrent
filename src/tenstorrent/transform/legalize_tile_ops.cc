@@ -20,6 +20,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/function.h>
 #include <tvm/ir/op.h>
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/function.h>
@@ -30,6 +31,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -183,6 +185,338 @@ Annotations BaseAnnotations(const Buffer &output, const char *kind) {
       {"tt.logical_domain", output->shape}};
 }
 
+// Fragment precision belongs to a complete GEMM lifetime, not to all FP32
+// temporaries. Keep this analysis before any DFB generation or loop lowering.
+class GemmAccumulatorVerifier : public StmtExprVisitor {
+  struct Lifetime {
+    Buffer buffer;
+    BufferRegion region;
+    DataType input_dtype;
+    bool initialized{false};
+    bool updated{false};
+    bool materialized{false};
+    DataType output_dtype;
+    int declaration_depth{-1};
+  };
+
+  class Collector : public StmtExprVisitor {
+  public:
+    std::vector<Buffer> fragments;
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(Gemm::Get())) {
+        Gemm gemm = Downcast<Gemm>(ParseOperator(ffi::GetRef<Call>(op)));
+        if (gemm->c_.scope() == "local.fragment") {
+          for (const Buffer &buffer : fragments)
+            if (buffer.same_as(gemm->c_))
+              return;
+          fragments.push_back(gemm->c_);
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  };
+
+public:
+  static PrimFunc Verify(PrimFunc func) {
+    Collector collector;
+    collector(func->body);
+    if (collector.fragments.empty()) {
+      if (func->attrs.defined() &&
+          func->attrs->dict.count("tt.gemm_accumulator_requirements"))
+        return WithoutAttr(std::move(func), "tt.gemm_accumulator_requirements");
+      return func;
+    }
+    GemmAccumulatorVerifier verifier;
+    auto metadata =
+        func->GetAttr<ffi::Array<TTBufferMetadata>>(kBufferMetadataTableAttr);
+    for (const Buffer &buffer : collector.fragments) {
+      Require(
+          metadata.has_value(),
+          "GEMM accumulator verification requires normalized buffer metadata");
+      int matches = 0;
+      for (const TTBufferMetadata &entry : metadata.value()) {
+        if (entry->buffer->data.same_as(buffer->data)) {
+          Require(
+              entry->buffer.same_as(buffer) &&
+                  entry->kind == "compute_fragment" &&
+                  !entry->alias_of.has_value(),
+              "GEMM accumulator must resolve to one unique compute_fragment; "
+              "aliases are unsupported");
+          ++matches;
+        }
+      }
+      Require(matches == 1,
+              "GEMM accumulator must resolve to one unique compute_fragment");
+      ValidateDType(buffer->dtype);
+      Require(buffer->shape.size() == 2,
+              "GEMM accumulator requires a rank-2 fragment");
+      verifier.lifetimes_.push_back({buffer, BufferRegion::FullRegion(buffer),
+                                     DataType::Void(), false, false, false,
+                                     DataType::Void()});
+    }
+    if (!verifier.lifetimes_.empty()) {
+      auto slot = func->GetAttr<ffi::String>(kKernelSlotAttr);
+      Require(!slot.has_value() || slot.value() == "trisc",
+              "GEMM fragment cannot cross processor slots; materialize through "
+              "an output DFB");
+      verifier(func->body);
+    }
+    ffi::Array<Annotations> requirements;
+    for (const Lifetime &lifetime : verifier.lifetimes_) {
+      Require(lifetime.updated && lifetime.materialized,
+              "GEMM accumulator must have one final materialization after "
+              "its complete K reduction");
+      Require(lifetime.buffer->dtype ==
+                  verifier.lifetimes_.front().buffer->dtype,
+              "GEMM accumulators in one compute Kernel have conflicting "
+              "destination precision requirements");
+      const bool fp32 = lifetime.buffer->dtype == DataType::Float(32);
+      Annotations requirement{
+          {"accumulator", lifetime.buffer},
+          {"region", lifetime.region},
+          {"input_dtype", StringImm(DTypeName(lifetime.input_dtype))},
+          {"accum_dtype", StringImm(DTypeName(lifetime.buffer->dtype))},
+          {"output_dtype", StringImm(DTypeName(lifetime.output_dtype))},
+          {"dest_precision_requirement",
+           StringImm(fp32 ? "bits32_required" : "bits16_required")},
+          {"materialization", StringImm("after_complete_k_reduction")}};
+      if (!fp32)
+        requirement.Set("matmul_full_fp32", StringImm("forbidden"));
+      requirements.push_back(requirement);
+    }
+    // Recompute this table on every invocation; frontend annotations are not a
+    // proof of the def-use, dominance, or precision contract.
+    return WithAttr(std::move(func), "tt.gemm_accumulator_requirements",
+                    requirements);
+  }
+
+private:
+  Lifetime *Find(const Buffer &buffer) {
+    for (Lifetime &lifetime : lifetimes_) {
+      if (buffer->data.same_as(lifetime.buffer->data)) {
+        Require(buffer.same_as(lifetime.buffer),
+                "GEMM accumulator alias makes fragment identity ambiguous");
+        return &lifetime;
+      }
+    }
+    return nullptr;
+  }
+
+  void CheckContext() {
+    Require(conditional_depth_ == 0,
+            "GEMM accumulator conditional access has no proven dominating "
+            "initialization or final materialization");
+    Require(unsupported_loop_depth_ == 0,
+            "GEMM accumulator requires static positive serial K loops");
+  }
+
+  void CheckRegion(const BufferRegion &region, const Lifetime &lifetime) {
+    Require(ffi::StructuralEqual()(region, lifetime.region),
+            "GEMM accumulator updates/materialization must preserve the same "
+            "full BufferRegion");
+    arith::Analyzer analyzer;
+    Require(region->buffer->strides.empty() &&
+                region->buffer->axis_separators.empty() &&
+                analyzer.CanProveEqual(region->buffer->elem_offset, 0),
+            "GEMM accumulator aliases and storage offsets are unsupported");
+  }
+
+  void Initialize(Lifetime *lifetime) {
+    CheckContext();
+    Require(loop_depth_ == lifetime->declaration_depth,
+            "GEMM accumulator initialization inside a K loop cannot preserve "
+            "one complete reduction lifetime");
+    Require(!lifetime->initialized && !lifetime->updated,
+            "GEMM accumulator requires unique initialization; an ordinary "
+            "write must not overwrite its live value");
+    lifetime->initialized = true;
+  }
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    const auto *node = op->value.as<CallNode>();
+    if (!node) {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
+    Call call = ffi::GetRef<Call>(node);
+    if (call->op.same_as(Gemm::Get())) {
+      Gemm gemm = Downcast<Gemm>(ParseOperator(call));
+      Lifetime *lifetime = Find(gemm->c_);
+      if (lifetime) {
+        CheckContext();
+        CheckRegion(gemm->cRegion_, *lifetime);
+        Require(call->annotations.empty(),
+                "GEMM scheduling/precision annotations are unsupported");
+        Require(gemm->m_ > 0 && gemm->n_ > 0 && gemm->k_ > 0 &&
+                    gemm->m_ % 32 == 0 && gemm->n_ % 32 == 0 &&
+                    gemm->k_ % 32 == 0,
+                "GEMM accumulator M/N/K must be positive multiples of 32");
+        Require(gemm->a_->shape.size() == 2 && gemm->b_->shape.size() == 2 &&
+                    is_const_int(gemm->a_->shape[gemm->transA_ ? 1 : 0],
+                                 gemm->m_) &&
+                    is_const_int(gemm->a_->shape[gemm->transA_ ? 0 : 1],
+                                 gemm->k_) &&
+                    is_const_int(gemm->b_->shape[gemm->transB_ ? 1 : 0],
+                                 gemm->k_) &&
+                    is_const_int(gemm->b_->shape[gemm->transB_ ? 0 : 1],
+                                 gemm->n_) &&
+                    is_const_int(gemm->c_->shape[0], gemm->m_) &&
+                    is_const_int(gemm->c_->shape[1], gemm->n_),
+                "GEMM accumulator M/N/K disagree with full operand shapes");
+
+        Require(!lifetime->materialized,
+                "GEMM update after final materialization would lose its "
+                "complete K reduction lifetime");
+        Require(gemm->a_->dtype == gemm->b_->dtype,
+                "GEMM requires matching input storage dtypes");
+        ValidateRegion(gemm->aRegion_, "GEMM matrix input A");
+        ValidateRegion(gemm->bRegion_, "GEMM matrix input B");
+        Require(!Find(gemm->a_) && !Find(gemm->b_),
+                "GEMM matrix inputs must not alias an accumulator");
+        Require(is_zero(gemm->clearAccum_) || is_one(gemm->clearAccum_),
+                "GEMM clear_accum must be static");
+        if (is_one(gemm->clearAccum_))
+          Initialize(lifetime);
+        Require(lifetime->initialized,
+                "GEMM accumulator first update requires dominating T.clear "
+                "or clear_accum=True");
+        Require(!lifetime->updated || lifetime->input_dtype == gemm->a_->dtype,
+                "GEMM accumulator input dtype changed during K updates");
+        lifetime->input_dtype = gemm->a_->dtype;
+        lifetime->updated = true;
+        return;
+      }
+    } else if (call->op.same_as(Fill::Get())) {
+      Fill fill = Downcast<Fill>(ParseOperator(call));
+      if (Lifetime *lifetime = Find(fill->dst)) {
+        CheckRegion(BufferRegion(fill->dst, fill->region), *lifetime);
+        // Fill preserves the explicit dtype conversion around T.clear's
+        // integer zero. Casting zero to either supported fragment dtype is
+        // exact; do not infer initialization from an arbitrary expression.
+        PrimExpr initializer = fill->value;
+        while (const auto *cast = initializer.as<CastNode>())
+          initializer = cast->value;
+        const auto *float_value = initializer.as<FloatImmNode>();
+        Require(is_zero(initializer) ||
+                    (float_value && float_value->value == 0.0),
+                "GEMM accumulator initialization requires T.clear (zero fill)");
+        Initialize(lifetime);
+        return;
+      }
+    } else if (call->op.same_as(Copy::Get())) {
+      Copy copy = Downcast<Copy>(ParseOperator(call));
+      Require(!Find(copy->dst),
+              "ordinary copy must not write a GEMM accumulator");
+      if (Lifetime *lifetime = Find(copy->src)) {
+        CheckContext();
+        CheckRegion(BufferRegion(copy->src, copy->src_range), *lifetime);
+        Require(loop_depth_ == lifetime->declaration_depth,
+                "GEMM accumulator cannot materialize inside its K reduction "
+                "loop; pack only after all updates");
+        Require(lifetime->updated && !lifetime->materialized,
+                "GEMM accumulator requires one final materialization after "
+                "all updates");
+        Require(copy->dst.scope() == "shared" ||
+                    copy->dst.scope() == "shared.dyn" ||
+                    copy->dst.scope() == "global" || copy->dst.scope().empty(),
+                "GEMM fragment must materialize to output DFB or Tensor");
+        Require(copy->dst_range.size() == lifetime->region->region.size(),
+                "GEMM output materialization rank mismatch");
+        arith::Analyzer analyzer;
+        for (size_t i = 0; i < copy->dst_range.size(); ++i)
+          Require(analyzer.CanProveEqual(copy->dst_range[i]->extent,
+                                         lifetime->region->region[i]->extent),
+                  "GEMM output materialization shape mismatch");
+        DataType input = lifetime->input_dtype;
+        DataType accum = lifetime->buffer->dtype;
+        DataType output = copy->dst->dtype;
+        Require(
+            (input == DataType::BFloat(16) &&
+             (accum == DataType::BFloat(16) || accum == DataType::Float(32)) &&
+             output == DataType::BFloat(16)) ||
+                (input == DataType::Float(32) && accum == DataType::Float(32) &&
+                 output == DataType::Float(32)),
+            "GEMM capability registry has no (input=" + DTypeName(input) +
+                ", accum=" + DTypeName(accum) +
+                ", output=" + DTypeName(output) + ") combination");
+        lifetime->output_dtype = output;
+        lifetime->materialized = true;
+        return;
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    Require(!Find(op->buffer),
+            "GEMM accumulator may only be read by GEMM updates and final copy; "
+            "ordinary reads or cross-slot uses are unsupported");
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const VarNode *op) final {
+    Var var = ffi::GetRef<Var>(op);
+    for (const Lifetime &lifetime : lifetimes_)
+      Require(!var.same_as(lifetime.buffer->data),
+              "opaque pointer access to a GEMM accumulator is unsupported; "
+              "use GEMM updates and final copy");
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    Require(!Find(op->buffer),
+            "ordinary write must not overwrite a live GEMM accumulator");
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    ++conditional_depth_;
+    StmtExprVisitor::VisitStmt_(op);
+    --conditional_depth_;
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers)
+      if (Lifetime *lifetime = Find(buffer))
+        lifetime->declaration_depth = loop_depth_;
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AllocBufferNode *op) final {
+    if (Lifetime *lifetime = Find(op->buffer))
+      lifetime->declaration_depth = loop_depth_;
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const WhileNode *op) final {
+    ++unsupported_loop_depth_;
+    StmtExprVisitor::VisitStmt_(op);
+    --unsupported_loop_depth_;
+  }
+
+  void VisitStmt_(const SBlockRealizeNode *op) final {
+    bool conditional = !is_one(op->predicate);
+    conditional_depth_ += conditional;
+    StmtExprVisitor::VisitStmt_(op);
+    conditional_depth_ -= conditional;
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    const auto *extent = op->extent.as<IntImmNode>();
+    bool unsupported =
+        op->kind != ForKind::kSerial || !extent || extent->value <= 0;
+    ++loop_depth_;
+    unsupported_loop_depth_ += unsupported;
+    StmtExprVisitor::VisitStmt_(op);
+    unsupported_loop_depth_ -= unsupported;
+    --loop_depth_;
+  }
+
+  std::vector<Lifetime> lifetimes_;
+  int loop_depth_{0};
+  int conditional_depth_{0};
+  int unsupported_loop_depth_{0};
+};
+
 Stmt MakeCompute(const BufferRegion &output,
                  const ffi::Array<BufferRegion> &inputs,
                  Annotations annotations, Span span) {
@@ -326,8 +660,10 @@ private:
               "GEMM scheduling/precision annotations are unsupported");
       Require(
           gemm->a_->dtype == gemm->b_->dtype &&
-              gemm->c_->dtype == DataType::Float(32),
-          "GEMM requires equal input dtype and float32 accumulation/output");
+              (gemm->c_->dtype == DataType::Float(32) ||
+               (gemm->a_->dtype == DataType::BFloat(16) &&
+                gemm->c_->dtype == DataType::BFloat(16))),
+          "GEMM requires equal input dtype and supported accumulation/output");
       Require(!gemm->c_->data.same_as(gemm->a_->data) &&
                   !gemm->c_->data.same_as(gemm->b_->data),
               "GEMM output must not alias its matrix inputs");
@@ -360,7 +696,14 @@ private:
       annotations.Set("tt.transpose_a", Integer(gemm->transA_));
       annotations.Set("tt.transpose_b", Integer(gemm->transB_));
       annotations.Set("tt.clear", Integer(is_one(gemm->clearAccum_)));
-      annotations.Set("tt.accum_dtype", StringImm("float32"));
+      annotations.Set("tt.input_dtype", StringImm(DTypeName(gemm->a_->dtype)));
+      annotations.Set("tt.accum_dtype", StringImm(DTypeName(gemm->c_->dtype)));
+      annotations.Set("tt.output_dtype", StringImm(DTypeName(gemm->c_->dtype)));
+      const bool fp32 = gemm->c_->dtype == DataType::Float(32);
+      annotations.Set("tt.dest_precision_requirement",
+                      StringImm(fp32 ? "bits32_required" : "bits16_required"));
+      if (!fp32)
+        annotations.Set("tt.matmul_full_fp32", StringImm("forbidden"));
       ffi::Array<BufferRegion> inputs{gemm->aRegion_, gemm->bRegion_};
       if (!is_one(gemm->clearAccum_))
         inputs.push_back(gemm->cRegion_);
@@ -459,9 +802,24 @@ private:
 
 } // namespace
 
+tvm::transform::Pass VerifyTTGemmAccumulators() {
+  auto pass_func = [](PrimFunc func, const IRModule &mod,
+                      const tvm::transform::PassContext &context) {
+    return GemmAccumulatorVerifier::Verify(std::move(func));
+  };
+  return tirx::transform::CreatePrimFuncPass(
+      pass_func, 0, "tl.tenstorrent.VerifyTTGemmAccumulators", {});
+}
+
 tvm::transform::Pass LegalizeTenstorrentTileOps() {
   auto pass_func = [](PrimFunc func, const IRModule &mod,
                       const tvm::transform::PassContext &context) {
+    auto requirements = func->GetAttr<ffi::Array<Annotations>>(
+        "tt.gemm_accumulator_requirements");
+    Require(!requirements.has_value() || requirements.value().empty(),
+            "GEMM compute_fragment contract is valid, but Device TIR currently "
+            "has no accumulator lifetime schedule; cannot guarantee logical "
+            "accumulation precision through all K updates and final pack");
     StructuredComputeLowerer lowerer(func);
     Stmt body = lowerer(func->body);
     if (!body.same_as(func->body)) {
@@ -470,7 +828,7 @@ tvm::transform::Pass LegalizeTenstorrentTileOps() {
     return func;
   };
   return tvm::transform::Sequential(
-      {VerifyTTComputeBlocks(),
+      {VerifyTTComputeBlocks(), VerifyTTGemmAccumulators(),
        tirx::transform::CreatePrimFuncPass(
            pass_func, 0, "tl.tenstorrent.LegalizeTenstorrentTileOps", {})},
       "tl.tenstorrent.LegalizeTenstorrentTileOps");
@@ -478,6 +836,8 @@ tvm::transform::Pass LegalizeTenstorrentTileOps() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = ffi::reflection;
+  refl::GlobalDef().def("tl.tenstorrent.transform.VerifyTTGemmAccumulators",
+                        VerifyTTGemmAccumulators);
   refl::GlobalDef().def("tl.tenstorrent.transform.LegalizeTenstorrentTileOps",
                         LegalizeTenstorrentTileOps);
 }

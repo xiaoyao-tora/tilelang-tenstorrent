@@ -536,6 +536,59 @@ def test_verifier_rejects_uncanonicalized_frontend_scope():
         transform.VerifyTTComputeBlocks()(_module())
 
 
+def test_orphan_frontend_annotations_cannot_bypass_capture_or_verification():
+    def remove_scope(node):
+        if isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
+            annotations = dict(node.annotations)
+            del annotations["tl.tt.tiles_scope"]
+            return tirx.For(node.loop_var, node.min, node.extent, node.kind, node.body, annotations=annotations)
+        return None
+
+    mod = _module()
+    func = mod["main"]
+    malformed = tvm.IRModule({"main": func.with_body(tirx.stmt_functor.ir_transform(func.body, None, remove_scope))})
+    _reject(malformed, "orphan|frontend|scope")
+    with pytest.raises(ValueError, match="frontend|scope"):
+        transform.VerifyTTComputeBlocks()(malformed)
+
+
+def test_structured_annotations_require_compute_kind():
+    mod = _change_compute_block(_canonicalize(_module()), lambda fields: fields["annotations"].pop("tl.tt.compute_kind"))
+    with pytest.raises(ValueError, match="missing metadata tl.tt.compute_kind"):
+        transform.VerifyTTComputeBlocks()(mod)
+
+
+@pytest.mark.parametrize("field", ["elem_offset", "strides"])
+def test_storage_descriptors_cannot_retain_removed_coordinate_binders(field):
+    i, j = tirx.Var("i", "int32"), tirx.Var("j", "int32")
+    canceled_coordinate = tirx.Sub(i, i)
+    options = {"elem_offset": canceled_coordinate} if field == "elem_offset" else {"strides": [tirx.Add(64, canceled_coordinate), 1]}
+    a = tirx.decl_buffer((64, 64), "float32", name="A", scope="shared", **options)
+    c = tirx.decl_buffer((64, 64), "float32", name="C", scope="shared")
+    body = _scope((64, 64), [i, j], tirx.BufferStore(c, a[i, j], [i, j]))
+    root = tirx.SBlock(
+        [], [], [], "root", body, alloc_buffers=[a, c], annotations={ALLOCATIONS: _annotation_value({a.data: METADATA, c.data: METADATA})}
+    )
+    func = tirx.PrimFunc([], tirx.SBlockRealize([], True, root)).with_attr("target", tvm.target.Target(TARGET))
+    _reject(tvm.IRModule({"main": func}), "storage.*loop variables")
+
+
+@pytest.mark.parametrize("field", ["elem_offset", "strides"])
+def test_verifier_rejects_free_variables_in_storage_descriptors(field):
+    def change(fields):
+        load = fields["body"].value.a
+        variable = tirx.Var("removed_coordinate", "int32")
+        canceled = tirx.Sub(variable, variable)
+        options = {"elem_offset": canceled} if field == "elem_offset" else {"strides": [tirx.Add(64, canceled), 1]}
+        buffer = tirx.decl_buffer(load.buffer.shape, load.buffer.dtype, scope="shared", data=load.buffer.data, **options)
+        store = fields["body"]
+        fields["body"] = tirx.BufferStore(store.buffer, buffer[0, 0] + store.value.b, store.indices)
+
+    malformed = _change_compute_block(_canonicalize(_module()), change)
+    with pytest.raises(ValueError, match="storage.*loop variables"):
+        transform.VerifyTTComputeBlocks()(malformed)
+
+
 @pytest.mark.parametrize("kind", ["call", "cast"])
 def test_reject_expression_annotations_containing_removed_binders(kind):
     def expression(a, b, c, ij):

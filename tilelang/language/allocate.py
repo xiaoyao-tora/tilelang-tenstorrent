@@ -58,7 +58,7 @@ def _with_span(buffer: Buffer) -> Buffer:
 
 
 def _compile_time_int(value: Any, annotation: str) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or (isinstance(value, IntImm) and value.dtype == "bool"):
         raise TypeError(f"`{annotation}` must be a compile-time integer, not bool.")
     if isinstance(value, int):
         return value
@@ -81,10 +81,7 @@ def _normalize_alloc_shared_annotations(
         if not isinstance(key, str):
             raise TypeError("`alloc_shared` annotation keys must be strings.")
         if key == _TT_TENSOR_BACKED:
-            raise NotImplementedError(
-                "`tt.tensor_backed` is not supported in the Phase 1 "
-                "alloc_shared metadata path."
-            )
+            raise NotImplementedError("`tt.tensor_backed` is not supported in the Phase 1 alloc_shared metadata path.")
         if key.startswith("tt.") and key not in _SUPPORTED_TT_ALLOC_SHARED_ANNOTATIONS:
             raise ValueError(f"Unsupported Tenstorrent alloc_shared annotation `{key}`.")
 
@@ -92,10 +89,11 @@ def _normalize_alloc_shared_annotations(
     if not has_tt_metadata:
         return normalized
 
+    if buffer.scope() not in ("shared", "shared.dyn"):
+        raise ValueError("Tenstorrent DFB metadata requires a shared or shared.dyn buffer.")
+
     if _TT_DFB_BLOCK_COUNT in normalized:
-        block_count = _compile_time_int(
-            normalized[_TT_DFB_BLOCK_COUNT], _TT_DFB_BLOCK_COUNT
-        )
+        block_count = _compile_time_int(normalized[_TT_DFB_BLOCK_COUNT], _TT_DFB_BLOCK_COUNT)
         if not 1 <= block_count <= 32:
             raise ValueError(f"`{_TT_DFB_BLOCK_COUNT}` must be in [1, 32], got {block_count}.")
         normalized[_TT_DFB_BLOCK_COUNT] = IntImm("int32", block_count)
@@ -112,18 +110,16 @@ def _normalize_alloc_shared_annotations(
         normalized[_TT_TILE_SHAPE] = [IntImm("int32", value) for value in tile_shape]
 
     if not buffer.shape:
-        raise ValueError(
-            "Tenstorrent DFB metadata requires a non-scalar shared buffer, "
-            f"got rank {len(buffer.shape)}."
-        )
+        raise ValueError(f"Tenstorrent DFB metadata requires a non-scalar shared buffer, got rank {len(buffer.shape)}.")
     for axis, extent in enumerate(buffer.shape):
+        if not isinstance(extent, IntImm) or extent.value <= 0:
+            raise ValueError(f"Tenstorrent DFB metadata requires positive compile-time shape extents, got axis {axis}: {extent}.")
         # Leading batch axes are untiled. Rank-one reduction results have an
         # implicit padded row; their only explicit axis uses the tile width.
         tile_extent = 32 if axis + 2 >= len(buffer.shape) else 1
-        if isinstance(extent, IntImm) and extent.value % tile_extent != 0:
+        if extent.value % tile_extent != 0:
             raise ValueError(
-                f"Shared buffer shape axis {axis} ({extent.value}) must be divisible by "
-                f"`{_TT_TILE_SHAPE}` axis {axis} ({tile_extent})."
+                f"Shared buffer shape axis {axis} ({extent.value}) must be divisible by `{_TT_TILE_SHAPE}` axis {axis} ({tile_extent})."
             )
 
     return normalized

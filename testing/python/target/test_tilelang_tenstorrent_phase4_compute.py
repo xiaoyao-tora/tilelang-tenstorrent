@@ -157,7 +157,9 @@ def test_tiles_parallel_same_consumed_expression_and_maps():
         blocks = []
         tirx.stmt_functor.post_order_visit(
             mod["main"].body,
-            lambda node, blocks=blocks: blocks.append(node) if isinstance(node, tirx.SBlock) and "tl.tt.compute_kind" in node.annotations else None,
+            lambda node, blocks=blocks: (
+                blocks.append(node) if isinstance(node, tirx.SBlock) and "tl.tt.compute_kind" in node.annotations else None
+            ),
         )
         assert not blocks
 
@@ -202,9 +204,17 @@ def test_inplace_preserves_read_and_write_buffer_identity():
     assert selected.args[0].buffer.same_as(selected.args[1].buffer)
 
 
-def test_gemm_rejects_low_precision_accumulation():
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="float32 accumulation"):
-        legalize(gemm_program(output_dtype="bfloat16"))
+def test_gemm_bfloat16_bringup_preserves_precision_requirement():
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
+
+    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": gemm_program(output_dtype="bfloat16")}), TARGET)
+    selected = [call for call in calls(mod, "tl.tt.dfb_compute") if call.annotations["tt.compute_kind"].value == "gemm"][0]
+    assert selected.annotations["tt.input_dtype"].value == "bfloat16"
+    assert selected.annotations["tt.accum_dtype"].value == "bfloat16"
+    assert selected.annotations["tt.output_dtype"].value == "bfloat16"
+    assert selected.annotations["tt.dest_precision_requirement"].value == "bits16_required"
+    assert selected.annotations["tt.matmul_full_fp32"].value == "forbidden"
+    transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 def test_reduction_rejects_unsupported_kind():

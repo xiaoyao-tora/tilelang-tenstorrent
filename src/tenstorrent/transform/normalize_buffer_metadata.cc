@@ -33,9 +33,10 @@ constexpr const char *kTensorBacked = "tt.tensor_backed";
 
 using BufferSet =
     std::unordered_set<Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+using VarSet = std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 using VarMetadataMap =
-    std::unordered_map<Var, ffi::Map<ffi::String, ffi::ObjectRef>,
-                       ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+    std::unordered_map<Var, ffi::Map<ffi::String, ffi::Any>, ffi::ObjectPtrHash,
+                       ffi::ObjectPtrEqual>;
 using VarStringMap = std::unordered_map<Var, ffi::String, ffi::ObjectPtrHash,
                                         ffi::ObjectPtrEqual>;
 
@@ -51,7 +52,7 @@ void ThrowUnsupported(const std::string &message) {
 
 struct AllocationRecord {
   Buffer buffer;
-  ffi::Map<ffi::String, ffi::ObjectRef> annotations;
+  ffi::Map<ffi::String, ffi::Any> annotations;
 };
 
 class AllocationCollector : public StmtExprVisitor {
@@ -65,12 +66,11 @@ public:
   void VisitStmt_(const SBlockNode *op) final {
     VarMetadataMap annotation_by_data;
     if (auto annotation = op->annotations.Get(kAllocBufferAnnotations)) {
-      auto table =
-          annotation.value()
-              .as<ffi::Map<Var, ffi::Map<ffi::String, ffi::ObjectRef>>>();
+      auto table = annotation.value()
+                       .as<ffi::Map<Var, ffi::Map<ffi::String, ffi::Any>>>();
       if (!table.has_value()) {
         ThrowMalformed(std::string("'") + kAllocBufferAnnotations +
-                       "' must be Map<Var, Map<String, ObjectRef>>");
+                       "' must be Map<Var, Map<String, Any>>");
       }
       for (const auto &[data, entries] : table.value()) {
         annotation_by_data.emplace(data, entries);
@@ -82,7 +82,7 @@ public:
       if (!allocated.insert(buffer).second) {
         ThrowMalformed("an SBlock allocates the same Buffer object twice");
       }
-      ffi::Map<ffi::String, ffi::ObjectRef> entries;
+      ffi::Map<ffi::String, ffi::Any> entries;
       auto it = annotation_by_data.find(buffer->data);
       if (it != annotation_by_data.end()) {
         entries = it->second;
@@ -94,6 +94,13 @@ public:
       ThrowMalformed("allocation annotations contain a dangling Buffer data "
                      "reference");
     }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AllocBufferNode *op) final {
+    // LowerOpaqueBlock moves per-buffer annotations onto AllocBuffer. Keep
+    // collecting the same Buffer identity across that representation change.
+    allocations_.push_back({op->buffer, op->annotations});
     StmtExprVisitor::VisitStmt_(op);
   }
 
@@ -129,7 +136,7 @@ struct ParsedAnnotations {
 
 ParsedAnnotations
 ParseAnnotations(const Buffer &buffer,
-                 const ffi::Map<ffi::String, ffi::ObjectRef> &annotations) {
+                 const ffi::Map<ffi::String, ffi::Any> &annotations) {
   ParsedAnnotations result;
   for (const auto &[key, value] : annotations) {
     const std::string name = key;
@@ -144,7 +151,8 @@ ParseAnnotations(const Buffer &buffer,
       }
       for (const PrimExpr &extent : shape.value()) {
         const auto *integer = extent.as<IntImmNode>();
-        if (integer == nullptr || integer->value <= 0) {
+        if (integer == nullptr || integer->dtype.is_bool() ||
+            integer->value <= 0) {
           ThrowMalformed("'tt.tile_shape' entries must be positive static "
                          "integers");
         }
@@ -155,7 +163,7 @@ ParseAnnotations(const Buffer &buffer,
     }
     if (name == kDFBBlockCount) {
       const auto *integer = value.as<IntImmNode>();
-      if (integer == nullptr) {
+      if (integer == nullptr || integer->dtype.is_bool()) {
         ThrowMalformed("'tt.dfb_block_count' must be a compile-time integer");
       }
       if (integer->value < 1 || integer->value > 32) {
@@ -177,6 +185,7 @@ void ValidateExistingTable(const PrimFunc &func,
                            const ffi::Array<TTBufferMetadata> &table) {
   std::unordered_set<std::string> ids;
   BufferSet buffers;
+  VarSet allocation_data;
   for (const TTBufferMetadata &metadata : table) {
     if (!metadata.defined() || !metadata->buffer.defined()) {
       ThrowMalformed("'tt.buffer_metadata_table' contains an undefined entry");
@@ -189,12 +198,23 @@ void ValidateExistingTable(const PrimFunc &func,
       ThrowMalformed("'tt.buffer_metadata_table' contains a Buffer more than "
                      "once");
     }
+    allocation_data.insert(metadata->buffer->data);
   }
 
   for (const auto &[parameter, buffer] : func->buffer_map) {
     if (!buffers.count(buffer)) {
       ThrowMalformed("'tt.buffer_metadata_table' omits parameter Buffer '" +
                      std::string(buffer->name) + "'");
+    }
+  }
+  for (const AllocationRecord &allocation :
+       AllocationCollector::Collect(func->body)) {
+    // LowerOpaqueBlock retains the logical Buffer in DeclBuffer but creates
+    // a physical allocation Buffer sharing its data Var. Allocation metadata
+    // is attached to that storage identity, not to a particular wrapper.
+    if (!allocation_data.count(allocation.buffer->data)) {
+      ThrowMalformed("'tt.buffer_metadata_table' omits allocated Buffer '" +
+                     std::string(allocation.buffer->name) + "'");
     }
   }
 }

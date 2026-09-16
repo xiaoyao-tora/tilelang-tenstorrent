@@ -65,6 +65,20 @@ def test_tiles_explicit_domain_and_parallel_false():
     _assert_tiles_annotations(outer, inner, [4, 8], 0)
 
 
+def test_tiles_preserves_symbolic_and_batch_domains_until_capture():
+    @T.prim_func
+    def main(n: T.int32):
+        for batch, i, j in T.Tiles([2, n, 32]):
+            T.evaluate(batch + i + j)
+
+    outer = next(loop for loop in _collect_loops(main) if "tl.tt.tiles_scope" in loop.annotations)
+    domain = outer.annotations["tl.tt.tiles_domain"]
+    assert len(domain) == 3
+    assert int(domain[0]) == 2 and int(domain[2]) == 32
+    assert domain[1].same_as(main.params[0])
+    assert outer.body.extent.same_as(main.params[0])
+
+
 @pytest.mark.parametrize("domain", [[], [4]])
 def test_tiles_rejects_unsupported_domain_rank(domain):
     expected = "non-empty" if not domain else "rank at least 2"
@@ -83,6 +97,24 @@ def test_tiles_rejects_non_iterable_domain():
         def main():
             for _, _ in T.Tiles(4):
                 T.evaluate(0)
+
+
+@pytest.mark.parametrize("domain", ["32", b"32", [32, 1.5], [True, 32], [32, None]])
+def test_tiles_rejects_non_integer_domain(domain):
+    with pytest.raises(TypeError, match="iterable|scalar integer"):
+        T.Tiles(domain)
+
+
+@pytest.mark.parametrize("extent", [tvm.tirx.const(True), tvm.tirx.const(32, "float32"), tvm.tirx.Broadcast(32, 2)])
+def test_tiles_rejects_non_integer_scalar_expression(extent):
+    with pytest.raises(TypeError, match="scalar integer"):
+        T.Tiles([extent, 32])
+
+
+@pytest.mark.parametrize("extent", [0, -32, tvm.tirx.const(0, "int64")])
+def test_tiles_rejects_non_positive_domain(extent):
+    with pytest.raises(ValueError, match="must be positive"):
+        T.Tiles([extent, 32])
 
 
 @pytest.mark.parametrize("parallel", [0, 1, None, "true"])
