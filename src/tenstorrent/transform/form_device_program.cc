@@ -31,8 +31,10 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -629,13 +631,42 @@ private:
   PrimExpr value_;
 };
 
+struct PipeEndpoint {
+  int64_t transfer_id;
+  ffi::Array<Integer> record;
+  int64_t x, y, dfb_id;
+  bool source;
+  Span span;
+};
+using TransferKeys =
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, int64_t>;
+
 class GeneralDataflowPlanner {
 public:
   GeneralDataflowPlanner(const PrimFunc &frontend,
-                         const ffi::Array<TTBufferMetadata> &metadata)
-      : frontend_(frontend), metadata_(IndexBufferMetadata(metadata)),
+                         const ffi::Array<TTBufferMetadata> &metadata,
+                         TransferKeys *transfers = nullptr, int64_t x = 0,
+                         int64_t y = 0)
+      : transfers_(transfers), core_x_(x), core_y_(y), frontend_(frontend),
+        metadata_(IndexBufferMetadata(metadata)),
         tensor_reads_(frontend->params.size(), false),
         tensor_writes_(frontend->params.size(), false) {}
+
+  const std::vector<PipeEndpoint> &Endpoints() const { return endpoints_; }
+  int64_t ResourceCount() const { return resources_.size(); }
+  Stmt PipeBody() const { return Body(pipe_); }
+
+  void FinalizeMulticore() {
+    for (size_t id = 0; id < resources_.size(); ++id) {
+      if (live_.count(id) && resources_[id].consumer.empty()) {
+        resources_[id].consumer = "ncrisc";
+        Wait(&transfer_, id, frontend_->span);
+      }
+    }
+    AddReleases(&compute_, "trisc");
+    AddReleases(&transfer_, "ncrisc");
+    AddReleases(&pipe_, "brisc");
+  }
 
   // Phase 5 materializes bounded windows. A value remains an immutable
   // generation, while the same lexical write site shares one capacity pool.
@@ -813,11 +844,17 @@ public:
       if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
         mark(*as_const_int(call->args[0]));
     }
+    for (const PipeEndpoint &endpoint : endpoints_)
+      mark(endpoint.dfb_id);
     auto filter = [&](const ffi::Array<Stmt> &body) {
       ffi::Array<Stmt> result;
       for (const Stmt &statement : body) {
         const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
-        size_t arg = call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ? 1 : 0;
+        size_t arg = call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
+                             call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+                             call->op.same_as(tenstorrent::dfb_pipe_wait())
+                         ? 1
+                         : 0;
         if (live.count(*as_const_int(call->args[arg])))
           result.push_back(statement);
       }
@@ -905,10 +942,13 @@ public:
     if (!node)
       ThrowUnsupported("non-call Evaluate in compute dataflow");
     Call call = ffi::GetRef<Call>(node);
-    if (IsPipeline() && !call->span.defined())
+    if ((IsPipeline() || transfers_) && !call->span.defined())
       call.CopyOnWrite()->span =
           RequireSourceSpan(call->span, frontend_->span, "pipeline operation");
-    if (call->op.same_as(Copy::Get())) {
+    if (transfers_ && (call->op.same_as(tenstorrent::pipe_send()) ||
+                       call->op.same_as(tenstorrent::pipe_recv()))) {
+      PlanPipe(call);
+    } else if (call->op.same_as(Copy::Get())) {
       PlanCopy(Downcast<Copy>(ParseOperator(call)), call);
     } else if (call->op.same_as(tenstorrent::tile_add())) {
       BufferRegion a =
@@ -1013,6 +1053,14 @@ private:
       if (call->op.same_as(tenstorrent::dfb_compute())) {
         for (size_t arg = 1; arg < call->args.size(); ++arg)
           last_use[*as_const_int(call->args[arg])] = index;
+      } else if (call->op.same_as(tenstorrent::dfb_pipe_wait())) {
+        int64_t id = *as_const_int(call->args[1]);
+        if (resources_[id].consumer == slot)
+          last_use[id] = index;
+      } else if (call->op.same_as(tenstorrent::dfb_wait()) && transfers_) {
+        int64_t id = *as_const_int(call->args[0]);
+        if (resources_[id].consumer == slot)
+          last_use[id] = index;
       } else if (call->op.same_as(tenstorrent::dfb_copy_wait())) {
         int64_t id = *as_const_int(call->args[0]);
         if (resources_[id].consumer == slot)
@@ -1153,15 +1201,25 @@ private:
   void PlanCopy(const Copy &copy, const Call &call) {
     BufferRegion source(copy->src, copy->src_range);
     BufferRegion destination(copy->dst, copy->dst_range);
-    FullRegion(source);
-    FullRegion(destination);
+    if (!transfers_ || copy->src.scope() == "shared" ||
+        copy->src.scope() == "shared.dyn")
+      FullRegion(source);
+    if (!transfers_ || copy->dst.scope() == "shared" ||
+        copy->dst.scope() == "shared.dyn")
+      FullRegion(destination);
     const TTBufferMetadata &src =
         RequireMetadata(metadata_, copy->src, "copy source");
     const TTBufferMetadata &dst =
         RequireMetadata(metadata_, copy->dst, "copy destination");
     if (copy->src->dtype != copy->dst->dtype ||
-        !ffi::StructuralEqual()(copy->src->shape, copy->dst->shape))
-      ThrowUnsupported("copy requires matching complete shapes and dtypes");
+        source->region.size() != destination->region.size())
+      ThrowUnsupported("copy requires matching region ranks and dtypes");
+    for (size_t axis = 0; axis < source->region.size(); ++axis) {
+      arith::Analyzer analyzer;
+      if (!analyzer.CanProveEqual(source->region[axis]->extent,
+                                  destination->region[axis]->extent))
+        ThrowUnsupported("copy requires matching region extents");
+    }
     if (src->kind == "tensor" && dst->kind == "logical_dfb_candidate") {
       int64_t tensor = src->global_arg_index.value()->value;
       tensor_reads_[tensor] = true;
@@ -1175,6 +1233,10 @@ private:
       }
       transfer_.push_back(
           MakeDeviceCall(tenstorrent::tensor_to_dfb_nd(), args, call->span));
+      if (transfers_)
+        transfer_.push_back(MakeDeviceCall(tenstorrent::dfb_copy_wait(),
+                                           {Integer(id), Integer(1)},
+                                           call->span));
       return;
     }
     if (src->kind == "logical_dfb_candidate" && dst->kind == "tensor") {
@@ -1213,12 +1275,85 @@ private:
       }
       transfer_.push_back(
           MakeDeviceCall(tenstorrent::dfb_to_tensor_nd(), args, call->span));
+      if (transfers_)
+        transfer_.push_back(MakeDeviceCall(tenstorrent::dfb_copy_wait(),
+                                           {Integer(output), Integer(1)},
+                                           call->span));
       return;
     }
     ThrowUnsupported("Copy must connect Tensor and DFB; shared Copy requires "
                      "compute legalization");
   }
 
+  void PlanPipe(const Call &call) {
+    auto descriptor = call->annotations.Get("tt.pipe_record");
+    if (!descriptor.has_value())
+      ThrowMalformed("Pipe operation lacks normalized record metadata");
+    auto record = Downcast<ffi::Array<Integer>>(descriptor.value());
+    bool send = call->op.same_as(tenstorrent::pipe_send());
+    BufferRegion region =
+        NormalizeToAccessRegion(call->args[send ? 0 : 1],
+                                send ? kAccessRead : kAccessWrite)
+            .region;
+    FullRegion(region);
+    int64_t id;
+    if (send) {
+      int64_t input = Read(region->buffer, "trisc");
+      id = Write(region->buffer, "trisc", std::nullopt, false);
+      resources_[id].consumer = "brisc";
+      Wait(&compute_, input, call->span);
+      Reserve(&compute_, id, call->span);
+      const auto &metadata = resources_[id].metadata;
+      ffi::Array<Integer> identity;
+      for (size_t axis = 0; axis < region->buffer->shape.size(); ++axis)
+        identity.push_back(Integer(axis));
+      ffi::Map<ffi::String, ffi::ObjectRef> annotations{
+          {"tt.compute_kind", StringImm("copy")},
+          {"tt.compute_dtype",
+           StringImm(region->buffer->dtype == DataType::BFloat(16)
+                         ? "bfloat16"
+                         : "float32")},
+          {"tt.compute_tile_shape", metadata->tile_shape},
+          {"tt.logical_domain", region->buffer->shape},
+          {"tt.input_shapes",
+           ffi::Array<ffi::Array<PrimExpr>>{region->buffer->shape}},
+          {"tt.access_maps", ffi::Array<ffi::Array<Integer>>{identity}}};
+      compute_.push_back(
+          Evaluate(Call(DataType::Void(), tenstorrent::dfb_compute(),
+                        {Integer(id), Integer(input)}, annotations, call->span),
+                   call->span));
+      Wait(&pipe_, id, call->span);
+    } else {
+      id = Write(region->buffer, "ncrisc");
+      Reserve(&transfer_, id, call->span);
+    }
+    int64_t bx = send ? record[5]->value : core_x_;
+    int64_t by = send ? record[6]->value : core_y_;
+    int64_t ex = send ? record[7]->value : core_x_ + 1;
+    int64_t ey = send ? record[8]->value : core_y_ + 1;
+    for (int64_t x = bx; x < ex; ++x) {
+      for (int64_t y = by; y < ey; ++y) {
+        auto key = std::make_tuple(record[0]->value, record[1]->value, x, y);
+        auto found = transfers_->find(key);
+        int64_t transfer =
+            found == transfers_->end() ? transfers_->size() : found->second;
+        (*transfers_)[key] = transfer;
+        endpoints_.push_back({transfer, record, x, y, id, send, call->span});
+        auto *body = send ? &pipe_ : &transfer_;
+        body->push_back(MakeDeviceCall(
+            send ? tenstorrent::dfb_pipe_send() : tenstorrent::dfb_pipe_recv(),
+            {Integer(transfer), Integer(id), Integer(1)}, call->span));
+        body->push_back(MakeDeviceCall(
+            tenstorrent::dfb_pipe_wait(),
+            {Integer(transfer), Integer(id), Integer(1)}, call->span));
+      }
+    }
+  }
+
+  TransferKeys *transfers_;
+  int64_t core_x_, core_y_;
+  std::vector<PipeEndpoint> endpoints_;
+  ffi::Array<Stmt> pipe_;
   PrimFunc frontend_;
   BufferMetadataMap metadata_;
   std::unordered_map<Var, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
@@ -1347,6 +1482,221 @@ PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
                   frontend->span);
 }
 
+// Every Core uses the established single-Core value planner. Only identity
+// remapping and explicit Pipe transfer matching cross this boundary.
+class DeviceIDRemapper : public StmtExprMutator {
+public:
+  explicit DeviceIDRemapper(int64_t offset) : offset_(offset) {}
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    auto args = call->args;
+    auto shift = [&](size_t index) {
+      args.Set(index, Integer(*as_const_int(args[index]) + offset_));
+    };
+    if (call->op.same_as(tenstorrent::dfb_compute())) {
+      for (size_t index = 0; index < args.size(); ++index)
+        shift(index);
+    } else if (call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
+               call->op.same_as(tenstorrent::dfb_pipe_send()) ||
+               call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+               call->op.same_as(tenstorrent::dfb_pipe_wait())) {
+      shift(1);
+    } else if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()) ||
+               call->op.same_as(tenstorrent::dfb_reserve()) ||
+               call->op.same_as(tenstorrent::dfb_wait()) ||
+               call->op.same_as(tenstorrent::dfb_release()) ||
+               call->op.same_as(tenstorrent::dfb_copy_wait()) ||
+               call->op.same_as(tenstorrent::dfb_load())) {
+      shift(0);
+    }
+    return Call(call->dtype, call->op, args, call->annotations, op->span);
+  }
+
+private:
+  int64_t offset_;
+};
+
+IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
+                              const Target &target,
+                              const ffi::String &operation,
+                              const ffi::String &arch, int64_t gx, int64_t gy,
+                              const Stmt &body,
+                              const ffi::Array<TTBufferMetadata> &metadata) {
+  ffi::Array<Stmt> cores;
+  if (const auto *seq = body.as<SeqStmtNode>())
+    cores = seq->seq;
+  else
+    cores.push_back(body);
+  if (cores.size() != static_cast<size_t>(gx * gy))
+    ThrowMalformed("normalized topology does not cover the Core grid");
+  ffi::Map<GlobalVar, BaseFunc> functions;
+  ffi::Array<ffi::String> order;
+  ffi::Array<DFBDescriptor> dfbs;
+  ffi::Array<PipeDescriptor> pipes;
+  ffi::Array<PipeTransferDescriptor> transfers;
+  std::vector<int> effects(frontend->params.size(), 0);
+  TransferKeys transfer_keys;
+  std::vector<PipeEndpoint> endpoints;
+  int64_t offset = 0;
+  for (size_t index = 0; index < cores.size(); ++index) {
+    int64_t x = index / gy, y = index % gy;
+    const auto *realize = cores[index].as<SBlockRealizeNode>();
+    if (!realize || !realize->block->annotations.count("tt.core_x") ||
+        Downcast<Integer>(realize->block->annotations.at("tt.core_x"))->value !=
+            x ||
+        Downcast<Integer>(realize->block->annotations.at("tt.core_y"))->value !=
+            y)
+      ThrowMalformed("normalized topology Core order is not lexicographic x/y");
+    GeneralDataflowPlanner planner(frontend, metadata, &transfer_keys, x, y);
+    planner.Plan(realize->block->body);
+    planner.EliminateDeadWrites();
+    planner.FinalizeMulticore();
+    CoreDomain domain(CoreCoord(x, y), CoreCoord(x + 1, y + 1));
+    for (const DFBDescriptor &dfb : planner.Descriptors(domain)) {
+      dfbs.push_back(DFBDescriptor(
+          dfb->dfb_id + offset,
+          dfb->source_buffer_identity + ".core" + std::to_string(x) + "_" +
+              std::to_string(y),
+          dfb->element_dtype, dfb->tile_shape, dfb->block_shape_in_tiles,
+          dfb->block_count, dfb->tensor_backing, dfb->producer_slot, domain,
+          dfb->consumer_slot, domain, dfb->transaction_count_or_loop_relation,
+          dfb->source_span));
+    }
+    for (PipeEndpoint endpoint : planner.Endpoints()) {
+      endpoint.dfb_id += offset;
+      endpoints.push_back(std::move(endpoint));
+    }
+    auto core_effects = planner.Effects();
+    for (const Integer &tensor : planner.UsedTensorIndices()) {
+      const auto &effect = core_effects[tensor->value];
+      effects[tensor->value] |= effect == "inout"    ? 3
+                                : effect == "output" ? 2
+                                                     : 1;
+    }
+    DeviceIDRemapper remap(offset);
+    ffi::String core_operation =
+        operation + "_x" + std::to_string(x) + "_y" + std::to_string(y);
+    for (const ffi::String &slot :
+         ffi::Array<ffi::String>{"trisc", "ncrisc", "brisc"}) {
+      bool compute = slot == "trisc";
+      Stmt slot_body = compute            ? planner.ComputeBody()
+                       : slot == "ncrisc" ? planner.TransferBody()
+                                          : planner.PipeBody();
+      PrimFunc func = MakeSlotFunction(
+          frontend, target, domain, core_operation, slot,
+          compute ? "compute" : "datamovement",
+          compute ? ffi::Optional<Integer>(std::nullopt)
+                  : ffi::Optional<Integer>(Integer(slot == "ncrisc" ? 0 : 1)),
+          slot == "ncrisc" ? planner.UsedTensorIndices()
+                           : ffi::Array<Integer>(),
+          compute ? "compute" : "datamovement",
+          compute            ? "general"
+          : slot == "ncrisc" ? "tensor_io"
+                             : "pipe_source",
+          remap(slot_body));
+      ffi::Array<Var> isolated_params;
+      ffi::Map<Var, Buffer> isolated_buffers;
+      for (const Var &parameter : func->params) {
+        Var isolated_parameter = parameter.copy_with_suffix("");
+        Buffer buffer = func->buffer_map.at(parameter);
+        buffer.CopyOnWrite()->data = buffer->data.copy_with_suffix("");
+        isolated_params.push_back(isolated_parameter);
+        isolated_buffers.Set(isolated_parameter, buffer);
+      }
+      func.CopyOnWrite()->params = isolated_params;
+      func.CopyOnWrite()->buffer_map = isolated_buffers;
+      ffi::String symbol = core_operation + "_" + slot;
+      func = WithAttr(func, kLogicalKernelAttr,
+                      LogicalKernel("kernel." + symbol,
+                                    compute ? "compute" : "datamovement",
+                                    compute            ? "general"
+                                    : slot == "ncrisc" ? "tensor_io"
+                                                       : "pipe_source",
+                                    frontend->span));
+      functions.Set(GlobalVar(symbol), func);
+      order.push_back(symbol);
+    }
+    offset += planner.ResourceCount();
+  }
+  std::map<int64_t, PipeEndpoint> senders, receivers;
+  std::map<std::pair<int64_t, int64_t>, int64_t> record_payloads;
+  std::map<std::pair<int64_t, int64_t>, PipeDescriptor> ordered_pipes;
+  for (const PipeEndpoint &endpoint : endpoints) {
+    auto &side = endpoint.source ? senders : receivers;
+    if (!side.emplace(endpoint.transfer_id, endpoint).second)
+      ThrowMalformed(
+          "Pipe record has repeated transaction occurrence; Phase 6 requires "
+          "exactly one send/receive per record and destination");
+    if (endpoint.source) {
+      const auto &r = endpoint.record;
+      auto key = std::make_pair(r[0]->value, r[1]->value);
+      auto previous = record_payloads.find(key);
+      if (previous == record_payloads.end()) {
+        record_payloads.emplace(key, endpoint.dfb_id);
+        ordered_pipes.emplace(
+            key, PipeDescriptor(r[0]->value, r[1]->value,
+                                CoreCoord(r[3]->value, r[4]->value),
+                                CoreCoord(r[5]->value, r[6]->value),
+                                CoreCoord(r[7]->value, r[8]->value),
+                                r[2]->value ? "collective" : "point_to_point",
+                                endpoint.dfb_id, endpoint.span));
+      } else if (previous->second != endpoint.dfb_id) {
+        ThrowMalformed("Pipe record has more than one source occurrence");
+      }
+    }
+  }
+  auto original_records =
+      frontend->GetAttr<ffi::Array<ffi::Array<Integer>>>("tt.topology_records");
+  if (!original_records.has_value())
+    ThrowMalformed("normalized topology original record registry is missing");
+  std::unordered_set<int64_t> active_nets;
+  for (const auto &[key, payload] : record_payloads)
+    active_nets.insert(key.first);
+  for (const auto &record : original_records.value()) {
+    if (active_nets.count(record[0]->value) &&
+        !record_payloads.count({record[0]->value, record[1]->value}))
+      ThrowMalformed("active PipeNet must retain one transaction for every "
+                     "original record");
+  }
+  for (const auto &[key, pipe] : ordered_pipes)
+    pipes.push_back(pipe);
+  if (senders.size() != receivers.size())
+    ThrowMalformed("Pipe producer/consumer transaction count mismatch");
+  for (const auto &[id, sender] : senders) {
+    auto receiver = receivers.find(id);
+    if (receiver == receivers.end())
+      ThrowMalformed("Pipe send has no matching receive");
+    const auto &r = sender.record;
+    if (!ffi::StructuralEqual()(r, receiver->second.record))
+      ThrowMalformed("Pipe endpoint frozen descriptors disagree");
+    transfers.push_back(PipeTransferDescriptor(
+        id, r[0]->value, r[1]->value, 0, CoreCoord(r[3]->value, r[4]->value),
+        CoreCoord(sender.x, sender.y), sender.dfb_id, receiver->second.dfb_id,
+        1, sender.span));
+  }
+  ffi::Array<ffi::String> tensor_effects;
+  for (int effect : effects)
+    tensor_effects.push_back(effect == 3   ? "inout"
+                             : effect == 2 ? "output"
+                                           : "input");
+  auto tensors = BuildTensorTable(frontend, metadata, tensor_effects, true);
+  ffi::Map<ffi::String, ffi::Any> attrs{
+      {kDeviceIRVersionAttr, Integer(4)},
+      {kTargetArchAttr, arch},
+      {kLaunchGridAttr, CoreCoord(gx, gy)},
+      {kOperationIdentityAttr, OperationIdentity(operation, frontend->span)},
+      {kTensorTableAttr, tensors},
+      {kDFBTableAttr, dfbs},
+      {kPipeTableAttr, pipes},
+      {kPipeTransferTableAttr, transfers},
+      {kKernelOrderAttr, order}};
+  auto capacity = input->GetAttr<Integer>("tt.l1_capacity_bytes");
+  if (capacity.has_value())
+    attrs.Set("tt.l1_capacity_bytes", capacity.value());
+  return IRModule(functions, input->source_map, DictAttrs(attrs),
+                  input->global_infos);
+}
+
 IRModule FormProgram(const IRModule &input) {
   if (input->GetAttr<Integer>(kDeviceIRVersionAttr).has_value()) {
     return VerifyTenstorrentDeviceIR()(input);
@@ -1397,10 +1747,7 @@ IRModule FormProgram(const IRModule &input) {
       RequirePositiveStaticInteger(launch_grid.value()[0], "launch grid x");
   const int64_t grid_y =
       RequirePositiveStaticInteger(launch_grid.value()[1], "launch grid y");
-  if (grid_x != 1 || grid_y != 1) {
-    ThrowUnsupported("multi-Core program formation is deferred beyond Phase 2; "
-                     "expected launch grid 1x1");
-  }
+
   ffi::Optional<ffi::Array<TTBufferMetadata>> buffer_table =
       frontend->GetAttr<ffi::Array<TTBufferMetadata>>(kBufferMetadataTableAttr);
   if (!buffer_table.has_value()) {
@@ -1408,6 +1755,12 @@ IRModule FormProgram(const IRModule &input) {
   }
 
   Stmt kernel_body = StripLogicalCoreLoops(frontend, launch_grid.value());
+  if (frontend->GetAttr<Integer>("tt.topology_normalized").has_value())
+    return FormMulticoreProgram(
+        input, frontend, target.value(), frontend_global.value()->name_hint,
+        target_arch.value(), grid_x, grid_y, kernel_body, buffer_table.value());
+  if (grid_x != 1 || grid_y != 1)
+    ThrowMalformed("multi-Core input requires NormalizeTenstorrentTopology");
   const size_t tile_add_count = TileAddCounter::Count(kernel_body);
   bool legacy_add = tile_add_count == 1 && frontend->params.size() == 3 &&
                     buffer_table.value().size() == 6;

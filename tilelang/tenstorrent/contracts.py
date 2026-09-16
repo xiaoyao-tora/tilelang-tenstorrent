@@ -21,7 +21,24 @@ DEVICE_IR_VERSION = 1
 # General computation uses version 2; consumers must dispatch on the version.
 GENERAL_DEVICE_IR_VERSION = 2
 PIPELINE_DEVICE_IR_VERSION = 3
-SUPPORTED_DEVICE_IR_VERSIONS = (DEVICE_IR_VERSION, GENERAL_DEVICE_IR_VERSION, PIPELINE_DEVICE_IR_VERSION)
+MULTICORE_DEVICE_IR_VERSION = 4
+SUPPORTED_DEVICE_IR_VERSIONS = (DEVICE_IR_VERSION, GENERAL_DEVICE_IR_VERSION, PIPELINE_DEVICE_IR_VERSION, MULTICORE_DEVICE_IR_VERSION)
+
+# v4 preserves all earlier reflected constructors and adds a typed transfer
+# table. Kernel order now lists global function names in (x, y, slot) order.
+MULTICORE_MODULE_FIELDS = ("tt.pipe_transfer_table",)
+PIPE_TRANSFER_DESCRIPTOR_FIELDS = (
+    "transfer_id",
+    "pipe_net_id",
+    "record_index",
+    "occurrence",
+    "src_coord",
+    "dst_coord",
+    "source_dfb_id",
+    "destination_dfb_id",
+    "transaction_count",
+    "source_span",
+)
 
 # v3 adds module metadata; the v1/v2 reflected descriptor constructors retain
 # their fields and defaults. Each immutable DFB generation has one transaction.
@@ -155,6 +172,9 @@ __all__ = (
     "DEVICE_IR_VERSION",
     "GENERAL_DEVICE_IR_VERSION",
     "PIPELINE_DEVICE_IR_VERSION",
+    "MULTICORE_DEVICE_IR_VERSION",
+    "MULTICORE_MODULE_FIELDS",
+    "PIPE_TRANSFER_DESCRIPTOR_FIELDS",
     "PIPELINE_MODULE_FIELDS",
     "SUPPORTED_DEVICE_IR_VERSIONS",
     "DEVICE_OUTPUT_FORMAT",

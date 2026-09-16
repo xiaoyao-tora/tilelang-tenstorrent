@@ -209,6 +209,42 @@ void PipeDescriptorNode::RegisterReflection() {
       .def_ro("source_span", &PipeDescriptorNode::source_span);
 }
 
+PipeTransferDescriptor::PipeTransferDescriptor(
+    int64_t transfer_id, int64_t pipe_net_id, int64_t record_index,
+    int64_t occurrence, CoreCoord src_coord, CoreCoord dst_coord,
+    int64_t source_dfb_id, int64_t destination_dfb_id,
+    int64_t transaction_count, Span source_span) {
+  auto node = ffi::make_object<PipeTransferDescriptorNode>();
+  node->transfer_id = transfer_id;
+  node->pipe_net_id = pipe_net_id;
+  node->record_index = record_index;
+  node->occurrence = occurrence;
+  node->src_coord = std::move(src_coord);
+  node->dst_coord = std::move(dst_coord);
+  node->source_dfb_id = source_dfb_id;
+  node->destination_dfb_id = destination_dfb_id;
+  node->transaction_count = transaction_count;
+  node->source_span = std::move(source_span);
+  data_ = std::move(node);
+}
+
+void PipeTransferDescriptorNode::RegisterReflection() {
+  namespace refl = ffi::reflection;
+  refl::ObjectDef<PipeTransferDescriptorNode>()
+      .def_ro("transfer_id", &PipeTransferDescriptorNode::transfer_id)
+      .def_ro("pipe_net_id", &PipeTransferDescriptorNode::pipe_net_id)
+      .def_ro("record_index", &PipeTransferDescriptorNode::record_index)
+      .def_ro("occurrence", &PipeTransferDescriptorNode::occurrence)
+      .def_ro("src_coord", &PipeTransferDescriptorNode::src_coord)
+      .def_ro("dst_coord", &PipeTransferDescriptorNode::dst_coord)
+      .def_ro("source_dfb_id", &PipeTransferDescriptorNode::source_dfb_id)
+      .def_ro("destination_dfb_id",
+              &PipeTransferDescriptorNode::destination_dfb_id)
+      .def_ro("transaction_count",
+              &PipeTransferDescriptorNode::transaction_count)
+      .def_ro("source_span", &PipeTransferDescriptorNode::source_span);
+}
+
 LogicalKernel::LogicalKernel(ffi::String kernel_id, ffi::String kind,
                              ffi::String role, Span source_span) {
   ffi::ObjectPtr<LogicalKernelNode> node =
@@ -351,6 +387,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   TensorDescriptorNode::RegisterReflection();
   DFBDescriptorNode::RegisterReflection();
   PipeDescriptorNode::RegisterReflection();
+  PipeTransferDescriptorNode::RegisterReflection();
   LogicalKernelNode::RegisterReflection();
   TTBufferMetadataNode::RegisterReflection();
   DeviceModuleMetadataNode::RegisterReflection();
@@ -418,6 +455,16 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                                    std::move(src_coord), std::move(dst_begin),
                                    std::move(dst_end), std::move(contract),
                                    payload_dfb_id, std::move(source_span));
+           })
+      .def("tl.tenstorrent.PipeTransferDescriptor",
+           [](int64_t transfer_id, int64_t pipe_net_id, int64_t record_index,
+              int64_t occurrence, CoreCoord src_coord, CoreCoord dst_coord,
+              int64_t source_dfb_id, int64_t destination_dfb_id,
+              int64_t transaction_count, Span source_span) {
+             return PipeTransferDescriptor(
+                 transfer_id, pipe_net_id, record_index, occurrence,
+                 std::move(src_coord), std::move(dst_coord), source_dfb_id,
+                 destination_dfb_id, transaction_count, std::move(source_span));
            })
       .def("tl.tenstorrent.LogicalKernel",
            [](ffi::String kernel_id, ffi::String kind, ffi::String role,

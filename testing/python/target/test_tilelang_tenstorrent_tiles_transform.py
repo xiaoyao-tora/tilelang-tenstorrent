@@ -856,6 +856,7 @@ def test_pipeline_consumes_complete_compute_dataflow(monkeypatch, frontend, size
     assert all(_integers(call.annotations["tt.logical_domain"]) == [size, size] for call in computes)
     assert not any(call.op.name.startswith("tl.tileop.") for call in calls)
     from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
+
     VerifyTenstorrentDeviceIR()(lowered)
 
 
@@ -866,6 +867,7 @@ def test_pipeline_parallel_default_allocation_metadata_reaches_device(monkeypatc
     assert int(lowered.attrs["tt.device_ir_version"]) == 2
     assert "tt.ir_stage" not in lowered.attrs
     from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
+
     VerifyTenstorrentDeviceIR()(lowered)
 
 
@@ -961,6 +963,7 @@ def test_two_single_tile_adds_reach_device_stage(monkeypatch):
     assert int(lowered.attrs["tt.device_ir_version"]) == 2
     assert "tt.ir_stage" not in lowered.attrs
     from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
+
     VerifyTenstorrentDeviceIR()(lowered)
 
 
@@ -971,13 +974,19 @@ def test_pipeline_preserves_padded_broadcast_recipe(monkeypatch, frontend, size)
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     lowered = context.lower(tvm.IRModule({"main": _io_function(frontend, size, broadcast=True)}))
     assert int(lowered.attrs["tt.device_ir_version"]) == 2
-    computes = [call for func in lowered.functions.values() for call in _nodes(func, tirx.Call)
-                if isinstance(call.op, ir.Op) and call.op.name == "tl.tt.dfb_compute"
-                and str(call.annotations["tt.compute_kind"].value) == "elementwise"]
+    computes = [
+        call
+        for func in lowered.functions.values()
+        for call in _nodes(func, tirx.Call)
+        if isinstance(call.op, ir.Op)
+        and call.op.name == "tl.tt.dfb_compute"
+        and str(call.annotations["tt.compute_kind"].value) == "elementwise"
+    ]
     assert len(computes) == 1
     assert [-1, 1] in [_integers(axes) for axes in computes[0].annotations["tt.access_maps"]]
     assert _integers(computes[0].annotations["tt.logical_domain"]) == [size, size]
     from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
+
     VerifyTenstorrentDeviceIR()(lowered)
 
 
@@ -1008,5 +1017,5 @@ def test_deferred_compute_cannot_bypass_topology_validation(monkeypatch):
             "p2p": FRONTEND_PROGRAMS["p2p"],
         }
     )
-    with pytest.raises(NotImplementedError, match="NormalizeTenstorrentTopology"):
+    with pytest.raises(NotImplementedError, match="multiple frontend PrimFuncs"):
         context.lower(raw)

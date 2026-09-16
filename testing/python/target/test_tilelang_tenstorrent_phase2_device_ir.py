@@ -219,7 +219,7 @@ def test_phase2_add_rejects_cross_slot_var_and_intermediate_tile_add(monkeypatch
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
-def test_phase2_add_rejects_non_add_topology(monkeypatch):
+def test_pipe_requires_initialized_payload(monkeypatch):
     context = _context(monkeypatch)
-    with pytest.raises(NotImplementedError, match="TileOp|Topology|Pipe"):
+    with pytest.raises(ValueError, match="read-before-write"):
         context.lower(tvm.IRModule({"p2p": FRONTEND_PROGRAMS["p2p"]}))

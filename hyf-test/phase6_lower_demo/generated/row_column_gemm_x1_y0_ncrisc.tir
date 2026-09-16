@@ -1,0 +1,11 @@
+# from tvm.script import tirx as T
+
+@T.prim_func
+def row_column_gemm_x1_y0_ncrisc(B_handle: T.handle):
+    T.func_attr({"calling_conv": 2, "target": T.target({"arch": "wormhole_b0", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][0], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][0], "tt.noc_index": 0, "tt.tensor_arg_indices": [1]})
+    B = T.match_buffer(B_handle, (32, 64), strides=(64, 1))
+    T.tt.dfb_reserve(4, 1)
+    T.tt.tensor_to_dfb_nd(1, 4, 0, 32, 0, 32)
+    T.tt.dfb_copy_wait(4, 1)
+
+# Metadata omitted. Use show_meta=True in script() method to show it.

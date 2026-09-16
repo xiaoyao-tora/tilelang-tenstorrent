@@ -1,4 +1,4 @@
-"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3.
+"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3/v4.
 
 ``TTBufferMetadata`` is a normalization-stage object.  It is attached as an
 array under :data:`BUFFER_METADATA_TABLE_ATTR` before program formation and
@@ -8,6 +8,9 @@ Device TIR.
 The reflected descriptor constructors retain their v1 defaults. Pipeline v3
 adds module attributes for storage groups and iteration relations; these must
 be attached alongside the common metadata before invoking the verifier.
+Multicore v4 adds ``tt.pipe_transfer_table`` containing typed point deliveries
+and orders all Core/slot functions by global name in ``tt.kernel_order``.
+The earlier metadata constructors and their default version remain unchanged.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ OPERATION_IDENTITY_ATTR = "tt.operation_identity"
 TENSOR_TABLE_ATTR = "tt.tensor_table"
 DFB_TABLE_ATTR = "tt.dfb_table"
 PIPE_TABLE_ATTR = "tt.pipe_table"
+PIPE_TRANSFER_TABLE_ATTR = "tt.pipe_transfer_table"
 KERNEL_ORDER_ATTR = "tt.kernel_order"
 KERNEL_SLOT_ATTR = "tt.kernel_slot"
 KERNEL_THREAD_ATTR = "tt.kernel_thread"
@@ -176,6 +180,38 @@ class PipeDescriptor(Node):
             dst_end,
             contract,
             int(payload_dfb_id),
+            source_span,
+        )
+
+
+@tvm_ffi.register_object("tl.tenstorrent.PipeTransferDescriptor")
+class PipeTransferDescriptor(Node):
+    """One v4 record delivery to a destination Core, with explicit DFB IDs."""
+
+    def __init__(
+        self,
+        transfer_id: int,
+        pipe_net_id: int,
+        record_index: int,
+        occurrence: int,
+        src_coord: CoreCoord,
+        dst_coord: CoreCoord,
+        source_dfb_id: int,
+        destination_dfb_id: int,
+        transaction_count: int,
+        source_span: Span,
+    ):
+        self.__init_handle_by_constructor__(
+            _ffi_api.PipeTransferDescriptor,
+            int(transfer_id),
+            int(pipe_net_id),
+            int(record_index),
+            int(occurrence),
+            src_coord,
+            dst_coord,
+            int(source_dfb_id),
+            int(destination_dfb_id),
+            int(transaction_count),
             source_span,
         )
 
@@ -334,6 +370,8 @@ __all__ = (
     "LogicalKernel",
     "OperationIdentity",
     "PipeDescriptor",
+    "PipeTransferDescriptor",
+    "PIPE_TRANSFER_TABLE_ATTR",
     "ShardSpec",
     "TTBufferMetadata",
     "TensorBacking",

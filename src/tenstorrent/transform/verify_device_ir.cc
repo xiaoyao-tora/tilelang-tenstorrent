@@ -261,6 +261,7 @@ void VerifyPipeTable(const ffi::Array<PipeDescriptor> &pipes,
                      const DFBTable &dfbs, const CoreCoord &launch_grid) {
   std::unordered_set<std::string> event_ids;
   std::unordered_map<int64_t, int64_t> next_event;
+  std::unordered_map<int64_t, ffi::String> contracts;
   for (const PipeDescriptor &pipe : pipes) {
     const std::string label = "PipeNet " + std::to_string(pipe->pipe_net_id) +
                               " event " + std::to_string(pipe->event_index);
@@ -281,6 +282,11 @@ void VerifyPipeTable(const ffi::Array<PipeDescriptor> &pipes,
     Check(pipe->contract == "point_to_point" || pipe->contract == "collective",
           label + " has invalid contract `" + std::string(pipe->contract) +
               "`");
+    auto [contract, inserted] =
+        contracts.emplace(pipe->pipe_net_id, pipe->contract);
+    Check(inserted || contract->second == pipe->contract,
+          label +
+              " mixes point-to-point and collective contracts in one PipeNet");
     if (pipe->contract == "point_to_point") {
       Check(pipe->dst_end->x == pipe->dst_begin->x + 1 &&
                 pipe->dst_end->y == pipe->dst_begin->y + 1,
@@ -654,7 +660,8 @@ void VerifyFunctionABI(const tirx::PrimFunc &func, const std::string &symbol,
 
 void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
                      const CoreCoord &launch_grid, const TensorTable &tensors,
-                     const Phase2AddPlan *phase2_plan, bool general = false) {
+                     const Phase2AddPlan *phase2_plan, bool general = false,
+                     bool multicore = false) {
   std::unordered_set<std::string> slots;
   std::unordered_set<std::string> symbols;
   std::unordered_set<std::string> kernel_ids;
@@ -684,8 +691,21 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
     Check(IsSupportedSlot(slot), "PrimFunc `" + symbol +
                                      "` has invalid slot `" +
                                      std::string(slot) + "`");
-    Check(slots.insert(slot).second,
-          "operation contains duplicate slot `" + std::string(slot) + "`");
+    std::string slot_identity = slot;
+    if (multicore) {
+      CoreDomain domain =
+          RequireFuncAttr<CoreDomain>(func, symbol, kCoreDomainAttr);
+      VerifyDomain(domain, launch_grid,
+                   "PrimFunc `" + symbol + "` core_domain");
+      Check(domain->end->x == domain->begin->x + 1 &&
+                domain->end->y == domain->begin->y + 1,
+            "Phase 6 slot core_domain must contain exactly one Core");
+      slot_identity = std::to_string(domain->begin->x) + ":" +
+                      std::to_string(domain->begin->y) + ":" +
+                      std::string(slot);
+    }
+    Check(slots.insert(slot_identity).second,
+          "operation contains duplicate Core/slot `" + slot_identity + "`");
 
     ffi::String thread =
         RequireFuncAttr<ffi::String>(func, symbol, kKernelThreadAttr);
@@ -773,12 +793,13 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
 
     auto record_var = [&](const tirx::Var &var) {
       auto owner = var_owners.find(var);
-      if (owner != var_owners.end() && owner->second != std::string(slot)) {
+      if (owner != var_owners.end() &&
+          owner->second != (multicore ? symbol : std::string(slot))) {
         Fail("Var `" + std::string(var->name_hint) +
              "` is shared across Device IR slots `" + owner->second +
              "` and `" + std::string(slot) + "`");
       }
-      var_owners.emplace(var, std::string(slot));
+      var_owners.emplace(var, multicore ? symbol : std::string(slot));
     };
     for (const tirx::Var &param : func->params) {
       record_var(param);
@@ -790,6 +811,15 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
     });
   }
 
+  if (multicore) {
+    Check(launch_grid->x <= 256 && launch_grid->y <= 256 &&
+              launch_grid->x * launch_grid->y <= 256,
+          "Phase 6 static launch grid is limited to 256 Cores");
+    Check(prim_func_count ==
+              static_cast<size_t>(3 * launch_grid->x * launch_grid->y),
+          "Phase 6 operation must contain three slot PrimFuncs per Core");
+    return;
+  }
   Check(prim_func_count == 3,
         "operation must contain exactly three slot PrimFuncs");
   Check(slots.size() == 3 && slots.count("trisc") != 0 &&
@@ -1661,12 +1691,543 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
   }
 }
 
+// Schema v4 specializes every Core and keeps each DFB generation immutable.
+// Edges describe logical completion/readiness, not a claim about a NoC runtime.
+using CoreKey = std::pair<int64_t, int64_t>;
+
+CoreKey CoreOf(const CoreDomain &domain) {
+  Check(domain->end->x == domain->begin->x + 1 &&
+            domain->end->y == domain->begin->y + 1,
+        "Phase 6 DFB domain must contain exactly one Core");
+  return {domain->begin->x, domain->begin->y};
+}
+
+CoreKey CoreOf(const CoreCoord &coord) { return {coord->x, coord->y}; }
+
+void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
+                            const DFBTable &dfbs, const CoreCoord &grid,
+                            const ffi::Array<PipeDescriptor> &pipes) {
+  Check(
+      !mod->attrs->dict.count(kPipelineRelationsAttr) &&
+          !mod->attrs->dict.count(kDFBStorageGroupsAttr) &&
+          !mod->attrs->dict.count(kPipelineStagesAttr) &&
+          !mod->attrs->dict.count(kPipelineExtentAttr) &&
+          !mod->attrs->dict.count("tt.pipeline_wait_policy"),
+      "Phase 6 Pipe communication with pipeline storage reuse is unsupported");
+  const auto transfers = RequireModuleAttr<ffi::Array<PipeTransferDescriptor>>(
+      mod, kPipeTransferTableAttr);
+  std::unordered_map<int64_t, PipeTransferDescriptor> transfer_table;
+  std::map<std::pair<int64_t, int64_t>, PipeDescriptor> records;
+  for (const PipeDescriptor &pipe : pipes)
+    records.emplace(std::make_pair(pipe->pipe_net_id, pipe->event_index), pipe);
+  std::map<std::pair<int64_t, int64_t>, std::map<CoreKey, int64_t>>
+      destinations;
+  std::unordered_map<int64_t, int64_t> incoming;
+  std::unordered_map<int64_t, std::vector<int64_t>> outgoing;
+  std::map<CoreKey, int64_t> payload;
+  for (const auto &[id, dfb] : dfbs) {
+    CoreKey core = CoreOf(dfb->producer_domain);
+    Check(core == CoreOf(dfb->consumer_domain),
+          "Phase 6 DFB producer/consumer owner Core mismatch");
+    Check(SupportedComputeDType(dfb->element_dtype),
+          "Phase 6 DFB dtype unsupported");
+    Check(dfb->tile_shape.size() == 2 &&
+              RequireStaticInteger(dfb->tile_shape[0], "tile rows") == 32 &&
+              RequireStaticInteger(dfb->tile_shape[1], "tile columns") == 32,
+          "Phase 6 physical tile shape must be [32,32]");
+    int64_t capacity =
+        RequireStaticInteger(dfb->block_count, "DFB block count");
+    Check(capacity >= 1 && capacity <= 32,
+          "Phase 6 DFB capacity must be in [1,32]");
+    Check(RequireStaticInteger(dfb->transaction_count_or_loop_relation,
+                               "DFB transaction count") == 1,
+          "Phase 6 immutable DFB generation requires exactly one transaction");
+    int64_t bytes = capacity;
+    for (const PrimExpr &extent : dfb->tile_shape)
+      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, "tile extent"),
+                             "Phase 6 L1 payload");
+    for (const PrimExpr &extent : dfb->block_shape_in_tiles)
+      bytes =
+          CheckedProduct(bytes, RequireStaticInteger(extent, "block extent"),
+                         "Phase 6 L1 payload");
+    bytes =
+        CheckedProduct(bytes, dfb->element_dtype.bytes(), "Phase 6 L1 payload");
+    Check(payload[core] <= std::numeric_limits<int64_t>::max() - bytes,
+          "Phase 6 L1 payload byte sum overflows");
+    payload[core] += bytes;
+    if (dfb->tensor_backing.has_value()) {
+      const TensorBacking &backing = dfb->tensor_backing.value();
+      Check(RequireStaticInteger(backing->byte_offset, "backing byte offset") ==
+                0,
+            "Phase 6 Tensor backing offset must be zero; slices belong to "
+            "transfer ops");
+      Check(dfb->element_dtype == tensors.at(backing->global_arg_index)->dtype,
+            "Phase 6 DFB Tensor backing dtype mismatch");
+    }
+  }
+  auto budget = mod->GetAttr<Integer>(kL1CapacityBytesAttr);
+  if (budget.has_value()) {
+    Check(budget.value()->value > 0, "tt.l1_capacity_bytes must be positive");
+    for (const auto &[core, bytes] : payload)
+      Check(bytes <= budget.value()->value,
+            "Core (" + std::to_string(core.first) + "," +
+                std::to_string(core.second) +
+                ") L1 logical payload lower bound " + std::to_string(bytes) +
+                " exceeds explicit tt.l1_capacity_bytes; "
+                "physical allocation overhead is not included");
+  }
+  for (const auto &[id, tensor] : tensors) {
+    Check(SupportedComputeDType(tensor->dtype),
+          "Phase 6 Tensor dtype unsupported");
+    Check(tensor->tile_shape.size() == 2 &&
+              RequireStaticInteger(tensor->tile_shape[0], "Tensor tile rows") ==
+                  32 &&
+              RequireStaticInteger(tensor->tile_shape[1],
+                                   "Tensor tile columns") == 32,
+          "Phase 6 Tensor tile shape must be [32,32]");
+    Check(tensor->alias_group == id && !tensor->shard_spec.has_value() &&
+              tensor->memory_space == "dram" &&
+              tensor->memory_layout == "interleaved",
+          "Phase 6 requires unaliased interleaved DRAM Tensors");
+    VerifyTileGrid(tensor->shape, tensor->tile_grid_shape, "Phase 6 Tensor");
+    if (!tensor->strides.empty()) {
+      arith::Analyzer analyzer;
+      PrimExpr stride = Integer(1);
+      for (size_t axis = tensor->shape.size(); axis-- > 0;) {
+        Check(analyzer.CanProveEqual(tensor->strides[axis], stride),
+              "Phase 6 Tensor requires compact row-major strides");
+        stride = stride * tensor->shape[axis];
+      }
+    }
+  }
+  int64_t expected_transfer = 0;
+  for (const PipeTransferDescriptor &transfer : transfers) {
+    Check(transfer->transfer_id == expected_transfer++,
+          "Pipe transfer IDs must follow stable contiguous table order");
+    Check(transfer_table.emplace(transfer->transfer_id, transfer).second,
+          "duplicate Pipe transfer identity");
+    const auto record_key =
+        std::make_pair(transfer->pipe_net_id, transfer->record_index);
+    Check(records.count(record_key),
+          "Pipe transfer references missing original record");
+    const PipeDescriptor &record = records.at(record_key);
+    Check(transfer->occurrence == 0,
+          "Phase 6 supports exactly one occurrence per Pipe record");
+    Check(transfer->transaction_count == 1,
+          "Pipe transfer must contain exactly one transaction");
+    VerifyCoord(transfer->src_coord, grid, "Pipe transfer source Core");
+    VerifyCoord(transfer->dst_coord, grid, "Pipe transfer destination Core");
+    Check(CoreOf(transfer->src_coord) == CoreOf(record->src_coord),
+          "Pipe transfer source Core disagrees with original record");
+    CoreKey dest = CoreOf(transfer->dst_coord);
+    Check(dest.first >= record->dst_begin->x &&
+              dest.first < record->dst_end->x &&
+              dest.second >= record->dst_begin->y &&
+              dest.second < record->dst_end->y,
+          "Pipe transfer destination Core is outside original record domain");
+    Check(destinations[record_key].emplace(dest, transfer->transfer_id).second,
+          "Pipe record has a duplicate destination transaction");
+    Check(dfbs.count(transfer->source_dfb_id) &&
+              dfbs.count(transfer->destination_dfb_id),
+          "Pipe transfer references missing source/destination DFB");
+    Check(transfer->source_dfb_id == record->payload_dfb_id,
+          "Pipe transfer source DFB disagrees with original record payload");
+    DFBDescriptor source = dfbs.at(transfer->source_dfb_id);
+    DFBDescriptor destination = dfbs.at(transfer->destination_dfb_id);
+    Check(CoreOf(source->consumer_domain) == CoreOf(transfer->src_coord) &&
+              CoreOf(destination->producer_domain) == dest,
+          "Pipe transfer endpoint owner Core mismatch");
+    Check(source->consumer_slot == "brisc" &&
+              destination->producer_slot == "ncrisc",
+          "Pipe source requires BRISC affinity and receiver requires NCRISC");
+    Check(source->element_dtype == destination->element_dtype &&
+              ffi::StructuralEqual()(source->tile_shape,
+                                     destination->tile_shape) &&
+              ffi::StructuralEqual()(source->block_shape_in_tiles,
+                                     destination->block_shape_in_tiles),
+          "Pipe transfer payload dtype/shape mismatch");
+    Check(incoming.emplace(transfer->destination_dfb_id, transfer->transfer_id)
+              .second,
+          "Pipe destination DFB has multiple producers (overwrite risk)");
+    outgoing[transfer->source_dfb_id].push_back(transfer->transfer_id);
+    Check(transfer->source_span.defined(), "Pipe transfer has no source span");
+  }
+  for (const auto &[key, record] : records) {
+    int64_t count = (record->dst_end->x - record->dst_begin->x) *
+                    (record->dst_end->y - record->dst_begin->y);
+    Check(destinations[key].size() == static_cast<size_t>(count),
+          "Pipe record destination transactions are not closed (missing "
+          "receiver)");
+  }
+
+  struct Event {
+    Call call;
+    std::string slot;
+    CoreKey core;
+  };
+  struct WriteRegion {
+    int64_t tensor;
+    CoreKey core;
+    ffi::Array<PrimExpr> bounds;
+  };
+  std::vector<Event> events;
+  std::vector<std::vector<size_t>> dependencies;
+  std::vector<WriteRegion> writes;
+  std::unordered_map<int64_t, size_t> reserves, producers, releases,
+      copy_issues, copy_completions, sends, receives, send_completions,
+      recv_completions;
+  std::unordered_map<int64_t, std::vector<size_t>> uses;
+  std::unordered_set<int64_t> discards;
+  std::unordered_map<int64_t, ffi::Array<PrimExpr>> logical_shapes;
+  std::unordered_map<int64_t, int> effects;
+  std::map<std::pair<CoreKey, std::string>, std::string> function_names;
+  for (const auto &[global, base] : mod->functions) {
+    PrimFunc func = Downcast<PrimFunc>(base);
+    std::string slot = func->GetAttr<ffi::String>(kKernelSlotAttr).value();
+    CoreKey core = CoreOf(func->GetAttr<CoreDomain>(kCoreDomainAttr).value());
+    function_names.emplace(std::make_pair(core, slot), global->name_hint);
+    std::unordered_set<int64_t> declared, used_tensors, waited;
+    std::unordered_map<int64_t, int64_t> last_record;
+    for (const Integer &id :
+         func->GetAttr<ffi::Array<Integer>>(kTensorArgIndicesAttr).value())
+      declared.insert(id->value);
+    Check(slot == "ncrisc" || declared.empty(),
+          "Phase 6 Tensor ABI belongs to NCRISC");
+    ffi::Array<Stmt> statements;
+    if (!IsCanonicalNoOp(func->body)) {
+      if (const auto *seq = func->body.as<SeqStmtNode>())
+        statements = seq->seq;
+      else
+        statements.push_back(func->body);
+    }
+    size_t previous = 0;
+    bool first = true;
+    for (const Stmt &statement : statements) {
+      const auto *evaluate = statement.as<EvaluateNode>();
+      Check(evaluate != nullptr,
+            "Phase 6 slot body requires explicit scheduled Device operations");
+      const auto *node = evaluate->value.as<CallNode>();
+      Check(node && node->dtype.is_void(),
+            "Phase 6 Device operation must be a void intrinsic");
+      Call call = ffi::GetRef<Call>(node);
+      size_t event = events.size();
+      events.push_back({call, slot, core});
+      dependencies.emplace_back();
+      if (!first)
+        dependencies[event].push_back(previous);
+      first = false;
+      previous = event;
+      auto id_at = [&](size_t index) {
+        Check(index < call->args.size(), "Device operation missing DFB ID");
+        int64_t id = RequireStaticInteger(call->args[index], "DFB ID");
+        Check(dfbs.count(id), "Device operation references missing DFB");
+        Check(CoreOf(dfbs.at(id)->producer_domain) == core,
+              "Device operation references a DFB owned by another Core");
+        return id;
+      };
+      auto read = [&](int64_t id) {
+        Check(waited.count(id),
+              "DFB use must be preceded by dfb_wait in consumer slot");
+        Check(dfbs.at(id)->consumer_slot == slot,
+              "DFB consumer slot metadata mismatch");
+        Check(!releases.count(id),
+              "DFB use after release risks overwritten data");
+        uses[id].push_back(event);
+      };
+      auto publish = [&](int64_t id) {
+        Check(reserves.count(id), "DFB publication must follow dfb_reserve");
+        Check(dfbs.at(id)->producer_slot == slot,
+              "DFB producer slot metadata mismatch");
+        Check(producers.emplace(id, event).second,
+              "DFB generation published more than once");
+      };
+      if (call->op.same_as(dfb_reserve()) || call->op.same_as(dfb_wait()) ||
+          call->op.same_as(dfb_release()) ||
+          call->op.same_as(dfb_copy_wait())) {
+        Check(call->args.size() == 2 &&
+                  RequireStaticInteger(call->args[1], "transaction count") == 1,
+              "Phase 6 DFB operation must request exactly one transaction");
+        int64_t id = id_at(0);
+        if (call->op.same_as(dfb_reserve())) {
+          Check(dfbs.at(id)->producer_slot == slot,
+                "DFB reserve in wrong producer slot");
+          Check(reserves.emplace(id, event).second,
+                "DFB generation reserved more than once");
+        } else if (call->op.same_as(dfb_wait())) {
+          Check(dfbs.at(id)->consumer_slot == slot,
+                "DFB wait in wrong consumer slot");
+          Check(!releases.count(id),
+                "DFB wait after release risks overwritten data");
+          waited.insert(id);
+        } else if (call->op.same_as(dfb_copy_wait())) {
+          Check(slot == "ncrisc" && copy_issues.count(id),
+                "dfb_copy_wait must follow copy issue in NCRISC");
+          Check(copy_completions.emplace(id, event).second,
+                "DFB copy completed more than once");
+          if (events[copy_issues.at(id)].call->op.same_as(tensor_to_dfb_nd()))
+            publish(id);
+        } else {
+          bool discard =
+              incoming.count(id) && slot == "ncrisc" && uses[id].empty();
+          Check(
+              dfbs.at(id)->consumer_slot == slot && waited.count(id) &&
+                  (!uses[id].empty() || discard),
+              "DFB release must follow wait and consumption in consumer slot");
+          if (discard) {
+            Check(recv_completions.count(incoming.at(id)),
+                  "Pipe discard must follow receive completion, wait, and "
+                  "release");
+            discards.insert(id);
+          }
+          Check(releases.emplace(id, event).second,
+                "DFB generation released more than once");
+        }
+      } else if (call->op.same_as(dfb_compute())) {
+        Check(slot == "trisc", "dfb_compute requires TRISC");
+        VerifyGeneralCompute(call, dfbs);
+        int64_t output = id_at(0);
+        logical_shapes[output] = ComputeShape(call, "tt.logical_domain");
+        for (size_t i = 1; i < call->args.size(); ++i)
+          read(id_at(i));
+        publish(output);
+      } else if (call->op.same_as(tensor_to_dfb_nd()) ||
+                 call->op.same_as(dfb_to_tensor_nd())) {
+        Check(slot == "ncrisc" && call->args.size() >= 2,
+              "Tensor transfer requires NCRISC and Tensor/DFB operands");
+        bool input = call->op.same_as(tensor_to_dfb_nd());
+        int64_t id = id_at(input ? 1 : 0);
+        int64_t tensor_id =
+            RequireStaticInteger(call->args[input ? 0 : 1], "Tensor ID");
+        Check(tensors.count(tensor_id), "transfer references missing Tensor");
+        TensorDescriptor tensor = tensors.at(tensor_id);
+        Check(call->args.size() == 2 + 2 * tensor->shape.size(),
+              "ND transfer rank/arity mismatch");
+        ffi::Array<PrimExpr> shape, bounds;
+        for (size_t axis = 0; axis < tensor->shape.size(); ++axis) {
+          int64_t start =
+              RequireStaticInteger(call->args[2 + 2 * axis], "transfer start");
+          int64_t extent =
+              RequireStaticInteger(call->args[3 + 2 * axis], "transfer extent");
+          int64_t limit =
+              RequireStaticInteger(tensor->shape[axis], "Tensor extent");
+          int64_t tile = axis + 2 >= tensor->shape.size() ? 32 : 1;
+          Check(start >= 0 && start <= limit && extent > 0 &&
+                    extent <= limit - start,
+                "ND transfer slice lies outside Tensor bounds");
+          Check(start % tile == 0 && (extent == 1 || extent % tile == 0),
+                "Phase 6 Tensor transfer slice must align to whole tiles");
+          shape.push_back(call->args[3 + 2 * axis]);
+          bounds.push_back(call->args[2 + 2 * axis]);
+          bounds.push_back(call->args[3 + 2 * axis]);
+        }
+        VerifyTileGrid(shape, dfbs.at(id)->block_shape_in_tiles,
+                       "transfer DFB");
+        const auto backing = dfbs.at(id)->tensor_backing;
+        Check(backing.has_value() &&
+                  backing.value()->global_arg_index == tensor_id,
+              "transfer disagrees with DFB Tensor backing");
+        effects[tensor_id] |= input ? 1 : 2;
+        used_tensors.insert(tensor_id);
+        Check(copy_issues.emplace(id, event).second,
+              "DFB generation has multiple Tensor copy issues");
+        if (input) {
+          Check(reserves.count(id) && dfbs.at(id)->producer_slot == slot,
+                "Tensor copy issue must follow reserve in producer slot");
+          logical_shapes[id] = shape;
+        } else {
+          read(id);
+          writes.push_back({tensor_id, core, bounds});
+        }
+      } else if (call->op.same_as(dfb_pipe_send()) ||
+                 call->op.same_as(dfb_pipe_recv()) ||
+                 call->op.same_as(dfb_pipe_wait())) {
+        Check(call->args.size() == 3 &&
+                  RequireStaticInteger(call->args[2],
+                                       "Pipe transaction count") == 1,
+              "Pipe operation must request exactly one transaction");
+        int64_t tid = RequireStaticInteger(call->args[0], "Pipe transfer ID");
+        Check(transfer_table.count(tid),
+              "Pipe operation references missing transfer");
+        const PipeTransferDescriptor &transfer = transfer_table.at(tid);
+        int64_t id = id_at(1);
+        bool source = id == transfer->source_dfb_id;
+        Check(source || id == transfer->destination_dfb_id,
+              "Pipe operation payload DFB mismatch");
+        if (call->op.same_as(dfb_pipe_send()) ||
+            call->op.same_as(dfb_pipe_recv())) {
+          auto [previous_record, inserted] = last_record.emplace(
+              transfer->pipe_net_id, transfer->record_index);
+          Check(inserted || previous_record->second <= transfer->record_index,
+                "Pipe operations must preserve original foreach record order");
+          previous_record->second = transfer->record_index;
+        }
+        if (call->op.same_as(dfb_pipe_send())) {
+          Check(source && slot == "brisc",
+                "Pipe send requires source BRISC affinity");
+          read(id);
+          Check(sends.emplace(tid, event).second,
+                "Pipe transaction sent more than once");
+        } else if (call->op.same_as(dfb_pipe_recv())) {
+          Check(!source && slot == "ncrisc",
+                "Pipe receive requires destination NCRISC");
+          Check(reserves.count(id),
+                "Pipe receive must follow destination reserve");
+          Check(receives.emplace(tid, event).second,
+                "Pipe transaction received more than once");
+        } else if (source) {
+          Check(slot == "brisc" && sends.count(tid),
+                "Pipe source completion must follow send in BRISC");
+          Check(send_completions.emplace(tid, event).second,
+                "Pipe source completion duplicated");
+        } else {
+          Check(slot == "ncrisc" && receives.count(tid),
+                "Pipe destination completion must follow receive in NCRISC");
+          Check(recv_completions.emplace(tid, event).second,
+                "Pipe destination completion duplicated");
+          publish(id);
+        }
+      } else {
+        Fail("Phase 6 slot retains unsupported Device operation");
+      }
+    }
+    Check(declared == used_tensors, "Phase 6 NCRISC Tensor ABI must contain "
+                                    "exactly its used Tensor arguments");
+  }
+  auto order =
+      RequireModuleAttr<ffi::Array<ffi::String>>(mod, kKernelOrderAttr);
+  Check(order.size() == mod->functions.size(),
+        "Phase 6 kernel_order must cover every Core/slot");
+  size_t order_index = 0;
+  for (int64_t x = 0; x < grid->x; ++x)
+    for (int64_t y = 0; y < grid->y; ++y)
+      for (const char *slot : {"trisc", "ncrisc", "brisc"}) {
+        auto key = std::make_pair(CoreKey{x, y}, std::string(slot));
+        Check(function_names.count(key) &&
+                  order[order_index++] == function_names.at(key),
+              "Phase 6 kernel_order must follow x/y/TRISC/NCRISC/BRISC order");
+      }
+  for (const auto &[id, dfb] : dfbs) {
+    Check(reserves.count(id) && producers.count(id),
+          "DFB generation is never published");
+    Check(!uses[id].empty() || discards.count(id),
+          "DFB generation is never consumed");
+    Check(releases.count(id), "DFB generation is missing release");
+    // Same-owner slot order is the authority for a release. Adding a missing
+    // dependency here would silently repair malformed Device IR.
+    for (size_t use : uses[id])
+      Check(use < releases.at(id),
+            "DFB release precedes last consumption (overwrite risk)");
+    if (copy_issues.count(id)) {
+      Check(copy_completions.count(id), "DFB copy is missing completion wait");
+      if (events[copy_issues.at(id)].call->op.same_as(dfb_to_tensor_nd()))
+        Check(
+            copy_completions.at(id) < releases.at(id),
+            "DFB output release before copy completion risks overwritten data");
+    }
+  }
+  for (const auto &[tid, transfer] : transfer_table) {
+    Check(sends.count(tid) && receives.count(tid),
+          "Pipe transaction producer/consumer matching is not closed");
+    Check(send_completions.count(tid) && recv_completions.count(tid),
+          "Pipe transaction is missing completion synchronization");
+    Check(send_completions.at(tid) < releases.at(transfer->source_dfb_id),
+          "Pipe source release before send completion risks overwritten data");
+    // Destination reservation must exist before transport completes. Reception
+    // becomes readable only after the matching source transport has completed.
+    dependencies[send_completions.at(tid)].push_back(receives.at(tid));
+    dependencies[recv_completions.at(tid)].push_back(send_completions.at(tid));
+  }
+  for (size_t i = 0; i < events.size(); ++i)
+    if (events[i].call->op.same_as(dfb_wait())) {
+      int64_t id = RequireStaticInteger(events[i].call->args[0], "DFB wait ID");
+      dependencies[i].push_back(producers.at(id));
+    }
+  // Reject cross-Core writes to overlapping global regions; no ordering of
+  // unrelated NCRISC streams can establish a deterministic winning write.
+  for (size_t i = 0; i < writes.size(); ++i)
+    for (size_t j = i + 1; j < writes.size(); ++j) {
+      if (writes[i].tensor != writes[j].tensor ||
+          writes[i].core == writes[j].core)
+        continue;
+      bool overlap = true;
+      for (size_t axis = 0; axis < writes[i].bounds.size(); axis += 2) {
+        int64_t a = RequireStaticInteger(writes[i].bounds[axis], "write start");
+        int64_t b = RequireStaticInteger(writes[j].bounds[axis], "write start");
+        int64_t na =
+            RequireStaticInteger(writes[i].bounds[axis + 1], "write extent");
+        int64_t nb =
+            RequireStaticInteger(writes[j].bounds[axis + 1], "write extent");
+        overlap &= a < b + nb && b < a + na;
+      }
+      Check(
+          !overlap,
+          "cross-Core Tensor output overlap risks nondeterministic overwrite");
+    }
+  std::vector<int> state(events.size(), 0);
+  std::function<void(size_t)> visit = [&](size_t event) {
+    Check(state[event] != 1,
+          "Device transaction dependency cycle (cross-Core/slot deadlock)");
+    if (state[event] == 2)
+      return;
+    state[event] = 1;
+    for (size_t dependency : dependencies[event])
+      visit(dependency);
+    state[event] = 2;
+  };
+  for (size_t i = 0; i < events.size(); ++i)
+    visit(i);
+  // Forward logical shapes through communication in graph-independent order.
+  std::function<ffi::Array<PrimExpr>(int64_t)> shape_of = [&](int64_t id) {
+    if (logical_shapes.count(id))
+      return logical_shapes.at(id);
+    Check(incoming.count(id), "DFB generation has no logical shape producer");
+    int64_t source = transfer_table.at(incoming.at(id))->source_dfb_id;
+    auto shape = shape_of(source);
+    VerifyTileGrid(shape, dfbs.at(id)->block_shape_in_tiles,
+                   "Pipe destination DFB");
+    logical_shapes[id] = shape;
+    return shape;
+  };
+  for (const Event &event : events) {
+    const Call &call = event.call;
+    if (call->op.same_as(dfb_compute())) {
+      auto shapes = CheckedShapes(call->annotations.at("tt.input_shapes"),
+                                  "tt.input_shapes");
+      for (size_t i = 1; i < call->args.size(); ++i)
+        Check(ffi::StructuralEqual()(
+                  shape_of(RequireStaticInteger(call->args[i], "input DFB ID")),
+                  shapes[i - 1]),
+              "dfb_compute input logical shape disagrees with its producer");
+    } else if (call->op.same_as(dfb_to_tensor_nd())) {
+      ffi::Array<PrimExpr> shape;
+      for (size_t i = 3; i < call->args.size(); i += 2)
+        shape.push_back(call->args[i]);
+      Check(ffi::StructuralEqual()(
+                shape_of(RequireStaticInteger(call->args[0], "export DFB ID")),
+                shape),
+            "Tensor export logical shape disagrees with its producer");
+    }
+  }
+  for (const auto &[id, tensor] : tensors) {
+    ffi::String expected = effects[id] == 3   ? "inout"
+                           : effects[id] == 2 ? "output"
+                                              : "input";
+    Check(tensor->effect == expected,
+          "Tensor effect disagrees with scheduled multicore dataflow");
+    Check(effects[id] != 3,
+          "Phase 6 cross-Core Tensor inout ordering is unsupported");
+  }
+}
+
 IRModule VerifyModule(IRModule mod) {
   Integer version = RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr);
   Check(version->value == kDeviceIRVersion || version->value == 2 ||
-            version->value == 3,
+            version->value == 3 || version->value == 4,
         "unsupported tt.device_ir_version " + std::to_string(version->value) +
-            "; expected 1, 2, or 3");
+            "; expected 1, 2, 3, or 4");
+
+  Check(version->value == 4 || !mod->attrs->dict.count(kPipeTransferTableAttr),
+        "tt.pipe_transfer_table requires Device IR schema v4");
 
   ffi::String target_arch =
       RequireModuleAttr<ffi::String>(mod, kTargetArchAttr);
@@ -1692,8 +2253,9 @@ IRModule VerifyModule(IRModule mod) {
       RequireModuleAttr<ffi::Array<PipeDescriptor>>(mod, kPipeTableAttr);
   ffi::Array<ffi::String> kernel_order =
       RequireModuleAttr<ffi::Array<ffi::String>>(mod, kKernelOrderAttr);
-  Check(kernel_order.size() == 3 && kernel_order[0] == "trisc" &&
-            kernel_order[1] == "ncrisc" && kernel_order[2] == "brisc",
+  Check(version->value == 4 ||
+            (kernel_order.size() == 3 && kernel_order[0] == "trisc" &&
+             kernel_order[1] == "ncrisc" && kernel_order[2] == "brisc"),
         "tt.kernel_order must be exactly [trisc, ncrisc, brisc]");
 
   const bool general = version->value >= 2;
@@ -1702,7 +2264,11 @@ IRModule VerifyModule(IRModule mod) {
   VerifyPipeTable(pipes, dfb_table, launch_grid);
   if (version->value < 3)
     VerifyLegacyL1Budget(mod, dfb_table);
-  if (general) {
+  if (version->value == 4) {
+    VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr, true,
+                    true);
+    VerifyMulticoreProgram(mod, tensor_table, dfb_table, launch_grid, pipes);
+  } else if (general) {
     Check(launch_grid->x == 1 && launch_grid->y == 1 && pipes.empty(),
           "Phase 4 is single-Core without Pipe communication");
     VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr, true);

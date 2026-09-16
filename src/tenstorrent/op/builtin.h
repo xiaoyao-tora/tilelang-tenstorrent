@@ -79,6 +79,17 @@ TVM_DLL const Op &dfb_wait();
  */
 TVM_DLL const Op &dfb_copy_wait();
 TVM_DLL const Op &dfb_release();
+/*!
+ * \brief Schema v4 explicit point delivery and completion operations.
+ *
+ * Arguments are (transfer ID, local immutable DFB ID, transaction count=1).
+ * send runs on source BRISC, recv on destination NCRISC. A source wait keeps
+ * its data live until delivery completes; a destination wait publishes the
+ * received generation. Every multicast destination has its own transfer ID.
+ */
+TVM_DLL const Op &dfb_pipe_send();
+TVM_DLL const Op &dfb_pipe_recv();
+TVM_DLL const Op &dfb_pipe_wait();
 TVM_DLL const Op &tensor_to_dfb();
 TVM_DLL const Op &dfb_to_tensor();
 TVM_DLL const Op &dfb_add();

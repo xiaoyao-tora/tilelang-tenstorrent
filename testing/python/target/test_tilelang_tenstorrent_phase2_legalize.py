@@ -223,8 +223,9 @@ def test_legalize_consumes_fill_tileop():
 def test_topology_capabilities_are_checked_by_the_topology_pass():
     normalized = _normalized(FRONTEND_PROGRAMS["p2p"])
     ir.assert_structural_equal(transform.LegalizeTenstorrentTileOps()(normalized), normalized)
-    with pytest.raises(NotImplementedError, match="NormalizeTenstorrentTopology"):
-        transform.NormalizeTenstorrentTopology()(normalized)
+    specialized = transform.NormalizeTenstorrentTopology()(normalized)
+    assert int(specialized["main"].attrs["tt.topology_normalized"]) == 1
+    assert "tl.tt.foreach_src" not in specialized.script()
 
 
 def test_partial_copy_is_rejected_at_transaction_planning_boundary():

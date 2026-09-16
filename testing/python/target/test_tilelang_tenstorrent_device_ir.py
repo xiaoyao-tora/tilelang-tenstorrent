@@ -156,7 +156,7 @@ def test_duplicate_slot_is_rejected_without_modifying_input():
     duplicate = mod["operation_ncrisc"].with_attr("global_symbol", "operation_brisc")
     mod[brisc_gv] = duplicate
     before = ir.save_json(mod)
-    with pytest.raises(Exception, match="duplicate slot|duplicate PrimFunc"):
+    with pytest.raises(Exception, match="duplicate slot|duplicate Core/slot|duplicate PrimFunc"):
         VerifyTenstorrentDeviceIR()(mod)
     assert ir.save_json(mod) == before
 

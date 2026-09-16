@@ -29,6 +29,7 @@ constexpr const char *kOperationIdentityAttr = "tt.operation_identity";
 constexpr const char *kTensorTableAttr = "tt.tensor_table";
 constexpr const char *kDFBTableAttr = "tt.dfb_table";
 constexpr const char *kPipeTableAttr = "tt.pipe_table";
+constexpr const char *kPipeTransferTableAttr = "tt.pipe_transfer_table";
 constexpr const char *kKernelOrderAttr = "tt.kernel_order";
 
 // Schema v3 retains immutable DFB descriptors and adds explicit storage reuse.
@@ -250,6 +251,46 @@ public:
                          int64_t payload_dfb_id, Span source_span);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(PipeDescriptor, ffi::ObjectRef,
                                              PipeDescriptorNode);
+};
+
+/*! \brief Schema v4 point delivery of one immutable PipeNet record payload.
+ *
+ * A collective record has one entry per destination, in x/y order. Record
+ * identity is never deduplicated by endpoint coordinates. Version 4 currently
+ * requires occurrence=0 and transaction_count=1; repeated dynamic occurrences
+ * need a future scheduling contract. Existing descriptor layouts are unchanged.
+ */
+class PipeTransferDescriptorNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t transfer_id;
+  int64_t pipe_net_id;
+  int64_t record_index;
+  int64_t occurrence;
+  CoreCoord src_coord;
+  CoreCoord dst_coord;
+  int64_t source_dfb_id;
+  int64_t destination_dfb_id;
+  int64_t transaction_count;
+  Span source_span;
+
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.PipeTransferDescriptor",
+                                    PipeTransferDescriptorNode, ffi::Object);
+};
+
+class PipeTransferDescriptor : public ffi::ObjectRef {
+public:
+  TVM_DLL PipeTransferDescriptor(int64_t transfer_id, int64_t pipe_net_id,
+                                 int64_t record_index, int64_t occurrence,
+                                 CoreCoord src_coord, CoreCoord dst_coord,
+                                 int64_t source_dfb_id,
+                                 int64_t destination_dfb_id,
+                                 int64_t transaction_count, Span source_span);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(PipeTransferDescriptor,
+                                             ffi::ObjectRef,
+                                             PipeTransferDescriptorNode);
 };
 
 class LogicalKernelNode : public ffi::Object {

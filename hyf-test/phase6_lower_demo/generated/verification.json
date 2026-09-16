@@ -1,0 +1,160 @@
+{
+  "arch": "wormhole_b0",
+  "device_ir_version": 4,
+  "grid": [
+    3,
+    3
+  ],
+  "function_count": 27,
+  "pipe_records": 4,
+  "dfb_generations": 24,
+  "transfers": [
+    {
+      "id": 0,
+      "net": 0,
+      "record": 0,
+      "src": [
+        0,
+        1
+      ],
+      "dst": [
+        1,
+        1
+      ],
+      "source_dfb": 1,
+      "destination_dfb": 6
+    },
+    {
+      "id": 1,
+      "net": 0,
+      "record": 0,
+      "src": [
+        0,
+        1
+      ],
+      "dst": [
+        2,
+        1
+      ],
+      "source_dfb": 1,
+      "destination_dfb": 16
+    },
+    {
+      "id": 2,
+      "net": 0,
+      "record": 1,
+      "src": [
+        0,
+        2
+      ],
+      "dst": [
+        1,
+        2
+      ],
+      "source_dfb": 3,
+      "destination_dfb": 10
+    },
+    {
+      "id": 3,
+      "net": 0,
+      "record": 1,
+      "src": [
+        0,
+        2
+      ],
+      "dst": [
+        2,
+        2
+      ],
+      "source_dfb": 3,
+      "destination_dfb": 20
+    },
+    {
+      "id": 4,
+      "net": 1,
+      "record": 0,
+      "src": [
+        1,
+        0
+      ],
+      "dst": [
+        1,
+        1
+      ],
+      "source_dfb": 5,
+      "destination_dfb": 7
+    },
+    {
+      "id": 5,
+      "net": 1,
+      "record": 0,
+      "src": [
+        1,
+        0
+      ],
+      "dst": [
+        1,
+        2
+      ],
+      "source_dfb": 5,
+      "destination_dfb": 11
+    },
+    {
+      "id": 6,
+      "net": 1,
+      "record": 1,
+      "src": [
+        2,
+        0
+      ],
+      "dst": [
+        2,
+        1
+      ],
+      "source_dfb": 15,
+      "destination_dfb": 17
+    },
+    {
+      "id": 7,
+      "net": 1,
+      "record": 1,
+      "src": [
+        2,
+        0
+      ],
+      "dst": [
+        2,
+        2
+      ],
+      "source_dfb": 15,
+      "destination_dfb": 21
+    }
+  ],
+  "per_core_payload_bytes": {
+    "0,1": 8192,
+    "0,2": 8192,
+    "1,0": 8192,
+    "1,1": 16384,
+    "1,2": 16384,
+    "2,0": 8192,
+    "2,1": 16384,
+    "2,2": 16384
+  },
+  "required_per_core_budget": 16384,
+  "logical_numeric_seeds": [
+    0,
+    1,
+    19
+  ],
+  "maximum_absolute_errors": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "deterministic_script_and_json": true,
+  "json_roundtrip_verified": true,
+  "ttl_codegen": "not run",
+  "ttlang_compile_only": "not run",
+  "simulator": "not run",
+  "hardware": "not run"
+}

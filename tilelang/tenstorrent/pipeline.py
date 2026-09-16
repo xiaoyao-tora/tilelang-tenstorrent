@@ -17,8 +17,8 @@ TENSTORRENT_LOWER_PASS_ORDER = (
     "ValidateTenstorrentFrontendIR",
     "NormalizeTenstorrentLaunch",
     "NormalizeTenstorrentBufferMetadata",
-    "NormalizeTenstorrentRegions",
     "NormalizeTenstorrentTopology",
+    "NormalizeTenstorrentRegions",
     "LegalizeTenstorrentTileOps",
     "InferTenstorrentTensorLayout",
     "FormTenstorrentDeviceProgram",
@@ -49,6 +49,11 @@ def TenstorrentPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     forms v3 window schedules, asynchronous copy completion and storage release.
     The final verifier checks cross-slot dependencies and capacity reuse. No
     separate synchronization pass or generic GPU pipeline pass is required.
+
+    Static topology specialization precedes region validation so Core/record
+    coordinates become concrete Tensor slices. Formation consumes the entire
+    specialized topology into v4 Core/slot functions and explicit Pipe delivery
+    operations. Verification closes cross-Core completion and lifetime edges.
     """
 
     if mod.attrs is not None and "tt.device_ir_version" in mod.attrs:
@@ -66,8 +71,8 @@ def TenstorrentPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
-        transform.NormalizeTenstorrentRegions(),
         transform.NormalizeTenstorrentTopology(),
+        transform.NormalizeTenstorrentRegions(),
     )
     for compiler_pass in passes:
         mod = compiler_pass(mod)

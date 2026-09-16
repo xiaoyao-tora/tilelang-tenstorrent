@@ -132,10 +132,8 @@ def test_phase1_read_only_gates_are_identity_for_supported_subset(monkeypatch):
 @pytest.mark.parametrize(
     ("name", "func", "message"),
     (
-        ("p2p", FRONTEND_PROGRAMS["p2p"], "NormalizeTenstorrentTopology"),
         ("store", phase1_store, "structured T.Parallel or T.Tiles operation"),
         ("dfb_only", phase1_dfb_only, "requires Phase 2 transaction planning"),
-        ("multicore", phase1_multicore_noop, "multi-Core program formation"),
     ),
 )
 def test_phase1_pipeline_rejects_deferred_capabilities(monkeypatch, name, func, message):
@@ -144,7 +142,7 @@ def test_phase1_pipeline_rejects_deferred_capabilities(monkeypatch, name, func, 
         context.lower(tvm.IRModule({name: func}))
 
 
-def test_phase1_topology_gate_rejects_pipe_when_called_directly(monkeypatch):
+def test_topology_specializes_pipe_when_called_directly(monkeypatch):
     context = _context(monkeypatch)
     mod = tirx.transform.BindTarget(context.target)(tvm.IRModule({"p2p": FRONTEND_PROGRAMS["p2p"]}))
     for compiler_pass in (
@@ -155,5 +153,20 @@ def test_phase1_topology_gate_rejects_pipe_when_called_directly(monkeypatch):
         transform.InferTenstorrentTensorLayout(),
     ):
         mod = compiler_pass(mod)
-    with pytest.raises(NotImplementedError, match="NormalizeTenstorrentTopology"):
-        transform.NormalizeTenstorrentTopology()(mod)
+    normalized = transform.NormalizeTenstorrentTopology()(mod)
+    assert int(normalized["p2p"].attrs["tt.topology_normalized"]) == 1
+    assert "tl.tt.foreach_src" not in normalized.script()
+    assert "tl.tt.foreach_dst" not in normalized.script()
+
+
+def test_multicore_noop_forms_verified_device_ir(monkeypatch):
+    context = _context(monkeypatch)
+    lowered = context.lower(tvm.IRModule({"multicore": phase1_multicore_noop}))
+    assert int(lowered.attrs["tt.device_ir_version"]) == 4
+    transform.VerifyTenstorrentDeviceIR()(lowered)
+
+
+def test_pipe_with_uninitialized_payload_is_rejected(monkeypatch):
+    context = _context(monkeypatch)
+    with pytest.raises(ValueError, match="before.*write|uninitialized|read.*before"):
+        context.lower(tvm.IRModule({"p2p": FRONTEND_PROGRAMS["p2p"]}))
