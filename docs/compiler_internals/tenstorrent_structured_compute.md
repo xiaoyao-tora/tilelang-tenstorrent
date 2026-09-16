@@ -4,7 +4,8 @@
 contract. This extends the original Tiles design to the existing Tenstorrent
 Device TIR pipeline without retaining the frontend Add pattern matcher.
 All stages described here run without Tenstorrent hardware, TT-Lang, or TTNN.
-TTL generation and device execution remain unimplemented.
+Source-only TTL generation covers a narrower subset with optional TT-Lang
+bindings. Device execution and hardware precision validation remain separate.
 
 ## Frontend and canonical IR
 
@@ -105,8 +106,9 @@ VerifyTTComputeBlocks
 ValidateTenstorrentFrontendIR
 NormalizeTenstorrentLaunch
 NormalizeTenstorrentBufferMetadata
-NormalizeTenstorrentRegions
+VerifyTTGemmAccumulators
 NormalizeTenstorrentTopology
+NormalizeTenstorrentRegions
 LegalizeTenstorrentTileOps
 ```
 
@@ -133,19 +135,33 @@ Every complete pipeline invocation continues through:
 ```text
 InferTenstorrentTensorLayout
 FormTenstorrentDeviceProgram
+InferTenstorrentComputeRequirements
 VerifyTenstorrentDeviceIR
 ```
 
-The result has `tt.device_ir_version=1` (legacy Add/no-op) or `2` (general
-computation). Unsupported input raises a diagnostic; the pipeline no longer
-returns a structured fallback. Standalone uninitialized shared computations
-fail read-before-write checks. Clients that only need capture use
-`CanonicalizeTTElementwise` and `VerifyTTComputeBlocks` directly.
+`tilelang.tenstorrent.lower_tenstorrent_ir(mod, target)` returns Device IR when
+all computations have consumers. Versions 1–4 retain the existing Add, general,
+pipeline and multicore contracts; version 5 adds persistent GEMM accumulators.
+Legal unconsumed elementwise expressions and standalone computations without
+a Tensor ABI return the complete normalized module with
+`tt.ir_stage="structured"` and `tt.deferred_reasons`. Supported siblings are
+not partially replaced by Device operations in this result.
+
+Before structured return, `VerifyTTStructuredDataflow` checks definite
+initialization and region bounds. Uninitialized reads, malformed metadata and
+other errors are not converted into capability fallbacks. This verifier is
+conservative about aliases and symbolic regions. The registered compilation
+pipeline still requires Device IR and rejects structured output before shared
+host/device filtering. Clients needing capture alone can continue to invoke
+the two capture passes directly. To rerun the complete lowering pipeline, pass
+the original frontend module; normalized structured input is explicitly rejected
+instead of trusting its stage marker to bypass frontend validation.
 
 SIMT layout inference, generic simplification, `LowerOpaqueBlock`, buffer
 flattening, and scalar loop lowering do not run on the structured templates.
-Only the explicit compute consumer may replace them. The TTL codegen entry
-continues to report that source generation is unimplemented.
+Only the explicit compute consumer may replace them. The
+[accumulator and precision contract](tenstorrent_accumulator_precision.md)
+describes the new Device schema and narrower TTL emission boundary.
 
 ## Validation boundary
 

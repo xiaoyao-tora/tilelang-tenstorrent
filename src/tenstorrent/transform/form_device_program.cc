@@ -22,6 +22,7 @@
 #include <tvm/ir/transform.h>
 #include <tvm/target/target.h>
 #include <tvm/tirx/analysis.h>
+#include <tvm/tirx/buffer.h>
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
@@ -460,6 +461,8 @@ ffi::Array<TensorDescriptor> BuildTensorTable(
       ThrowMalformed("tt.buffer_metadata_table contains an undefined entry");
     }
     if (metadata->kind != "tensor") {
+      if (metadata->kind == "compute_fragment" && allow_dfb_candidates)
+        continue;
       if (metadata->kind == "logical_dfb_candidate") {
         if (allow_dfb_candidates) {
           continue;
@@ -641,8 +644,34 @@ struct PipeEndpoint {
 using TransferKeys =
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, int64_t>;
 
+struct AccumulatorLifetime {
+  BufferRegion region;
+  DataType input_dtype{DataType::Void()};
+  DataType output_dtype{DataType::Void()};
+  int64_t full_k_tiles{0};
+  int64_t output_id{-1};
+  std::vector<int64_t> inputs;
+  Span span;
+};
+
 class GeneralDataflowPlanner {
 public:
+  ffi::Array<AccumulatorDescriptor> Accumulators() const {
+    ffi::Array<AccumulatorDescriptor> result;
+    for (size_t id = 0; id < accumulators_.size(); ++id) {
+      const auto &state = accumulators_[id];
+      if (state.output_id < 0 || state.full_k_tiles <= 0)
+        ThrowMalformed(
+            "accumulator requires updates and one final materialization");
+      if (live_.count(state.output_id))
+        result.push_back(AccumulatorDescriptor(
+            id, state.region, state.input_dtype, state.region->buffer->dtype,
+            state.output_dtype, state.full_k_tiles,
+            RequireSourceSpan(state.span, frontend_->span, "accumulator")));
+    }
+    return result;
+  }
+
   GeneralDataflowPlanner(const PrimFunc &frontend,
                          const ffi::Array<TTBufferMetadata> &metadata,
                          TransferKeys *transfers = nullptr, int64_t x = 0,
@@ -833,6 +862,11 @@ public:
           inputs[output].push_back(*as_const_int(call->args[i]));
       }
     }
+    for (const auto &state : accumulators_) {
+      if (state.output_id < 0)
+        ThrowMalformed("accumulator has no final materialization");
+      inputs[state.output_id] = state.inputs;
+    }
     std::function<void(int64_t)> mark = [&](int64_t id) {
       if (!live.insert(id).second)
         return;
@@ -850,6 +884,15 @@ public:
       ffi::Array<Stmt> result;
       for (const Stmt &statement : body) {
         const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
+        if (call->op.same_as(tenstorrent::accumulator_init()) ||
+            call->op.same_as(tenstorrent::gemm_update()) ||
+            call->op.same_as(tenstorrent::accumulator_materialize())) {
+          size_t arg = call->op.same_as(tenstorrent::gemm_update()) ? 2 : 0;
+          int64_t id = *as_const_int(call->args[arg]);
+          if (live.count(accumulators_[id].output_id))
+            result.push_back(statement);
+          continue;
+        }
         size_t arg = call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
                              call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
                              call->op.same_as(tenstorrent::dfb_pipe_wait())
@@ -1163,6 +1206,15 @@ private:
   }
 
   void PlanCompute(const Call &call) {
+    auto kind = call->annotations.Get("tt.compute_kind");
+    if (kind.has_value()) {
+      auto name = Downcast<StringImm>(kind.value())->value;
+      if (name == "accumulator_init" || name == "gemm_update" ||
+          name == "accumulator_materialize") {
+        PlanAccumulator(call, name);
+        return;
+      }
+    }
     if (call->args.empty())
       ThrowMalformed("tile_compute has no output region");
     BufferRegion output =
@@ -1198,13 +1250,122 @@ private:
                  call->span));
   }
 
+  void PlanAccumulator(const Call &call, const ffi::String &kind) {
+    if (IsPipeline() || transfers_)
+      ThrowUnsupported("accumulator lowering currently requires serial "
+                       "single-Core execution");
+    BufferRegion region =
+        NormalizeToAccessRegion(call->args[0], kAccessReadWrite).region;
+    FullRegion(region);
+    const Buffer &buffer = region->buffer;
+    auto found = accumulator_ids_.find(buffer);
+    if (kind == "accumulator_init") {
+      if (found != accumulator_ids_.end())
+        ThrowMalformed("accumulator initialization must be unique");
+      if (RequireMetadata(metadata_, buffer, "accumulator")->kind !=
+          "compute_fragment")
+        ThrowMalformed("accumulator must reference compute_fragment metadata");
+      int64_t id = accumulators_.size();
+      accumulator_ids_.emplace(buffer, id);
+      AccumulatorLifetime state;
+      state.region = region;
+      state.span = call->span;
+      accumulators_.push_back(std::move(state));
+      compute_.push_back(MakeDeviceCall(tenstorrent::accumulator_init(),
+                                        {Integer(id)}, call->span));
+      return;
+    }
+    if (found == accumulator_ids_.end())
+      ThrowMalformed(
+          "accumulator update/materialization requires initialization");
+    int64_t id = found->second;
+    auto &state = accumulators_[id];
+    if (state.output_id >= 0)
+      ThrowMalformed("accumulator access after final materialization");
+    if (kind == "gemm_update") {
+      BufferRegion lhs =
+          NormalizeToAccessRegion(call->args[1], kAccessRead).region;
+      BufferRegion rhs =
+          NormalizeToAccessRegion(call->args[2], kAccessRead).region;
+      FullRegion(lhs);
+      FullRegion(rhs);
+      int64_t a = Read(lhs->buffer, "trisc"), b = Read(rhs->buffer, "trisc");
+      int64_t transpose_a =
+          Downcast<Integer>(call->annotations.at("tt.transpose_a"))->value;
+      int64_t transpose_b =
+          Downcast<Integer>(call->annotations.at("tt.transpose_b"))->value;
+      state.input_dtype = lhs->buffer->dtype;
+      state.full_k_tiles +=
+          RequirePositiveStaticInteger(lhs->buffer->shape[transpose_a ? 0 : 1],
+                                       "GEMM K") /
+          32;
+      state.inputs.push_back(a);
+      state.inputs.push_back(b);
+      Wait(&compute_, a, call->span);
+      Wait(&compute_, b, call->span);
+      compute_.push_back(
+          MakeDeviceCall(tenstorrent::gemm_update(),
+                         {Integer(a), Integer(b), Integer(id),
+                          Integer(transpose_a), Integer(transpose_b)},
+                         call->span));
+      return;
+    }
+    if (state.full_k_tiles <= 0)
+      ThrowMalformed("accumulator cannot materialize before GEMM updates");
+    BufferRegion output =
+        NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
+    const auto &metadata =
+        RequireMetadata(metadata_, output->buffer, "accumulator output");
+    int64_t output_id;
+    if (metadata->kind == "logical_dfb_candidate") {
+      FullRegion(output);
+      output_id = Write(output->buffer, "trisc");
+    } else if (metadata->kind == "tensor") {
+      // Materialization allocates output storage only once, after complete K.
+      Buffer storage = decl_buffer(buffer->shape, output->buffer->dtype,
+                                   buffer->name + "_materialized", "shared",
+                                   std::nullopt, call->span);
+      ICHECK(!storage->data.same_as(buffer->data));
+      const auto &fragment = RequireMetadata(metadata_, buffer, "accumulator");
+      TTBufferMetadata output_metadata(
+          fragment->buffer_id + ".materialized", storage,
+          "logical_dfb_candidate", std::nullopt, fragment->tile_shape,
+          fragment->tile_grid_shape, "interleaved", std::nullopt, Integer(1),
+          std::nullopt, std::nullopt, "inferred", "inferred", "inferred",
+          "inferred", call->span);
+      int64_t tensor = metadata->global_arg_index.value()->value;
+      output_id = resources_.size();
+      resources_.push_back({output_metadata, "trisc", "ncrisc",
+                            TensorBacking(tensor, Integer(0))});
+      tensor_writes_[tensor] = true;
+      Wait(&transfer_, output_id, call->span);
+      ffi::Array<PrimExpr> args{Integer(output_id), Integer(tensor)};
+      for (const Range &range : output->region) {
+        args.push_back(range->min);
+        args.push_back(range->extent);
+      }
+      transfer_.push_back(
+          MakeDeviceCall(tenstorrent::dfb_to_tensor_nd(), args, call->span));
+    } else {
+      ThrowMalformed("accumulator must materialize to shared DFB or Tensor");
+    }
+    state.output_id = output_id;
+    state.output_dtype = output->buffer->dtype;
+    Reserve(&compute_, output_id, call->span);
+    compute_.push_back(MakeDeviceCall(tenstorrent::accumulator_materialize(),
+                                      {Integer(id), Integer(output_id)},
+                                      call->span));
+  }
+
   void PlanCopy(const Copy &copy, const Call &call) {
     BufferRegion source(copy->src, copy->src_range);
     BufferRegion destination(copy->dst, copy->dst_range);
-    if (!transfers_ || copy->src.scope() == "shared" ||
+    bool has_accumulator =
+        frontend_->attrs->dict.count("tt.gemm_accumulator_requirements");
+    if ((!transfers_ && !has_accumulator) || copy->src.scope() == "shared" ||
         copy->src.scope() == "shared.dyn")
       FullRegion(source);
-    if (!transfers_ || copy->dst.scope() == "shared" ||
+    if ((!transfers_ && !has_accumulator) || copy->dst.scope() == "shared" ||
         copy->dst.scope() == "shared.dyn")
       FullRegion(destination);
     const TTBufferMetadata &src =
@@ -1350,6 +1511,9 @@ private:
     }
   }
 
+  std::vector<AccumulatorLifetime> accumulators_;
+  std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      accumulator_ids_;
   TransferKeys *transfers_;
   int64_t core_x_, core_y_;
   std::vector<PipeEndpoint> endpoints_;
@@ -1794,6 +1958,7 @@ IRModule FormProgram(const IRModule &input) {
   CoreDomain domain(CoreCoord(0, 0), CoreCoord(grid_x, grid_y));
   ffi::Array<TensorDescriptor> tensors;
   ffi::Array<DFBDescriptor> dfbs;
+  ffi::Array<AccumulatorDescriptor> accumulators;
   ffi::Map<GlobalVar, BaseFunc> functions;
   PrimFunc trisc;
   PrimFunc ncrisc;
@@ -1825,6 +1990,7 @@ IRModule FormProgram(const IRModule &input) {
     tensors = BuildTensorTable(frontend, buffer_table.value(),
                                planner.Effects(), true);
     dfbs = planner.Descriptors(domain);
+    accumulators = planner.Accumulators();
     Stmt compute_body = planner.ComputeBody();
     Stmt transfer_body = planner.TransferBody();
     if (independent_loop.has_value()) {
@@ -1890,9 +2056,10 @@ IRModule FormProgram(const IRModule &input) {
   functions.Set(GlobalVar(operation + "_brisc"), std::move(brisc));
 
   ffi::Map<ffi::String, ffi::Any> attrs = {
-      {kDeviceIRVersionAttr, Integer(pipeline_extent   ? 3
-                                     : general_compute ? 2
-                                                       : kDeviceIRVersion)},
+      {kDeviceIRVersionAttr, Integer(!accumulators.empty() ? 5
+                                     : pipeline_extent     ? 3
+                                     : general_compute     ? 2
+                                                           : kDeviceIRVersion)},
       {kTargetArchAttr, target_arch.value()},
       {kLaunchGridAttr, launch},
       {kOperationIdentityAttr,
@@ -1902,6 +2069,8 @@ IRModule FormProgram(const IRModule &input) {
       {kPipeTableAttr, ffi::Array<PipeDescriptor>()},
       {kKernelOrderAttr, ffi::Array<ffi::String>({"trisc", "ncrisc", "brisc"})},
   };
+  if (!accumulators.empty())
+    attrs.Set(kAccumulatorTableAttr, accumulators);
   if (pipeline_extent) {
     attrs.Set("tt.dfb_storage_groups", storage_groups);
     attrs.Set("tt.pipeline_relations", pipeline_relations);

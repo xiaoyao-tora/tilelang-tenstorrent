@@ -49,7 +49,9 @@ bool IsDFBBuffer(const Buffer &buffer) {
 }
 
 int64_t RequireStaticInteger(const PrimExpr &expr, const std::string &field) {
-  const auto *integer = expr.as<IntImmNode>();
+  arith::Analyzer analyzer;
+  PrimExpr simplified = analyzer.Simplify(expr);
+  const auto *integer = simplified.as<IntImmNode>();
   if (integer == nullptr) {
     ThrowUnsupported(field +
                      " is dynamic; Phase 1 requires statically provable "
@@ -86,6 +88,8 @@ NormalizedRegion NormalizeRegion(const BufferRegion &region,
       ThrowMalformed(endpoint + " shape and region extents must be positive");
     }
     bool axis_changed = minimum < 0;
+    changed |= !is_const_int(range->min, minimum) ||
+               !is_const_int(range->extent, extent);
     if (axis_changed) {
       minimum += shape;
       changed = true;
@@ -95,11 +99,9 @@ NormalizedRegion NormalizeRegion(const BufferRegion &region,
                      std::string(buffer->name) + "' on axis " +
                      std::to_string(axis));
     }
-    PrimExpr normalized_min =
-        axis_changed ? PrimExpr(IntImm(range->min.dtype(), minimum))
-                     : range->min;
-    normalized.push_back(
-        Range::FromMinExtent(std::move(normalized_min), range->extent));
+    PrimExpr normalized_min = PrimExpr(IntImm(range->min.dtype(), minimum));
+    normalized.push_back(Range::FromMinExtent(
+        std::move(normalized_min), IntImm(range->extent.dtype(), extent)));
   }
   if (!changed) {
     return {region, false};
@@ -108,6 +110,10 @@ NormalizedRegion NormalizeRegion(const BufferRegion &region,
 }
 
 ffi::String ClassifyTransfer(const Buffer &source, const Buffer &destination) {
+  if (source.scope() == "local.fragment" &&
+      (IsGlobalBuffer(destination) || IsDFBBuffer(destination))) {
+    return "accumulator_materialize";
+  }
   if (IsGlobalBuffer(source) && IsDFBBuffer(destination)) {
     return "tensor_to_dfb";
   }
@@ -142,8 +148,57 @@ void ValidateMatchingExtents(const BufferRegion &source,
   }
 }
 
+// Preserve operation provenance while specializing K-dependent transfer slices.
+class AccumulatorIterationSubstituter : public StmtExprMutator {
+public:
+  AccumulatorIterationSubstituter(Var variable, PrimExpr value)
+      : variable_(std::move(variable)), value_(std::move(value)) {}
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    return variable_.same_as(ffi::GetRef<Var>(op)) ? value_
+                                                   : ffi::GetRef<Var>(op);
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (!call.same_as(ffi::GetRef<Call>(op)))
+      call.CopyOnWrite()->span = op->span;
+    return call;
+  }
+
+private:
+  Var variable_;
+  PrimExpr value_;
+};
+
 class RegionNormalizer : public StmtExprMutator {
 public:
+  explicit RegionNormalizer(bool expand_accumulator_loops)
+      : expand_accumulator_loops_(expand_accumulator_loops) {}
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    if (!expand_accumulator_loops_ || !op->annotations.empty())
+      return StmtExprMutator::VisitStmt_(op);
+    int64_t extent =
+        RequireStaticInteger(op->extent, "accumulator K loop extent");
+    int64_t minimum =
+        RequireStaticInteger(op->min, "accumulator K loop minimum");
+    if (op->kind != ForKind::kSerial || extent <= 0 || extent > 1024 ||
+        (op->step.has_value() && !is_one(op->step.value())))
+      ThrowUnsupported(
+          "accumulator K loop requires serial unit step and extent <= 1024");
+    ffi::Array<Stmt> iterations;
+    for (int64_t i = 0; i < extent; ++i) {
+      if (++expanded_iterations_ > 65536)
+        ThrowUnsupported(
+            "accumulator static loop expansion exceeds 65536 iterations");
+      AccumulatorIterationSubstituter substitute(
+          op->loop_var, IntImm(op->loop_var.dtype(), minimum + i));
+      iterations.push_back(VisitStmt(substitute(op->body)));
+    }
+    return SeqStmt(iterations, op->span);
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call_node = op->value.as<CallNode>();
     if (call_node == nullptr) {
@@ -165,6 +220,9 @@ public:
   }
 
 private:
+  bool expand_accumulator_loops_;
+  size_t expanded_iterations_{0};
+
   static void ValidatePipeRegion(const Call &call, size_t argument_index,
                                  int access_mask, const std::string &endpoint) {
     if (call->args.size() <= argument_index) {
@@ -231,13 +289,8 @@ PrimFunc NormalizeRegions(PrimFunc func) {
   auto accumulators =
       func->GetAttr<ffi::Array<ffi::Map<ffi::String, ffi::ObjectRef>>>(
           "tt.gemm_accumulator_requirements");
-  if (accumulators.has_value() && !accumulators.value().empty()) {
-    ThrowUnsupported(
-        "GEMM compute_fragment has no accumulator lifetime "
-        "schedule in Device TIR; cannot lower final materialization "
-        "while guaranteeing accumulation precision");
-  }
-  RegionNormalizer normalizer;
+  RegionNormalizer normalizer(accumulators.has_value() &&
+                              !accumulators.value().empty());
   Stmt body = normalizer(func->body);
   if (body.same_as(func->body)) {
     return func;

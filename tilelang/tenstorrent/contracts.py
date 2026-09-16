@@ -22,7 +22,25 @@ DEVICE_IR_VERSION = 1
 GENERAL_DEVICE_IR_VERSION = 2
 PIPELINE_DEVICE_IR_VERSION = 3
 MULTICORE_DEVICE_IR_VERSION = 4
-SUPPORTED_DEVICE_IR_VERSIONS = (DEVICE_IR_VERSION, GENERAL_DEVICE_IR_VERSION, PIPELINE_DEVICE_IR_VERSION, MULTICORE_DEVICE_IR_VERSION)
+ACCUMULATOR_DEVICE_IR_VERSION = 5
+SUPPORTED_DEVICE_IR_VERSIONS = (
+    DEVICE_IR_VERSION,
+    GENERAL_DEVICE_IR_VERSION,
+    PIPELINE_DEVICE_IR_VERSION,
+    MULTICORE_DEVICE_IR_VERSION,
+    ACCUMULATOR_DEVICE_IR_VERSION,
+)
+ACCUMULATOR_MODULE_FIELDS = ("tt.accumulator_table",)
+ACCUMULATOR_DESCRIPTOR_FIELDS = (
+    "accumulator_id",
+    "accumulator_region",
+    "input_dtype",
+    "accumulation_dtype",
+    "output_dtype",
+    "full_k_tiles",
+    "source_span",
+)
+COMPUTE_REQUIREMENTS_FIELDS = ("destination_width", "matmul_full_fp32", "accumulators")
 
 # v4 preserves all earlier reflected constructors and adds a typed transfer
 # table. Kernel order now lists global function names in (x, y, slot) order.
@@ -168,6 +186,10 @@ TTLANG_LOWERING_PIPELINE = "ttl-to-ttkernel-pipeline"
 
 
 __all__ = (
+    "ACCUMULATOR_DEVICE_IR_VERSION",
+    "ACCUMULATOR_MODULE_FIELDS",
+    "ACCUMULATOR_DESCRIPTOR_FIELDS",
+    "COMPUTE_REQUIREMENTS_FIELDS",
     "DEFERRED_FRONTEND_CAPABILITIES",
     "DEVICE_IR_VERSION",
     "GENERAL_DEVICE_IR_VERSION",

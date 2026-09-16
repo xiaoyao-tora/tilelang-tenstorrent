@@ -17,6 +17,57 @@ namespace tvm {
 namespace tl {
 namespace tenstorrent {
 
+bool IsSupportedAccumulatorDTypeTriple(DataType input, DataType accumulation,
+                                       DataType output) {
+  return (input == DataType::BFloat(16) && output == DataType::BFloat(16) &&
+          (accumulation == DataType::BFloat(16) ||
+           accumulation == DataType::Float(32))) ||
+         (input == DataType::Float(32) && accumulation == DataType::Float(32) &&
+          output == DataType::Float(32));
+}
+
+AccumulatorDescriptor::AccumulatorDescriptor(
+    int64_t accumulator_id, tirx::BufferRegion accumulator_region,
+    DataType input_dtype, DataType accumulation_dtype, DataType output_dtype,
+    int64_t full_k_tiles, Span source_span) {
+  auto node = ffi::make_object<AccumulatorDescriptorNode>();
+  node->accumulator_id = accumulator_id;
+  node->accumulator_region = std::move(accumulator_region);
+  node->input_dtype = input_dtype;
+  node->accumulation_dtype = accumulation_dtype;
+  node->output_dtype = output_dtype;
+  node->full_k_tiles = full_k_tiles;
+  node->source_span = std::move(source_span);
+  data_ = std::move(node);
+}
+void AccumulatorDescriptorNode::RegisterReflection() {
+  ffi::reflection::ObjectDef<AccumulatorDescriptorNode>()
+      .def_ro("accumulator_id", &AccumulatorDescriptorNode::accumulator_id)
+      .def_ro("accumulator_region",
+              &AccumulatorDescriptorNode::accumulator_region)
+      .def_ro("input_dtype", &AccumulatorDescriptorNode::input_dtype)
+      .def_ro("accumulation_dtype",
+              &AccumulatorDescriptorNode::accumulation_dtype)
+      .def_ro("output_dtype", &AccumulatorDescriptorNode::output_dtype)
+      .def_ro("full_k_tiles", &AccumulatorDescriptorNode::full_k_tiles)
+      .def_ro("source_span", &AccumulatorDescriptorNode::source_span);
+}
+ComputeRequirements::ComputeRequirements(
+    ffi::String destination_width, ffi::String matmul_full_fp32,
+    ffi::Array<AccumulatorDescriptor> accumulators) {
+  auto node = ffi::make_object<ComputeRequirementsNode>();
+  node->destination_width = std::move(destination_width);
+  node->matmul_full_fp32 = std::move(matmul_full_fp32);
+  node->accumulators = std::move(accumulators);
+  data_ = std::move(node);
+}
+void ComputeRequirementsNode::RegisterReflection() {
+  ffi::reflection::ObjectDef<ComputeRequirementsNode>()
+      .def_ro("destination_width", &ComputeRequirementsNode::destination_width)
+      .def_ro("matmul_full_fp32", &ComputeRequirementsNode::matmul_full_fp32)
+      .def_ro("accumulators", &ComputeRequirementsNode::accumulators);
+}
+
 CoreCoord::CoreCoord(int64_t x, int64_t y) {
   ffi::ObjectPtr<CoreCoordNode> node = ffi::make_object<CoreCoordNode>();
   node->x = x;
@@ -379,6 +430,8 @@ void DeviceFunctionMetadataNode::RegisterReflection() {
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
+  AccumulatorDescriptorNode::RegisterReflection();
+  ComputeRequirementsNode::RegisterReflection();
   CoreCoordNode::RegisterReflection();
   CoreDomainNode::RegisterReflection();
   ShardSpecNode::RegisterReflection();
@@ -446,6 +499,22 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(consumer_slot), std::move(consumer_domain),
                  std::move(transaction_count_or_loop_relation),
                  std::move(source_span));
+           })
+      .def("tl.tenstorrent.IsSupportedAccumulatorDTypeTriple",
+           IsSupportedAccumulatorDTypeTriple)
+      .def("tl.tenstorrent.AccumulatorDescriptor",
+           [](int64_t id, tirx::BufferRegion region, DataType input,
+              DataType accumulation, DataType output, int64_t full_k,
+              Span span) {
+             return AccumulatorDescriptor(id, std::move(region), input,
+                                          accumulation, output, full_k,
+                                          std::move(span));
+           })
+      .def("tl.tenstorrent.ComputeRequirements",
+           [](ffi::String width, ffi::String full,
+              ffi::Array<AccumulatorDescriptor> accumulators) {
+             return ComputeRequirements(std::move(width), std::move(full),
+                                        std::move(accumulators));
            })
       .def("tl.tenstorrent.PipeDescriptor",
            [](int64_t pipe_net_id, int64_t event_index, CoreCoord src_coord,

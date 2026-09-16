@@ -1,4 +1,4 @@
-"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3/v4.
+"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3/v4/v5.
 
 ``TTBufferMetadata`` is a normalization-stage object.  It is attached as an
 array under :data:`BUFFER_METADATA_TABLE_ATTR` before program formation and
@@ -10,7 +10,11 @@ adds module attributes for storage groups and iteration relations; these must
 be attached alongside the common metadata before invoking the verifier.
 Multicore v4 adds ``tt.pipe_transfer_table`` containing typed point deliveries
 and orders all Core/slot functions by global name in ``tt.kernel_order``.
-The earlier metadata constructors and their default version remain unchanged.
+Schema v5 adds ``tt.accumulator_table`` and mandatory typed
+``tt.compute_requirements`` on TRISC. Persistent fragments have one init, the
+complete static K update sequence, and one final materialization; v5 currently
+excludes pipelines and multicore execution. Earlier metadata constructors and
+their default version remain unchanged.
 """
 
 from __future__ import annotations
@@ -30,6 +34,8 @@ TARGET_ARCH_ATTR = "tt.target_arch"
 LAUNCH_GRID_ATTR = "tt.launch_grid"
 OPERATION_IDENTITY_ATTR = "tt.operation_identity"
 TENSOR_TABLE_ATTR = "tt.tensor_table"
+ACCUMULATOR_TABLE_ATTR = "tt.accumulator_table"
+COMPUTE_REQUIREMENTS_ATTR = "tt.compute_requirements"
 DFB_TABLE_ATTR = "tt.dfb_table"
 PIPE_TABLE_ATTR = "tt.pipe_table"
 PIPE_TRANSFER_TABLE_ATTR = "tt.pipe_transfer_table"
@@ -46,6 +52,11 @@ PIPELINE_RELATIONS_ATTR = "tt.pipeline_relations"
 PIPELINE_STAGES_ATTR = "tt.pipeline_stages"
 PIPELINE_EXTENT_ATTR = "tt.pipeline_extent"
 L1_CAPACITY_BYTES_ATTR = "tt.l1_capacity_bytes"
+
+
+def is_supported_accumulator_dtype_triple(input_dtype, accumulation_dtype, output_dtype) -> bool:
+    """Query the shared native Lower registry; this does not imply TTL schedule support."""
+    return bool(_ffi_api.IsSupportedAccumulatorDTypeTriple(DataType(input_dtype), DataType(accumulation_dtype), DataType(output_dtype)))
 
 
 def _expr(value: Any):
@@ -155,6 +166,36 @@ class DFBDescriptor(Node):
             consumer_domain,
             _expr(transaction_count_or_loop_relation),
             source_span,
+        )
+
+
+@tvm_ffi.register_object("tl.tenstorrent.AccumulatorDescriptor")
+class AccumulatorDescriptor(Node):
+    """One persistent fragment, retained until all ``full_k_tiles`` updates finish."""
+
+    def __init__(self, accumulator_id, accumulator_region, input_dtype, accumulation_dtype, output_dtype, full_k_tiles, source_span):
+        self.__init_handle_by_constructor__(
+            _ffi_api.AccumulatorDescriptor,
+            int(accumulator_id),
+            accumulator_region,
+            DataType(input_dtype),
+            DataType(accumulation_dtype),
+            DataType(output_dtype),
+            int(full_k_tiles),
+            source_span,
+        )
+
+
+@tvm_ffi.register_object("tl.tenstorrent.ComputeRequirements")
+class ComputeRequirements(Node):
+    """Hard destination and full-K precision requirements of one compute kernel."""
+
+    def __init__(self, destination_width="unconstrained", matmul_full_fp32="allowed", accumulators=()):
+        self.__init_handle_by_constructor__(
+            _ffi_api.ComputeRequirements,
+            destination_width,
+            matmul_full_fp32,
+            list(accumulators),
         )
 
 
@@ -361,6 +402,11 @@ def VerifyTenstorrentDeviceIR():
 
 
 __all__ = (
+    "is_supported_accumulator_dtype_triple",
+    "AccumulatorDescriptor",
+    "ComputeRequirements",
+    "ACCUMULATOR_TABLE_ATTR",
+    "COMPUTE_REQUIREMENTS_ATTR",
     "BUFFER_METADATA_TABLE_ATTR",
     "CoreCoord",
     "CoreDomain",

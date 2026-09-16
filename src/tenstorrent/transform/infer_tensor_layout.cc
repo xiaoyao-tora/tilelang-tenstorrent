@@ -77,11 +77,8 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
   if (kind == "scalar_local") {
     return metadata;
   }
-  if (kind == "compute_fragment") {
-    ThrowUnsupported("compute fragment layout for buffer '" + buffer_id +
-                     "' is deferred beyond the Phase 1 basic path");
-  }
-  if (kind != "tensor" && kind != "logical_dfb_candidate") {
+  if (kind != "tensor" && kind != "logical_dfb_candidate" &&
+      kind != "compute_fragment") {
     ThrowMalformed("buffer '" + buffer_id + "' has unknown kind '" + kind +
                    "'");
   }
@@ -216,6 +213,20 @@ PrimFunc InferLayout(PrimFunc func) {
   bool changed = false;
   ffi::Array<TTBufferMetadata> inferred;
   for (const TTBufferMetadata &metadata : table.value()) {
+    if (metadata->kind == "compute_fragment") {
+      bool verified_accumulator = false;
+      auto requirements =
+          func->GetAttr<ffi::Array<ffi::Map<ffi::String, ffi::ObjectRef>>>(
+              "tt.gemm_accumulator_requirements");
+      if (requirements.has_value())
+        for (const auto &requirement : requirements.value())
+          verified_accumulator |=
+              Downcast<Buffer>(requirement.at("accumulator"))
+                  .same_as(metadata->buffer);
+      if (!verified_accumulator)
+        ThrowUnsupported(
+            "compute fragment layout requires a verified GEMM accumulator");
+    }
     inferred.push_back(InferOne(metadata, &changed));
   }
   if (!changed) {

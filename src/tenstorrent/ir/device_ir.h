@@ -17,16 +17,25 @@
 #include <tvm/ir/source_map.h>
 #include <tvm/tirx/buffer.h>
 #include <tvm/tirx/expr.h>
+#include <tvm/tirx/stmt.h>
 
 namespace tvm {
 namespace tl {
 namespace tenstorrent {
+
+/*! \brief Shared Lower capability registry for persistent GEMM dtype triples.
+ */
+TVM_DLL bool IsSupportedAccumulatorDTypeTriple(DataType input,
+                                               DataType accumulation,
+                                               DataType output);
 
 constexpr const char *kDeviceIRVersionAttr = "tt.device_ir_version";
 constexpr const char *kTargetArchAttr = "tt.target_arch";
 constexpr const char *kLaunchGridAttr = "tt.launch_grid";
 constexpr const char *kOperationIdentityAttr = "tt.operation_identity";
 constexpr const char *kTensorTableAttr = "tt.tensor_table";
+constexpr const char *kAccumulatorTableAttr = "tt.accumulator_table";
+constexpr const char *kComputeRequirementsAttr = "tt.compute_requirements";
 constexpr const char *kDFBTableAttr = "tt.dfb_table";
 constexpr const char *kPipeTableAttr = "tt.pipe_table";
 constexpr const char *kPipeTransferTableAttr = "tt.pipe_transfer_table";
@@ -223,6 +232,57 @@ public:
                         Span source_span);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DFBDescriptor, ffi::ObjectRef,
                                              DFBDescriptorNode);
+};
+
+/*! \brief Schema v5 persistent fragment, separate from published DFB values. */
+class AccumulatorDescriptorNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t accumulator_id;
+  tirx::BufferRegion accumulator_region;
+  DataType input_dtype;
+  DataType accumulation_dtype;
+  DataType output_dtype;
+  int64_t full_k_tiles;
+  Span source_span;
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.AccumulatorDescriptor",
+                                    AccumulatorDescriptorNode, ffi::Object);
+};
+class AccumulatorDescriptor : public ffi::ObjectRef {
+public:
+  TVM_DLL AccumulatorDescriptor(int64_t accumulator_id,
+                                tirx::BufferRegion accumulator_region,
+                                DataType input_dtype,
+                                DataType accumulation_dtype,
+                                DataType output_dtype, int64_t full_k_tiles,
+                                Span source_span);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(AccumulatorDescriptor,
+                                             ffi::ObjectRef,
+                                             AccumulatorDescriptorNode);
+};
+
+/*! \brief Hard requirements merged across one actual compute kernel. */
+class ComputeRequirementsNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  ffi::String destination_width;
+  ffi::String matmul_full_fp32;
+  ffi::Array<AccumulatorDescriptor> accumulators;
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.ComputeRequirements",
+                                    ComputeRequirementsNode, ffi::Object);
+};
+class ComputeRequirements : public ffi::ObjectRef {
+public:
+  TVM_DLL ComputeRequirements(ffi::String destination_width,
+                              ffi::String matmul_full_fp32,
+                              ffi::Array<AccumulatorDescriptor> accumulators);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ComputeRequirements,
+                                             ffi::ObjectRef,
+                                             ComputeRequirementsNode);
 };
 
 class PipeDescriptorNode : public ffi::Object {

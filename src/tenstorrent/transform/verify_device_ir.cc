@@ -8,6 +8,7 @@
  * \brief Read-only verifier for the Tenstorrent Device TIR v1/v2 schemas.
  */
 #include "verify_device_ir.h"
+#include "infer_compute_requirements.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
@@ -1299,6 +1300,15 @@ PipelineResources VerifyPipelineResources(const IRModule &mod,
 void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
                           const DFBTable &dfbs) {
   PipelineResources pipeline = VerifyPipelineResources(mod, dfbs);
+  bool accumulators =
+      RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr)->value == 5;
+  std::unordered_map<int64_t, AccumulatorDescriptor> accumulator_table;
+  if (accumulators) {
+    for (const auto &entry :
+         RequireModuleAttr<ffi::Array<AccumulatorDescriptor>>(
+             mod, kAccumulatorTableAttr))
+      accumulator_table.emplace(entry->accumulator_id, entry);
+  }
   // Verify an independent structured iteration by induction: every active
   // slot has the same loop boundary, each resource is defined and fully used
   // in one iteration, and no DFB value escapes that iteration. Tensor inout
@@ -1307,6 +1317,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
   for (const auto &[global, base] : mod->functions)
     has_loop |= Downcast<PrimFunc>(base)->body.as<ForNode>() != nullptr;
   if (has_loop) {
+    Check(!accumulators,
+          "schema v5 requires statically expanded serial K updates");
     Check(!pipeline.enabled,
           "pipeline Device IR must contain explicit scheduled operations");
     ffi::Optional<For> boundary;
@@ -1430,10 +1442,11 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
       Check(RequireStaticInteger(backing->byte_offset, "backing byte offset") ==
                 0,
             "Phase 4 backing offset must be zero");
-      Check(dfb->element_dtype == tensor->dtype &&
-                ffi::StructuralEqual()(dfb->block_shape_in_tiles,
-                                       tensor->tile_grid_shape),
-            "DFB Tensor backing metadata mismatch");
+      Check(
+          dfb->element_dtype == tensor->dtype &&
+              (accumulators || ffi::StructuralEqual()(dfb->block_shape_in_tiles,
+                                                      tensor->tile_grid_shape)),
+          "DFB Tensor backing metadata mismatch");
     }
   }
   for (const auto &[global, base] : mod->functions) {
@@ -1542,6 +1555,32 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
           Check(copy_completions.count(id),
                 "DFB output release before copy completion risks overwritten "
                 "data");
+      } else if (accumulators &&
+                 (call->op.same_as(accumulator_init()) ||
+                  call->op.same_as(gemm_update()) ||
+                  call->op.same_as(accumulator_materialize()))) {
+        Check(slot == "trisc", "accumulator operation must execute in trisc");
+        bool update = call->op.same_as(gemm_update());
+        bool init = call->op.same_as(accumulator_init());
+        Check(call->args.size() == (update ? 5
+                                    : init ? 1
+                                           : 2),
+              "accumulator operation arity mismatch");
+        int64_t accumulator_id =
+            RequireStaticInteger(call->args[update ? 2 : 0], "accumulator ID");
+        Check(accumulator_table.count(accumulator_id),
+              "operation references missing accumulator");
+        if (update) {
+          read(id_at(0));
+          read(id_at(1));
+        } else if (!init) {
+          ffi::Array<PrimExpr> shape;
+          for (const auto &range :
+               accumulator_table.at(accumulator_id)->accumulator_region->region)
+            shape.push_back(range->extent);
+          logical_shapes[id_at(1)] = shape;
+          publish(id_at(1));
+        }
       } else if (call->op.same_as(dfb_compute())) {
         Check(slot == "trisc", "dfb_compute must execute in trisc");
         VerifyGeneralCompute(call, dfbs);
@@ -1566,20 +1605,35 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
         auto tensor = tensors.at(tensor_id);
         Check(call->args.size() == 2 + 2 * tensor->shape.size(),
               "ND transfer rank/arity mismatch");
+        ffi::Array<PrimExpr> transfer_shape;
         for (size_t axis = 0; axis < tensor->shape.size(); ++axis) {
-          Check(RequireStaticInteger(call->args[2 + 2 * axis],
-                                     "transfer start") == 0 &&
-                    ffi::StructuralEqual()(call->args[3 + 2 * axis],
-                                           tensor->shape[axis]),
-                "ND transfer must cover full Tensor");
+          const PrimExpr &start = call->args[2 + 2 * axis];
+          const PrimExpr &extent = call->args[3 + 2 * axis];
+          if (accumulators) {
+            arith::Analyzer analyzer;
+            int64_t begin = RequireStaticInteger(start, "transfer start");
+            int64_t size = RequireStaticInteger(extent, "transfer extent");
+            int64_t tile = axis + 2 >= tensor->shape.size() ? 32 : 1;
+            Check(begin >= 0 && begin % tile == 0 && size > 0 &&
+                      size % tile == 0 &&
+                      analyzer.CanProve(start + extent <= tensor->shape[axis]),
+                  "schema v5 Tensor slice must be tile-aligned and in bounds");
+          } else {
+            Check(RequireStaticInteger(start, "transfer start") == 0 &&
+                      ffi::StructuralEqual()(extent, tensor->shape[axis]),
+                  "ND transfer must cover full Tensor");
+          }
+          transfer_shape.push_back(extent);
         }
+        VerifyTileGrid(transfer_shape, dfbs.at(id)->block_shape_in_tiles,
+                       "Tensor transfer");
         auto dfb = dfbs.at(id);
         Check(dfb->tensor_backing.has_value() &&
                   dfb->tensor_backing.value()->global_arg_index == tensor_id,
               "transfer disagrees with DFB Tensor backing");
         effects[tensor_id] |= input ? 1 : 2;
         if (input) {
-          logical_shapes[id] = tensor->shape;
+          logical_shapes[id] = transfer_shape;
           if (!pipeline.enabled)
             publish(id);
         } else
@@ -1649,12 +1703,29 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
                   ffi::StructuralEqual()(logical_shapes.at(id), shapes[i - 1]),
               "dfb_compute input logical shape disagrees with its producer");
       }
+    } else if (accumulators && call->op.same_as(gemm_update())) {
+      for (size_t operand = 0; operand < 2; ++operand) {
+        int64_t id =
+            RequireStaticInteger(call->args[operand], "GEMM input DFB ID");
+        Check(logical_shapes.count(id) && logical_shapes.at(id).size() == 2,
+              "GEMM update input has no rank-2 logical shape producer");
+        for (size_t axis = 0; axis < 2; ++axis) {
+          int64_t extent = RequireStaticInteger(logical_shapes.at(id)[axis],
+                                                "GEMM input extent");
+          Check(extent > 0 && extent % 32 == 0 &&
+                    extent / 32 == RequireStaticInteger(
+                                       dfbs.at(id)->block_shape_in_tiles[axis],
+                                       "GEMM tile extent"),
+                "GEMM update input logical shape disagrees with tile grid");
+        }
+      }
     } else if (call->op.same_as(dfb_to_tensor_nd())) {
       int64_t id = RequireStaticInteger(call->args[0], "export DFB ID");
-      int64_t tensor = RequireStaticInteger(call->args[1], "export Tensor ID");
+      ffi::Array<PrimExpr> shape;
+      for (size_t axis = 3; axis < call->args.size(); axis += 2)
+        shape.push_back(call->args[axis]);
       Check(logical_shapes.count(id) &&
-                ffi::StructuralEqual()(logical_shapes.at(id),
-                                       tensors.at(tensor)->shape),
+                ffi::StructuralEqual()(logical_shapes.at(id), shape),
             "export logical shape disagrees with its producer");
     }
   }
@@ -2241,10 +2312,23 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
 IRModule VerifyModule(IRModule mod) {
   Integer version = RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr);
   Check(version->value == kDeviceIRVersion || version->value == 2 ||
-            version->value == 3 || version->value == 4,
+            version->value == 3 || version->value == 4 || version->value == 5,
         "unsupported tt.device_ir_version " + std::to_string(version->value) +
-            "; expected 1, 2, 3, or 4");
+            "; expected 1, 2, 3, 4, or 5");
 
+  Check(version->value == 5 || !mod->attrs->dict.count(kAccumulatorTableAttr),
+        "tt.accumulator_table requires Device IR schema v5");
+  if (version->value == 5) {
+    Check(!RequireModuleAttr<ffi::Array<AccumulatorDescriptor>>(
+               mod, kAccumulatorTableAttr)
+               .empty(),
+          "schema v5 requires a nonempty accumulator table");
+    for (const char *key :
+         {kDFBStorageGroupsAttr, kPipelineRelationsAttr, kPipelineStagesAttr,
+          kPipelineExtentAttr, "tt.pipeline_wait_policy"})
+      Check(!mod->attrs->dict.count(key),
+            "schema v5 accumulator pipeline scheduling is unsupported");
+  }
   Check(version->value == 4 || !mod->attrs->dict.count(kPipeTransferTableAttr),
         "tt.pipe_transfer_table requires Device IR schema v4");
 
@@ -2281,7 +2365,7 @@ IRModule VerifyModule(IRModule mod) {
   TensorTable tensor_table = VerifyTensorTable(tensors, launch_grid, general);
   DFBTable dfb_table = VerifyDFBTable(dfbs, tensor_table, launch_grid, general);
   VerifyPipeTable(pipes, dfb_table, launch_grid);
-  if (version->value < 3)
+  if (version->value < 3 || version->value == 5)
     VerifyLegacyL1Budget(mod, dfb_table);
   if (version->value == 4) {
     VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr, true,
@@ -2291,6 +2375,10 @@ IRModule VerifyModule(IRModule mod) {
     Check(launch_grid->x == 1 && launch_grid->y == 1 && pipes.empty(),
           "Phase 4 is single-Core without Pipe communication");
     VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr, true);
+    if (version->value == 5) {
+      for (const auto &[global, base] : mod->functions)
+        DeriveComputeRequirements(mod, Downcast<PrimFunc>(base));
+    }
     VerifyGeneralProgram(mod, tensor_table, dfb_table);
   } else if (dfbs.empty()) {
     Check(pipes.empty(), "Device IR without DFBs must not contain Pipes");
@@ -2299,6 +2387,22 @@ IRModule VerifyModule(IRModule mod) {
     Phase2AddPlan phase2_plan =
         VerifyPhase2AddDescriptors(dfbs, tensor_table, pipes, launch_grid);
     VerifyFunctions(mod, target_arch, launch_grid, tensor_table, &phase2_plan);
+  }
+  for (const auto &[global, base] : mod->functions) {
+    PrimFunc func = Downcast<PrimFunc>(base);
+    auto requirements =
+        func->GetAttr<ComputeRequirements>(kComputeRequirementsAttr);
+    bool compute =
+        func->GetAttr<ffi::String>(kKernelSlotAttr).value() == "trisc";
+    Check(compute || !requirements.has_value(),
+          "data movement kernel must not carry tt.compute_requirements");
+    if (compute && (version->value == 5 || requirements.has_value())) {
+      Check(requirements.has_value(),
+            "schema v5 compute kernel missing tt.compute_requirements");
+      ComputeRequirements expected = DeriveComputeRequirements(mod, func);
+      Check(ffi::StructuralEqual()(requirements.value(), expected),
+            "tt.compute_requirements disagrees with actual Device operations");
+    }
   }
   return mod;
 }

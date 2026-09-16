@@ -266,10 +266,6 @@ public:
       Require(lifetime.updated && lifetime.materialized,
               "GEMM accumulator must have one final materialization after "
               "its complete K reduction");
-      Require(lifetime.buffer->dtype ==
-                  verifier.lifetimes_.front().buffer->dtype,
-              "GEMM accumulators in one compute Kernel have conflicting "
-              "destination precision requirements");
       const bool fp32 = lifetime.buffer->dtype == DataType::Float(32);
       Annotations requirement{
           {"accumulator", lifetime.buffer},
@@ -430,15 +426,10 @@ private:
         DataType input = lifetime->input_dtype;
         DataType accum = lifetime->buffer->dtype;
         DataType output = copy->dst->dtype;
-        Require(
-            (input == DataType::BFloat(16) &&
-             (accum == DataType::BFloat(16) || accum == DataType::Float(32)) &&
-             output == DataType::BFloat(16)) ||
-                (input == DataType::Float(32) && accum == DataType::Float(32) &&
-                 output == DataType::Float(32)),
-            "GEMM capability registry has no (input=" + DTypeName(input) +
-                ", accum=" + DTypeName(accum) +
-                ", output=" + DTypeName(output) + ") combination");
+        Require(IsSupportedAccumulatorDTypeTriple(input, accum, output),
+                "GEMM capability registry has no (input=" + DTypeName(input) +
+                    ", accum=" + DTypeName(accum) +
+                    ", output=" + DTypeName(output) + ") combination");
         lifetime->output_dtype = output;
         lifetime->materialized = true;
         return;
@@ -562,7 +553,10 @@ public:
   explicit StructuredComputeLowerer(const PrimFunc &func)
       : metadata_(func->GetAttr<ffi::Array<TTBufferMetadata>>(
                           kBufferMetadataTableAttr)
-                      .value_or(ffi::Array<TTBufferMetadata>{})) {}
+                      .value_or(ffi::Array<TTBufferMetadata>{})),
+        accumulator_requirements_(func->GetAttr<ffi::Array<Annotations>>(
+                                          "tt.gemm_accumulator_requirements")
+                                      .value_or(ffi::Array<Annotations>{})) {}
 
 private:
   Stmt VisitStmt_(const SBlockRealizeNode *op) final {
@@ -572,6 +566,21 @@ private:
     const auto *store = block->body.as<BufferStoreNode>();
     ICHECK(store != nullptr);
     const Buffer &output = store->buffer;
+    bool supported_dtype = true;
+    PostOrderVisit(store->value, [&](const ffi::ObjectRef &object) {
+      if (auto expr = object.as<PrimExpr>()) {
+        if (!expr.value().as<IntImmNode>() && !expr.value().as<VarNode>()) {
+          DataType dtype = expr.value().dtype();
+          supported_dtype &=
+              dtype.lanes() == 1 &&
+              (dtype == DataType::BFloat(16) || dtype == DataType::Float(32));
+        }
+      }
+    });
+    supported_dtype &= output->dtype == DataType::BFloat(16) ||
+                       output->dtype == DataType::Float(32);
+    if (!supported_dtype)
+      return ffi::GetRef<Stmt>(op);
     Span span = block->span.defined() ? block->span : op->span;
     if (IsDeviceAdd(block, metadata_)) {
       const auto *add = store->value.as<AddNode>();
@@ -616,6 +625,15 @@ private:
     Span span = call->span.defined() ? call->span : op->span;
     if (call->op.same_as(Fill::Get())) {
       Fill fill = Downcast<Fill>(ParseOperator(call));
+      if (fill->dst.scope() == "local.fragment") {
+        bool verified = false;
+        for (const auto &requirement : accumulator_requirements_)
+          verified |= Downcast<Buffer>(requirement.at("accumulator"))
+                          .same_as(fill->dst);
+        Require(verified, "fragment Fill requires a verified GEMM accumulator");
+        return MakeAccumulatorCompute(BufferRegion(fill->dst, fill->region), {},
+                                      "accumulator_init", {}, span);
+      }
       Require(call->annotations.empty(),
               "Fill scheduling annotations are unsupported");
       Require(call->args[1].as<IntImmNode>() ||
@@ -705,6 +723,16 @@ private:
       if (!fp32)
         annotations.Set("tt.matmul_full_fp32", StringImm("forbidden"));
       ffi::Array<BufferRegion> inputs{gemm->aRegion_, gemm->bRegion_};
+      if (gemm->c_.scope() == "local.fragment") {
+        Stmt update = MakeAccumulatorCompute(gemm->cRegion_, inputs,
+                                             "gemm_update", annotations, span);
+        if (is_one(gemm->clearAccum_))
+          return SeqStmt({MakeAccumulatorCompute(gemm->cRegion_, {},
+                                                 "accumulator_init", {}, span),
+                          update},
+                         span);
+        return update;
+      }
       if (!is_one(gemm->clearAccum_))
         inputs.push_back(gemm->cRegion_);
       return MakeCompute(gemm->cRegion_, inputs, annotations, span);
@@ -755,6 +783,11 @@ private:
     }
     if (call->op.same_as(Copy::Get())) {
       Copy copy = Downcast<Copy>(ParseOperator(call));
+      if (copy->src.scope() == "local.fragment")
+        return MakeAccumulatorCompute(
+            BufferRegion(copy->src, copy->src_range),
+            {BufferRegion(copy->dst, copy->dst_range)},
+            "accumulator_materialize", {}, span);
       if ((copy->src.scope() == "shared" ||
            copy->src.scope() == "shared.dyn") &&
           (copy->dst.scope() == "shared" ||
@@ -797,7 +830,20 @@ private:
     return StmtExprMutator::VisitExpr_(op);
   }
 
+  static Stmt MakeAccumulatorCompute(const BufferRegion &accumulator,
+                                     const ffi::Array<BufferRegion> &regions,
+                                     const char *kind, Annotations annotations,
+                                     const Span &span) {
+    annotations.Set("tt.compute_kind", StringImm(kind));
+    ffi::Array<PrimExpr> args{accumulator->ToPrimExpr()};
+    for (const BufferRegion &region : regions)
+      args.push_back(region->ToPrimExpr());
+    return Evaluate(
+        Call(DataType::Void(), tile_compute(), args, annotations, span), span);
+  }
+
   ffi::Array<TTBufferMetadata> metadata_;
+  ffi::Array<Annotations> accumulator_requirements_;
 };
 
 } // namespace
@@ -814,12 +860,6 @@ tvm::transform::Pass VerifyTTGemmAccumulators() {
 tvm::transform::Pass LegalizeTenstorrentTileOps() {
   auto pass_func = [](PrimFunc func, const IRModule &mod,
                       const tvm::transform::PassContext &context) {
-    auto requirements = func->GetAttr<ffi::Array<Annotations>>(
-        "tt.gemm_accumulator_requirements");
-    Require(!requirements.has_value() || requirements.value().empty(),
-            "GEMM compute_fragment contract is valid, but Device TIR currently "
-            "has no accumulator lifetime schedule; cannot guarantee logical "
-            "accumulation precision through all K updates and final pack");
     StructuredComputeLowerer lowerer(func);
     Stmt body = lowerer(func->body);
     if (!body.same_as(func->body)) {

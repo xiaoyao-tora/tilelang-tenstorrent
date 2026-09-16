@@ -98,10 +98,18 @@ def test_unregistered_dtype_triples_are_rejected(dtypes):
         verify(program(*dtypes))
 
 
-def test_fragment_contract_is_not_silently_lowered_to_storage():
-    mod = verify(program())
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="no accumulator lifetime schedule"):
-        transform.LegalizeTenstorrentTileOps()(mod)
+def test_fragment_legalization_preserves_accumulator_operations():
+    mod = transform.LegalizeTenstorrentTileOps()(verify(program()))
+    kinds = []
+    tirx.stmt_functor.post_order_visit(
+        mod["main"].body,
+        lambda node: (
+            kinds.append(node.annotations["tt.compute_kind"].value)
+            if isinstance(node, tirx.Call) and node.op.name == "tl.tt.tile_compute"
+            else None
+        ),
+    )
+    assert kinds == ["accumulator_init", "gemm_update", "accumulator_materialize"]
 
 
 def test_frontend_requirements_do_not_bypass_reverification():
@@ -171,11 +179,75 @@ def test_ordinary_fp32_fragment_does_not_imply_gemm_precision():
     assert "tt.gemm_accumulator_requirements" not in checked["main"].attrs
 
 
-def test_full_pipeline_reports_unimplemented_accumulator_schedule():
+@pytest.mark.parametrize(
+    "dtypes",
+    [("bfloat16", "bfloat16", "bfloat16"), ("bfloat16", "float32", "bfloat16"), ("float32", "float32", "float32")],
+)
+@pytest.mark.parametrize("mode,updates", [("valid", 2), ("clear_true", 1)])
+def test_full_pipeline_preserves_complete_accumulator_lifetime(dtypes, mode, updates):
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="no accumulator lifetime schedule"):
-        TenstorrentPassPipelineBody(tvm.IRModule({"main": program()}), TARGET)
+    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": program(*dtypes, mode=mode)}), TARGET)
+    assert int(mod.attrs["tt.device_ir_version"]) == 5
+    (accumulator,) = mod.attrs["tt.accumulator_table"]
+    assert str(accumulator.input_dtype) == dtypes[0]
+    assert str(accumulator.accumulation_dtype) == dtypes[1]
+    assert str(accumulator.output_dtype) == dtypes[2]
+    assert accumulator.full_k_tiles == updates
+    calls = device_calls(mod, "trisc")
+    lifetime = [call for call in calls if call.op.name in {"tl.tt.accumulator_init", "tl.tt.gemm_update", "tl.tt.accumulator_materialize"}]
+    assert [call.op.name for call in lifetime] == [
+        "tl.tt.accumulator_init",
+        *["tl.tt.gemm_update"] * updates,
+        "tl.tt.accumulator_materialize",
+    ]
+    assert all(int(call.args[2]) == accumulator.accumulator_id for call in lifetime[1:-1])
+    assert int(lifetime[0].args[0]) == int(lifetime[-1].args[0]) == accumulator.accumulator_id
+    assert len(mod.attrs["tt.dfb_table"]) == 3
+    output = next(dfb for dfb in mod.attrs["tt.dfb_table"] if dfb.dfb_id == int(lifetime[-1].args[1]))
+    assert ".materialized" in str(output.source_buffer_identity)
+    assert str(output.element_dtype) == dtypes[2]
+    assert accumulator.accumulator_region.buffer.scope() == "local.fragment"
+    assert str(accumulator.accumulator_region.buffer.dtype) == dtypes[1]
+    assert not any(call.op.name == "tl.tt.dfb_compute" for call in calls)
+    assert ir.structural_equal(mod, transform.VerifyTenstorrentDeviceIR()(mod))
+
+
+def device_calls(mod, slot):
+    calls = []
+    for func in mod.functions.values():
+        if func.attrs["tt.kernel_slot"] == slot:
+            tirx.stmt_functor.post_order_visit(func.body, lambda node: calls.append(node) if isinstance(node, tirx.Call) else None)
+    return calls
+
+
+def test_serial_k_slices_keep_all_input_generations_live():
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
+
+    @T.prim_func
+    def sliced(A: T.Tensor((32, 96), "bfloat16"), B: T.Tensor((96, 32), "bfloat16"), C: T.Tensor((32, 32), "bfloat16")):
+        with T.Kernel(1, 1, threads=1):
+            a = T.alloc_shared((32, 32), "bfloat16")
+            b = T.alloc_shared((32, 32), "bfloat16")
+            c = T.alloc_fragment((32, 32), "float32")
+            T.clear(c)
+            for k in T.serial(3):
+                T.copy(A[:, k * 32 : k * 32 + 32], a)
+                T.copy(B[k * 32 : k * 32 + 32, :], b)
+                T.gemm(a, b, c)
+            T.copy(c, C)
+
+    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": sliced}), TARGET)
+    (accumulator,) = mod.attrs["tt.accumulator_table"]
+    assert accumulator.full_k_tiles == 3
+    updates = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.gemm_update"]
+    assert len(updates) == 3
+    assert len({int(call.args[index]) for call in updates for index in (0, 1)}) == 6
+    assert len(mod.attrs["tt.dfb_table"]) == 7
+    copies = [call for call in device_calls(mod, "ncrisc") if call.op.name == "tl.tt.tensor_to_dfb_nd"]
+    assert len(copies) == 6
+    assert [int(call.args[4]) for call in copies[::2]] == [0, 32, 64]
+    assert [int(call.args[2]) for call in copies[1::2]] == [0, 32, 64]
 
 
 def test_accumulator_alias_cannot_change_identity():
@@ -268,5 +340,59 @@ def test_one_compute_kernel_rejects_conflicting_accumulator_precision():
             T.gemm(a, b, d, clear_accum=True)
             T.copy(d, D)
 
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="conflicting destination precision"):
-        verify(mixed)
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
+
+    # Frontend proves individual lifetimes; the actual formed kernel owns the merge.
+    assert len(verify(mixed)["main"].attrs["tt.gemm_accumulator_requirements"]) == 2
+    with pytest.raises((ValueError, NotImplementedError, tvm.error.TVMError), match="conflicting.*destination"):
+        TenstorrentPassPipelineBody(tvm.IRModule({"main": mixed}), TARGET)
+
+
+@pytest.mark.parametrize("transpose_a,transpose_b", [(False, False), (True, False), (False, True), (True, True)])
+def test_accumulator_update_preserves_transpose_and_logical_k(transpose_a, transpose_b):
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
+
+    a_shape = (64, 32) if transpose_a else (32, 64)
+    b_shape = (96, 64) if transpose_b else (64, 96)
+
+    @T.prim_func
+    def transposed(A: T.Tensor(a_shape, "bfloat16"), B: T.Tensor(b_shape, "bfloat16"), C: T.Tensor((32, 96), "bfloat16")):
+        with T.Kernel(1, 1, threads=1):
+            a = T.alloc_shared(a_shape, "bfloat16")
+            b = T.alloc_shared(b_shape, "bfloat16")
+            c = T.alloc_fragment((32, 96), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.gemm(a, b, c, transpose_A=transpose_a, transpose_B=transpose_b, clear_accum=True)
+            T.copy(c, C)
+
+    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": transposed}), TARGET)
+    (accumulator,) = mod.attrs["tt.accumulator_table"]
+    assert accumulator.full_k_tiles == 2
+    (update,) = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.gemm_update"]
+    assert [int(arg) for arg in update.args[3:]] == [int(transpose_a), int(transpose_b)]
+
+
+def test_accumulator_materializes_to_shared_output_with_storage_dtype():
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
+
+    @T.prim_func
+    def shared_output(A: T.Tensor((32, 32), "bfloat16"), B: T.Tensor((32, 32), "bfloat16"), C: T.Tensor((32, 32), "bfloat16")):
+        with T.Kernel(1, 1, threads=1):
+            a = T.alloc_shared((32, 32), "bfloat16")
+            b = T.alloc_shared((32, 32), "bfloat16")
+            c = T.alloc_fragment((32, 32), "float32")
+            output = T.alloc_shared((32, 32), "bfloat16")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.clear(c)
+            for _k in T.serial(2):
+                T.gemm(a, b, c)
+            T.copy(c, output)
+            T.copy(output, C)
+
+    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": shared_output}), TARGET)
+    (materialize,) = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.accumulator_materialize"]
+    descriptor = next(dfb for dfb in mod.attrs["tt.dfb_table"] if dfb.dfb_id == int(materialize.args[1]))
+    assert str(descriptor.element_dtype) == "bfloat16"
+    assert mod.attrs["tt.accumulator_table"][0].full_k_tiles == 2

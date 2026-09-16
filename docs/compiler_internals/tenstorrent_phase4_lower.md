@@ -7,7 +7,7 @@ TTL Codegen、TTL parser/verifier、TT-Lang compile-only 和硬件数值验证�
 
 ## 1. Pass 边界
 
-沿用已有十二个 Pass，不增加重复的 compute 分析或数据流 Pass：
+当前主线包含前端 accumulator 检查和最终 compute requirement 推导，共十四个顶层阶段：
 
 ```text
 BindTarget
@@ -16,11 +16,13 @@ BindTarget
   -> ValidateTenstorrentFrontendIR
   -> NormalizeTenstorrentLaunch
   -> NormalizeTenstorrentBufferMetadata
-  -> NormalizeTenstorrentRegions
+  -> VerifyTTGemmAccumulators
   -> NormalizeTenstorrentTopology
+  -> NormalizeTenstorrentRegions
   -> LegalizeTenstorrentTileOps
   -> InferTenstorrentTensorLayout
   -> FormTenstorrentDeviceProgram
+  -> InferTenstorrentComputeRequirements
   -> VerifyTenstorrentDeviceIR
 ```
 
@@ -34,8 +36,13 @@ BindTarget
 | VerifyTenstorrentDeviceIR | Device IR module 及所有 slot | 检查 schema、操作数、dtype、shape、effect、资源归属、ABI 和资源协议；不修补错误 IR |
 
 完整 backend pipeline 要么返回通过 `VerifyTenstorrentDeviceIR` 的 module，要么报告
-具体不支持条件；不再用 `tt.ir_stage="structured"` 表示完整 Lower 成功。需要查看
-capture 结果的工具和测试可直接调用前两个 compute Pass。
+具体不支持条件。独立的 `lower_tenstorrent_ir` 入口还允许返回验证后的完整 structured
+module，并标记 `tt.ir_stage="structured"`；它不表示可执行。需要只查看 capture
+结果的工具和测试仍可直接调用前两个 compute Pass。
+
+GEMM fragment 的完整 K 生命周期和 v5 扩展见
+[accumulator precision](tenstorrent_accumulator_precision.md)。本文的 v2 DFB GEMM
+语义保持不变，不能把其每次物化的输出当作持久 fragment。
 
 ## 2. Operation 与资源设计
 
@@ -139,12 +146,12 @@ reserve/wait 仍请求一个 transaction。单迭代中的 immutable publication
 Device verifier 必须检查 active slot loop 边界一致、所有资源 transaction relation
 一致，并对 loop body 的完整 def-use 和跨 slot wait-for DAG 执行同样验证。
 在这些前提下，每轮从 Tensor 重新构造全部 DFB 值，以迭代归纳证明资源依赖闭合。
-即使 Tensor 参数是 inout，NCRISC 的前一轮输出 transfer 也必须排在下一轮输入
+即使 Tensor 参数是 读写，NCRISC 的前一轮输出 transfer 也必须排在下一轮输入
 transfer 前面。
 
 TTL Codegen 后续可将该 For 映射为 `scf.for`，所有 reserve/wait/attach/compute/store
 及 consumer 最后使用后的释放均放在对应 loop body 内。该 lifecycle 契约尚未经
-TTL verifier 或硬件验证；本轮已通过保留 For、Tensor inout 数值语义、跨 slot 边界
+TTL verifier 或硬件验证；本轮已通过保留 For、Tensor 读写 数值语义、跨 slot 边界
 一致性、transaction relation 和只读 verifier 的正向/负向回归。
 
 ## 3. 后续 TTL 映射责任
@@ -195,7 +202,7 @@ Phase 6 的多 Core、PipeNet、跨 Core barrier 或通信。单 Core 资源依�
 - 新增四组测试分别验证 compute 消费、Device 数据流/元数据、最终 Device 数值语义及
   结构化循环。数值语义组含 60 项，覆盖 Tiles/Parallel 等价、BF16 舍入、复合表达式、
   broadcast、Fill/Typecast/Transpose、GEMM transpose/clear、Reduction axis/clear/dtype、
-  batch Transpose/Reduction、同 Tensor inout 和 dead Tensor transfer/processor ABI。
+  batch Transpose/Reduction、同 Tensor 读写 和 dead Tensor transfer/processor ABI。
 - verifier 负向覆盖缺失 wait、重复发布、跨 slot 环依赖、未定义读、shape/dtype/axis/
   accumulation 不一致、原始 `Array[int]` 注入、非法表达式节点和不一致 loop epoch。
 - 新增 Python 测试及 Lower 接口通过 Ruff；`git diff --check` 通过。
@@ -235,7 +242,6 @@ PY
 | Reduction | sum/max/min，单 axis、移除该 axis，clear/accumulate；sum 用 FP32 accumulator | 输出 dtype 与输入相同或 FP32；无 keepdims、source/output alias 或任意 reducer；结果仍须满足 layout 条件 |
 | batch dimension | elementwise、Fill/Typecast、末两轴 Transpose 及满足结果布局的 Reduction | 不等于已支持 batched GEMM；batch 轴在成为最后两轴时也须满足 32 整除约束 |
 | dtype/accumulation | BF16/FP32 storage，DAG 保留显式 cast 和舍入点，GEMM FP32 accumulator | integer/FP16/vector storage、任意混合精度策略不支持 |
-| 结构化控制流 | 正静态 serial/unrolled loop 展开，常量条件及展开后可化简条件选择；完整独立 whole-body serial loop 保留为 Device For，已验证 epoch 和 Tensor inout | 展开单 loop extent ≤ 1024、累计 ≤ 65536 个 statement；保留 loop 须同 slot 边界且无跨迭代 DFB；动态 loop/条件、`T.Pipelined` 不支持 |
+| 结构化控制流 | 正静态 serial/unrolled loop 展开，常量条件及展开后可化简条件选择；完整独立 whole-body serial loop 保留为 Device For，已验证 epoch 和 Tensor 读写 | 展开单 loop extent ≤ 1024、累计 ≤ 65536 个 statement；保留 loop 须同 slot 边界且无跨迭代 DFB；动态 loop/条件、`T.Pipelined` 不支持 |
 | alias/in-place | 同 Buffer 的逐元素更新读取旧 generation，写入新 generation；完整同 shape/dtype 值依赖 | 部分 region、不同 Buffer 的 view/alias、strided storage、transpose/GEMM/reduce 输入输出重叠拒绝 |
 | 通用数据流 | 任意 Tensor 参数顺序、多个 operation、中间 TRISC→TRISC DFB、明确输出 snapshot | 单 Core 1×1；每个 generation 固定 producer/consumer slot；从 Tensor 输出逆追消除 dead 纯计算，read-before-write 明确诊断 |
-

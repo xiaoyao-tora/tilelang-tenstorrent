@@ -22,6 +22,16 @@ def VerifyTTComputeBlocks():
     return _ffi_api.VerifyTTComputeBlocks()  # type: ignore[attr-defined]
 
 
+def VerifyTTStructuredDataflow():
+    """Prove definite initialization before returning non-executable IR."""
+    return _ffi_api.VerifyTTStructuredDataflow()  # type: ignore[attr-defined]
+
+
+def InferTenstorrentComputeRequirements():
+    """Infer per-Kernel precision constraints from the formed Device program."""
+    return _ffi_api.InferTenstorrentComputeRequirements()  # type: ignore[attr-defined]
+
+
 def VerifyTTGemmAccumulators():
     """Verify GEMM fragment lifetimes and record logical precision requirements.
 
@@ -70,6 +80,8 @@ def VerifyTenstorrentDeviceIR():
 __all__ = (
     "CanonicalizeTTElementwise",
     "VerifyTTComputeBlocks",
+    "VerifyTTStructuredDataflow",
+    "InferTenstorrentComputeRequirements",
     "VerifyTTGemmAccumulators",
     "FormTenstorrentDeviceProgram",
     "InferTenstorrentTensorLayout",

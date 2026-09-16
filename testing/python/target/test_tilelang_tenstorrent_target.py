@@ -7,7 +7,6 @@ from tilelang import tvm
 from tilelang.backend import create_backend_context, get_backend
 from tilelang.tenstorrent import execution_backend
 from tilelang.tenstorrent import language as T
-from tilelang.tenstorrent.codegen import TTL_CODEGEN_NOT_IMPLEMENTED
 
 
 def _target(arch: str = "wormhole_b0", *, keys: list[str] | None = None):
@@ -122,7 +121,7 @@ def test_tenstorrent_pipeline_forms_phase1_device_ir(monkeypatch):
     }
 
 
-def test_tenstorrent_compile_fails_at_unimplemented_ttl_codegen(monkeypatch):
+def test_tenstorrent_compile_reports_missing_ttl_compiler(monkeypatch):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
 
     @T.prim_func
@@ -130,7 +129,13 @@ def test_tenstorrent_compile_fails_at_unimplemented_ttl_codegen(monkeypatch):
         with T.Kernel(1, 1, threads=1):
             T.evaluate(0)
 
-    with pytest.raises(NotImplementedError, match=TTL_CODEGEN_NOT_IMPLEMENTED):
+    from tilelang.tenstorrent.ttl_codegen import module
+
+    def missing_bindings():
+        raise ImportError("Tenstorrent TTL codegen requires the TT-Lang compiler Python bindings")
+
+    monkeypatch.setattr(module, "load_bindings", missing_bindings)
+    with pytest.raises(ImportError, match="requires the TT-Lang compiler Python bindings"):
         tilelang.compile(
             main,
             target={"kind": "tenstorrent", "arch": "wormhole_b0"},
