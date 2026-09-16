@@ -580,6 +580,8 @@ struct ResourceVersion {
   ffi::String producer;
   ffi::String consumer;
   ffi::Optional<TensorBacking> backing;
+  int64_t pool{-1};
+  int64_t iteration{-1};
 };
 
 class DeviceExpressionRewriter : public StmtExprMutator {
@@ -602,6 +604,31 @@ private:
                            ffi::ObjectPtrEqual> &inputs_;
 };
 
+// TVM's generic expression mutator substitutes PrimExpr call annotations, but
+// reconstructs a changed Call without its span. Keep operation provenance when
+// specializing a static iteration's scalar expressions.
+class StaticIterationSubstituter : public StmtExprMutator {
+public:
+  StaticIterationSubstituter(Var variable, PrimExpr value)
+      : variable_(std::move(variable)), value_(std::move(value)) {}
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    return variable_.same_as(ffi::GetRef<Var>(op)) ? value_
+                                                   : ffi::GetRef<Var>(op);
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (!call.same_as(ffi::GetRef<Call>(op)))
+      call.CopyOnWrite()->span = op->span;
+    return call;
+  }
+
+private:
+  Var variable_;
+  PrimExpr value_;
+};
+
 class GeneralDataflowPlanner {
 public:
   GeneralDataflowPlanner(const PrimFunc &frontend,
@@ -609,6 +636,160 @@ public:
       : frontend_(frontend), metadata_(IndexBufferMetadata(metadata)),
         tensor_reads_(frontend->params.size(), false),
         tensor_writes_(frontend->params.size(), false) {}
+
+  // Phase 5 materializes bounded windows. A value remains an immutable
+  // generation, while the same lexical write site shares one capacity pool.
+  void PlanPipeline(const For &loop) {
+    for (const auto &[key, value] : loop->annotations) {
+      if (key != "num_stages" && key != "tt.pipeline_wait_policy")
+        ThrowUnsupported(
+            "T.Pipelined manual stage/order/group schedules are unsupported");
+    }
+    if (!loop->annotations.count("num_stages") ||
+        loop->kind != ForKind::kSerial || loop->thread_binding.has_value() ||
+        (loop->step.has_value() && !is_one(loop->step.value()))) {
+      ThrowUnsupported("T.Pipelined requires num_stages only and unit step; "
+                       "manual stage/order/group schedules are unsupported");
+    }
+    auto policy = loop->annotations.Get("tt.pipeline_wait_policy");
+    if (policy.has_value()) {
+      if (auto string = policy.value().as<ffi::String>()) {
+        pipeline_wait_policy_ = string.value();
+      } else if (auto literal = policy.value().as<StringImm>()) {
+        pipeline_wait_policy_ = literal.value()->value;
+      } else {
+        ThrowMalformed("tt.pipeline_wait_policy must be a string");
+      }
+      if (pipeline_wait_policy_ != "conservative" &&
+          pipeline_wait_policy_ != "delayed")
+        ThrowMalformed(
+            "tt.pipeline_wait_policy must be conservative or delayed");
+    }
+    pipeline_stages_ = RequirePositiveStaticInteger(
+        Downcast<PrimExpr>(loop->annotations.at("num_stages")),
+        "T.Pipelined num_stages");
+    pipeline_extent_ =
+        RequirePositiveStaticInteger(loop->extent, "T.Pipelined extent");
+    int64_t minimum = RequireStaticInteger(loop->min, "T.Pipelined minimum");
+    if (pipeline_stages_ > 32 || pipeline_extent_ > 1024) {
+      ThrowUnsupported(
+          "T.Pipelined requires num_stages <= 32 and extent <= 1024");
+    }
+    pipeline_depth_ = std::min(pipeline_stages_, pipeline_extent_);
+    PostOrderVisit(loop->body, [&](const ffi::ObjectRef &object) {
+      if (object.as<IfThenElseNode>()) {
+        ThrowUnsupported("T.Pipelined conditional write sites are unsupported; "
+                         "each iteration must have the same transaction sites");
+      }
+      if (const auto *nested = object.as<ForNode>()) {
+        if (!nested->annotations.empty()) {
+          ThrowUnsupported(
+              "nested T.Pipelined or annotated loops are unsupported");
+        }
+      }
+    });
+    size_t writes_per_iteration = 0;
+    for (int64_t iteration = 0; iteration < pipeline_extent_; ++iteration) {
+      current_.clear();
+      size_t begin = resources_.size();
+      StaticIterationSubstituter substitute(
+          loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + iteration));
+      Plan(substitute(loop->body));
+      size_t count = resources_.size() - begin;
+      if (iteration == 0) {
+        writes_per_iteration = count;
+      } else if (count != writes_per_iteration) {
+        ThrowUnsupported("T.Pipelined requires identical transaction sites in "
+                         "every iteration");
+      }
+      for (size_t index = begin; index < resources_.size(); ++index) {
+        resources_[index].pool = index - begin;
+        resources_[index].iteration = iteration;
+      }
+    }
+    for (size_t tensor = 0; tensor < tensor_reads_.size(); ++tensor) {
+      if (tensor_reads_[tensor] && tensor_writes_[tensor]) {
+        ThrowUnsupported("T.Pipelined prefetch cannot reorder an inout Tensor; "
+                         "use a serial loop for cross-iteration Tensor state");
+      }
+    }
+  }
+
+  bool IsPipeline() const { return pipeline_extent_ != 0; }
+  int64_t PipelineStages() const { return pipeline_stages_; }
+  int64_t PipelineExtent() const { return pipeline_extent_; }
+  ffi::String PipelineWaitPolicy() const { return pipeline_wait_policy_; }
+
+  ffi::Map<ffi::String, Integer> StorageGroups() const {
+    ffi::Map<ffi::String, Integer> groups;
+    for (size_t id = 0; id < resources_.size(); ++id) {
+      if (live_.count(id)) {
+        groups.Set(std::to_string(id), Integer(resources_[id].pool));
+      }
+    }
+    return groups;
+  }
+
+  ffi::Map<ffi::String, ffi::Array<Integer>> PipelineRelations() const {
+    ffi::Map<ffi::String, ffi::Array<Integer>> relations;
+    for (size_t id = 0; id < resources_.size(); ++id) {
+      if (live_.count(id)) {
+        int64_t iteration = resources_[id].iteration;
+        relations.Set(
+            std::to_string(id),
+            {Integer(iteration), Integer(iteration % pipeline_depth_)});
+      }
+    }
+    return relations;
+  }
+
+  void FinalizePipeline() {
+    if (!IsPipeline())
+      return;
+    ffi::Array<Stmt> scheduled;
+    // Delayed policy issues the entire input window before copy completion;
+    // conservative policy completes each copy immediately. Output waits stay
+    // after all input publications, avoiding a cross-slot cycle.
+    for (int64_t begin = 0; begin < pipeline_extent_;
+         begin += pipeline_depth_) {
+      ffi::Array<Stmt> completions, outputs;
+      for (const Stmt &statement : transfer_) {
+        const CallNode *call =
+            statement.as<EvaluateNode>()->value.as<CallNode>();
+        bool input_copy = call->op.same_as(tenstorrent::tensor_to_dfb_nd());
+        int64_t id = *as_const_int(call->args[input_copy ? 1 : 0]);
+        const ResourceVersion &resource = resources_[id];
+        if (resource.iteration < begin ||
+            resource.iteration >= begin + pipeline_depth_)
+          continue;
+        if (resource.producer == "ncrisc") {
+          scheduled.push_back(statement);
+          if (input_copy) {
+            Stmt completion =
+                MakeDeviceCall(tenstorrent::dfb_copy_wait(),
+                               {Integer(id), Integer(1)}, statement->span);
+            if (pipeline_wait_policy_ == "conservative")
+              scheduled.push_back(completion);
+            else
+              completions.push_back(completion);
+          }
+        } else {
+          outputs.push_back(statement);
+          if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
+            outputs.push_back(MakeDeviceCall(tenstorrent::dfb_copy_wait(),
+                                             {Integer(id), Integer(1)},
+                                             statement->span));
+        }
+      }
+      for (const Stmt &statement : completions)
+        scheduled.push_back(statement);
+      for (const Stmt &statement : outputs)
+        scheduled.push_back(statement);
+    }
+    transfer_ = std::move(scheduled);
+    AddReleases(&compute_, "trisc");
+    AddReleases(&transfer_, "ncrisc");
+  }
 
   void EliminateDeadWrites() {
     std::unordered_set<int64_t> live;
@@ -694,9 +875,9 @@ public:
       if (extent > 1024)
         ThrowUnsupported("serial loop extent exceeds 1024");
       for (int64_t i = 0; i < extent; ++i) {
-        ffi::Map<Var, PrimExpr> replacement{
-            {loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + i)}};
-        Plan(Substitute(loop->body, replacement));
+        StaticIterationSubstituter substitute(
+            loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + i));
+        Plan(substitute(loop->body));
       }
       return;
     }
@@ -724,6 +905,9 @@ public:
     if (!node)
       ThrowUnsupported("non-call Evaluate in compute dataflow");
     Call call = ffi::GetRef<Call>(node);
+    if (IsPipeline() && !call->span.defined())
+      call.CopyOnWrite()->span =
+          RequireSourceSpan(call->span, frontend_->span, "pipeline operation");
     if (call->op.same_as(Copy::Get())) {
       PlanCopy(Downcast<Copy>(ParseOperator(call)), call);
     } else if (call->op.same_as(tenstorrent::tile_add())) {
@@ -791,9 +975,8 @@ public:
       result.push_back(DFBDescriptor(
           i, metadata->buffer_id + ".v" + std::to_string(i),
           metadata->buffer->dtype, metadata->tile_shape,
-          metadata->tile_grid_shape, metadata->dfb_block_count.value(),
-          resource.backing, resource.producer, domain, resource.consumer,
-          domain, Integer(1),
+          metadata->tile_grid_shape, Capacity(resource), resource.backing,
+          resource.producer, domain, resource.consumer, domain, Integer(1),
           RequireSourceSpan(metadata->source_span, frontend_->span,
                             "DFB generation")));
     }
@@ -804,6 +987,57 @@ public:
   Stmt TransferBody() const { return Body(transfer_); }
 
 private:
+  PrimExpr Capacity(const ResourceVersion &resource) const {
+    PrimExpr count = resource.metadata->dfb_block_count.value();
+    if (!IsPipeline())
+      return count;
+    if (resource.metadata->block_count_origin == "explicit") {
+      if (RequirePositiveStaticInteger(count, "DFB block_count") <
+          pipeline_depth_)
+        ThrowMalformed("DFB capacity insufficient for buffer '" +
+                       std::string(resource.metadata->buffer_id) + "' pool " +
+                       std::to_string(resource.pool) +
+                       ": block_count=" + std::to_string(*as_const_int(count)) +
+                       ", required=" + std::to_string(pipeline_depth_) +
+                       " (bounded pipeline window)");
+      return count;
+    }
+    return Integer(pipeline_depth_);
+  }
+
+  void AddReleases(ffi::Array<Stmt> *body, const ffi::String &slot) {
+    std::unordered_map<int64_t, size_t> last_use;
+    for (size_t index = 0; index < body->size(); ++index) {
+      const auto *call =
+          (*body)[index].as<EvaluateNode>()->value.as<CallNode>();
+      if (call->op.same_as(tenstorrent::dfb_compute())) {
+        for (size_t arg = 1; arg < call->args.size(); ++arg)
+          last_use[*as_const_int(call->args[arg])] = index;
+      } else if (call->op.same_as(tenstorrent::dfb_copy_wait())) {
+        int64_t id = *as_const_int(call->args[0]);
+        if (resources_[id].consumer == slot)
+          last_use[id] = index;
+      }
+    }
+    std::vector<std::vector<int64_t>> releases(body->size());
+    // Resource order makes releases deterministic, independent of hash order.
+    for (size_t id = 0; id < resources_.size(); ++id) {
+      auto found = last_use.find(id);
+      if (found != last_use.end())
+        releases[found->second].push_back(id);
+    }
+    ffi::Array<Stmt> result;
+    for (size_t index = 0; index < body->size(); ++index) {
+      const Stmt &statement = (*body)[index];
+      result.push_back(statement);
+      for (int64_t id : releases[index])
+        result.push_back(MakeDeviceCall(tenstorrent::dfb_release(),
+                                        {Integer(id), Integer(1)},
+                                        statement->span));
+    }
+    *body = std::move(result);
+  }
+
   std::vector<int> TensorAccesses() const {
     std::vector<int> accesses(frontend_->params.size(), 0);
     for (const Stmt &statement : transfer_) {
@@ -994,6 +1228,10 @@ private:
   ffi::Array<Stmt> compute_, transfer_;
   size_t statement_count_{0};
   std::unordered_set<int64_t> live_;
+  ffi::String pipeline_wait_policy_{"delayed"};
+  int64_t pipeline_stages_{0};
+  int64_t pipeline_extent_{0};
+  int64_t pipeline_depth_{0};
 };
 
 bool HasGeneralCompute(const Stmt &body) {
@@ -1003,6 +1241,22 @@ bool HasGeneralCompute(const Stmt &body) {
       found |= call->op.same_as(tenstorrent::tile_compute());
   });
   return found;
+}
+
+ffi::Optional<For> FindPipelineLoop(const Stmt &body) {
+  Stmt candidate = body;
+  while (const auto *realize = candidate.as<SBlockRealizeNode>()) {
+    if (!realize->iter_values.empty() || !is_one(realize->predicate) ||
+        !realize->block->iter_vars.empty() ||
+        realize->block->init.has_value() ||
+        !realize->block->match_buffers.empty())
+      return std::nullopt;
+    candidate = realize->block->body;
+  }
+  auto loop = candidate.as<For>();
+  if (loop.has_value() && loop.value()->annotations.count("num_stages"))
+    return loop.value();
+  return std::nullopt;
 }
 
 // A complete iteration can retain its structured loop without constructing
@@ -1168,8 +1422,9 @@ IRModule FormProgram(const IRModule &input) {
   } else {
     legacy_add = false;
   }
-  const bool general_compute =
-      HasGeneralCompute(kernel_body) || (tile_add_count > 0 && !legacy_add);
+  const bool general_compute = HasGeneralCompute(kernel_body) ||
+                               FindPipelineLoop(kernel_body).has_value() ||
+                               (tile_add_count > 0 && !legacy_add);
   if (!general_compute && tile_add_count > 1) {
     ThrowUnsupported("Phase 2 supports exactly one canonical Add operation");
   }
@@ -1185,13 +1440,30 @@ IRModule FormProgram(const IRModule &input) {
   PrimFunc trisc;
   PrimFunc ncrisc;
   PrimFunc brisc;
+  ffi::Map<ffi::String, Integer> storage_groups;
+  ffi::Map<ffi::String, ffi::Array<Integer>> pipeline_relations;
+  int64_t pipeline_stages = 0, pipeline_extent = 0;
+  ffi::String pipeline_wait_policy;
   Stmt idle = Evaluate(IntImm(DataType::Int(32), 0), frontend->span);
   if (general_compute) {
     GeneralDataflowPlanner planner(frontend, buffer_table.value());
     ffi::Optional<For> independent_loop = FindIndependentLoop(kernel_body);
-    planner.Plan(independent_loop.has_value() ? independent_loop.value()->body
-                                              : kernel_body);
+    ffi::Optional<For> pipeline_loop = FindPipelineLoop(kernel_body);
+    if (pipeline_loop.has_value()) {
+      planner.PlanPipeline(pipeline_loop.value());
+    } else {
+      planner.Plan(independent_loop.has_value() ? independent_loop.value()->body
+                                                : kernel_body);
+    }
     planner.EliminateDeadWrites();
+    planner.FinalizePipeline();
+    if (planner.IsPipeline()) {
+      pipeline_stages = planner.PipelineStages();
+      pipeline_extent = planner.PipelineExtent();
+      pipeline_wait_policy = planner.PipelineWaitPolicy();
+      storage_groups = planner.StorageGroups();
+      pipeline_relations = planner.PipelineRelations();
+    }
     tensors = BuildTensorTable(frontend, buffer_table.value(),
                                planner.Effects(), true);
     dfbs = planner.Descriptors(domain);
@@ -1260,7 +1532,9 @@ IRModule FormProgram(const IRModule &input) {
   functions.Set(GlobalVar(operation + "_brisc"), std::move(brisc));
 
   ffi::Map<ffi::String, ffi::Any> attrs = {
-      {kDeviceIRVersionAttr, Integer(general_compute ? 2 : kDeviceIRVersion)},
+      {kDeviceIRVersionAttr, Integer(pipeline_extent   ? 3
+                                     : general_compute ? 2
+                                                       : kDeviceIRVersion)},
       {kTargetArchAttr, target_arch.value()},
       {kLaunchGridAttr, launch},
       {kOperationIdentityAttr,
@@ -1270,6 +1544,16 @@ IRModule FormProgram(const IRModule &input) {
       {kPipeTableAttr, ffi::Array<PipeDescriptor>()},
       {kKernelOrderAttr, ffi::Array<ffi::String>({"trisc", "ncrisc", "brisc"})},
   };
+  if (pipeline_extent) {
+    attrs.Set("tt.dfb_storage_groups", storage_groups);
+    attrs.Set("tt.pipeline_relations", pipeline_relations);
+    attrs.Set("tt.pipeline_stages", Integer(pipeline_stages));
+    attrs.Set("tt.pipeline_extent", Integer(pipeline_extent));
+    attrs.Set("tt.pipeline_wait_policy", pipeline_wait_policy);
+  }
+  auto l1_capacity = input->GetAttr<Integer>("tt.l1_capacity_bytes");
+  if (l1_capacity.has_value())
+    attrs.Set("tt.l1_capacity_bytes", l1_capacity.value());
   return IRModule(std::move(functions), input->source_map,
                   DictAttrs(std::move(attrs)), input->global_infos);
 }

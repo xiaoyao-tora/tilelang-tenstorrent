@@ -44,6 +44,11 @@ def TenstorrentPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     Capture-only clients can invoke CanonicalizeTTElementwise followed by
     VerifyTTComputeBlocks directly. This pipeline always returns verified
     Device IR, including when called on an existing Device module.
+
+    FormTenstorrentDeviceProgram consumes supported static Pipelined loops and
+    forms v3 window schedules, asynchronous copy completion and storage release.
+    The final verifier checks cross-slot dependencies and capacity reuse. No
+    separate synchronization pass or generic GPU pipeline pass is required.
     """
 
     if mod.attrs is not None and "tt.device_ir_version" in mod.attrs:

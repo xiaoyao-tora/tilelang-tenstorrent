@@ -20,7 +20,18 @@ DEVICE_IR_VERSION = 1
 # Version 1 remains the construction default for existing Add/idle modules.
 # General computation uses version 2; consumers must dispatch on the version.
 GENERAL_DEVICE_IR_VERSION = 2
-SUPPORTED_DEVICE_IR_VERSIONS = (DEVICE_IR_VERSION, GENERAL_DEVICE_IR_VERSION)
+PIPELINE_DEVICE_IR_VERSION = 3
+SUPPORTED_DEVICE_IR_VERSIONS = (DEVICE_IR_VERSION, GENERAL_DEVICE_IR_VERSION, PIPELINE_DEVICE_IR_VERSION)
+
+# v3 adds module metadata; the v1/v2 reflected descriptor constructors retain
+# their fields and defaults. Each immutable DFB generation has one transaction.
+# Storage pools relate lexical write sites across statically expanded epochs.
+PIPELINE_MODULE_FIELDS = (
+    "tt.dfb_storage_groups",  # Map<decimal DFB ID string, pool ID>
+    "tt.pipeline_relations",  # Map<decimal DFB ID string, [ordinal, stage]>
+    "tt.pipeline_stages",  # requested depth; effective depth=min(depth, extent)
+    "tt.pipeline_extent",
+)
 
 MODULE_FIELDS = (
     "tt.device_ir_version",
@@ -143,6 +154,8 @@ __all__ = (
     "DEFERRED_FRONTEND_CAPABILITIES",
     "DEVICE_IR_VERSION",
     "GENERAL_DEVICE_IR_VERSION",
+    "PIPELINE_DEVICE_IR_VERSION",
+    "PIPELINE_MODULE_FIELDS",
     "SUPPORTED_DEVICE_IR_VERSIONS",
     "DEVICE_OUTPUT_FORMAT",
     "DFB_DESCRIPTOR_FIELDS",

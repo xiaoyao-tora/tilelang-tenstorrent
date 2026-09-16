@@ -1,9 +1,13 @@
-"""Typed construction helpers for the Tenstorrent Device TIR v1 contract.
+"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3.
 
 ``TTBufferMetadata`` is a normalization-stage object.  It is attached as an
 array under :data:`BUFFER_METADATA_TABLE_ATTR` before program formation and
 must be consumed before :func:`attach_device_module_metadata` produces final
 Device TIR.
+
+The reflected descriptor constructors retain their v1 defaults. Pipeline v3
+adds module attributes for storage groups and iteration relations; these must
+be attached alongside the common metadata before invoking the verifier.
 """
 
 from __future__ import annotations
@@ -33,6 +37,11 @@ LOGICAL_KERNEL_ATTR = "tt.logical_kernel"
 TENSOR_ARG_INDICES_ATTR = "tt.tensor_arg_indices"
 CORE_DOMAIN_ATTR = "tt.core_domain"
 BUFFER_METADATA_TABLE_ATTR = "tt.buffer_metadata_table"
+DFB_STORAGE_GROUPS_ATTR = "tt.dfb_storage_groups"
+PIPELINE_RELATIONS_ATTR = "tt.pipeline_relations"
+PIPELINE_STAGES_ATTR = "tt.pipeline_stages"
+PIPELINE_EXTENT_ATTR = "tt.pipeline_extent"
+L1_CAPACITY_BYTES_ATTR = "tt.l1_capacity_bytes"
 
 
 def _expr(value: Any):
@@ -60,17 +69,13 @@ class CoreDomain(Node):
 @tvm_ffi.register_object("tl.tenstorrent.ShardSpec")
 class ShardSpec(Node):
     def __init__(self, core_domain: CoreDomain, shard_shape, orientation: str):
-        self.__init_handle_by_constructor__(
-            _ffi_api.ShardSpec, core_domain, _shape(shard_shape), orientation
-        )
+        self.__init_handle_by_constructor__(_ffi_api.ShardSpec, core_domain, _shape(shard_shape), orientation)
 
 
 @tvm_ffi.register_object("tl.tenstorrent.TensorBacking")
 class TensorBacking(Node):
     def __init__(self, global_arg_index: int, byte_offset=0):
-        self.__init_handle_by_constructor__(
-            _ffi_api.TensorBacking, int(global_arg_index), _expr(byte_offset)
-        )
+        self.__init_handle_by_constructor__(_ffi_api.TensorBacking, int(global_arg_index), _expr(byte_offset))
 
 
 @tvm_ffi.register_object("tl.tenstorrent.OperationIdentity")
@@ -178,9 +183,7 @@ class PipeDescriptor(Node):
 @tvm_ffi.register_object("tl.tenstorrent.LogicalKernel")
 class LogicalKernel(Node):
     def __init__(self, kernel_id: str, kind: str, role: str, source_span: Span):
-        self.__init_handle_by_constructor__(
-            _ffi_api.LogicalKernel, kernel_id, kind, role, source_span
-        )
+        self.__init_handle_by_constructor__(_ffi_api.LogicalKernel, kernel_id, kind, role, source_span)
 
 
 @tvm_ffi.register_object("tl.tenstorrent.TTBufferMetadata")

@@ -68,6 +68,17 @@ TVM_DLL const Op &dfb_load();
  */
 TVM_DLL const Op &dfb_reserve();
 TVM_DLL const Op &dfb_wait();
+/*!
+ * \brief Schema v3 asynchronous copy completion and consumer release.
+ *
+ * Both take (immutable generation ID, block count), currently count=1.
+ * Input copy completion publishes the generation; output copy completion
+ * finishes reading it. Release follows the consumer's final use and permits
+ * a later generation in the same storage pool to acquire that capacity.
+ * A data wait alone never releases storage.
+ */
+TVM_DLL const Op &dfb_copy_wait();
+TVM_DLL const Op &dfb_release();
 TVM_DLL const Op &tensor_to_dfb();
 TVM_DLL const Op &dfb_to_tensor();
 TVM_DLL const Op &dfb_add();

@@ -207,7 +207,10 @@ Stmt MakeCompute(const BufferRegion &output,
 class ComputeDTypeVerifier : public ExprVisitor {
 public:
   void VisitExpr(const PrimExpr &expr) final {
-    if (!expr.as<IntImmNode>())
+    // VerifyTTComputeBlocks has already proved every remaining Var is an
+    // enclosing static loop's scalar parameter. Form replaces it by an
+    // integer constant; storage and arithmetic nodes still require FP dtypes.
+    if (!expr.as<IntImmNode>() && !expr.as<VarNode>())
       ValidateDType(expr.dtype());
     ExprVisitor::VisitExpr(expr);
   }

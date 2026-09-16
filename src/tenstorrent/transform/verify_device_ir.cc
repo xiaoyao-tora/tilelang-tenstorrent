@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -1093,8 +1095,161 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
   }
 }
 
+// Schema v3 preserves immutable DFB generations while assigning generations
+// from the same lexical write to a bounded storage pool.  These identities are
+// intentionally independent: waiting publishes readiness, releasing returns
+// storage, and each ordinal defines an iteration and logical window stage.
+struct PipelineResources {
+  bool enabled{false};
+  int64_t depth{0};
+  std::unordered_map<int64_t, int64_t> groups;
+  std::unordered_map<int64_t, int64_t> ordinals;
+  std::map<int64_t, std::vector<int64_t>> ordered;
+};
+
+int64_t CheckedProduct(int64_t left, int64_t right, const std::string &label) {
+  Check(left > 0 && right > 0 &&
+            left <= std::numeric_limits<int64_t>::max() / right,
+        label + " overflows static byte/capacity arithmetic");
+  return left * right;
+}
+
+void VerifyLegacyL1Budget(const IRModule &mod, const DFBTable &dfbs) {
+  auto budget = mod->GetAttr<Integer>(kL1CapacityBytesAttr);
+  if (!budget.has_value())
+    return;
+  Check(budget.value()->value > 0, "tt.l1_capacity_bytes must be positive");
+  int64_t payload = 0;
+  for (const auto &[id, dfb] : dfbs) {
+    const std::string label = "DFB " + std::to_string(id) + " L1 payload";
+    int64_t bytes = RequireStaticInteger(dfb->block_count, label);
+    for (const PrimExpr &extent : dfb->tile_shape)
+      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
+    for (const PrimExpr &extent : dfb->block_shape_in_tiles)
+      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
+    bytes = CheckedProduct(bytes, dfb->element_dtype.bytes(), label);
+    Check(payload <= std::numeric_limits<int64_t>::max() - bytes,
+          "L1 payload byte sum overflows static arithmetic");
+    payload += bytes;
+  }
+  Check(payload <= budget.value()->value,
+        "L1 logical payload lower bound " + std::to_string(payload) +
+            " bytes exceeds explicit tt.l1_capacity_bytes budget " +
+            std::to_string(budget.value()->value) +
+            "; physical allocation overhead is not included");
+}
+
+PipelineResources VerifyPipelineResources(const IRModule &mod,
+                                          const DFBTable &dfbs) {
+  PipelineResources result;
+  result.enabled =
+      RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr)->value == 3;
+  if (!result.enabled)
+    return result;
+  int64_t stages = RequireModuleAttr<Integer>(mod, kPipelineStagesAttr)->value;
+  int64_t extent = RequireModuleAttr<Integer>(mod, kPipelineExtentAttr)->value;
+  Check(stages > 0 && stages <= 32 && extent > 0 && extent <= 1024,
+        "pipeline stages must be in [1,32] and extent in [1,1024]");
+  result.depth = std::min(stages, extent);
+  auto wait_policy = mod->GetAttr<ffi::String>("tt.pipeline_wait_policy");
+  if (wait_policy.has_value())
+    Check(wait_policy.value() == "conservative" ||
+              wait_policy.value() == "delayed",
+          "tt.pipeline_wait_policy must be conservative or delayed");
+  auto groups = RequireModuleAttr<ffi::Map<ffi::String, Integer>>(
+      mod, kDFBStorageGroupsAttr);
+  auto relations =
+      RequireModuleAttr<ffi::Map<ffi::String, ffi::Array<Integer>>>(
+          mod, kPipelineRelationsAttr);
+  Check(groups.size() == dfbs.size() && relations.size() == dfbs.size(),
+        "pipeline resource metadata must cover exactly the DFB table");
+  std::unordered_map<std::string, int64_t> keyed_dfbs;
+  for (const auto &[id, dfb] : dfbs)
+    keyed_dfbs.emplace(std::to_string(id), id);
+  for (const auto &[key, group] : groups) {
+    Check(keyed_dfbs.count(key),
+          "pipeline storage group requires a canonical decimal DFB key");
+    int64_t id = keyed_dfbs.at(key);
+    Check(group->value >= 0,
+          "pipeline storage group references invalid DFB/pool ID");
+    Check(result.groups.emplace(id, group->value).second,
+          "duplicate pipeline storage group DFB ID");
+    if (!result.ordered.count(group->value))
+      result.ordered.emplace(group->value, std::vector<int64_t>(extent, -1));
+  }
+  for (const auto &[key, relation] : relations) {
+    Check(keyed_dfbs.count(key),
+          "pipeline transaction relation requires a canonical decimal DFB key");
+    int64_t id = keyed_dfbs.at(key);
+    Check(relation.size() == 2,
+          "pipeline transaction relation must be [iteration, stage]");
+    int64_t ordinal = relation[0]->value;
+    Check(ordinal >= 0 && ordinal < extent &&
+              relation[1]->value == ordinal % result.depth,
+          "pipeline transaction relation has invalid iteration/stage");
+    Check(result.ordinals.emplace(id, ordinal).second,
+          "duplicate pipeline transaction relation DFB ID");
+    int64_t &entry = result.ordered.at(result.groups.at(id))[ordinal];
+    Check(entry == -1, "pipeline storage pool has duplicate iteration");
+    entry = id;
+  }
+  int64_t payload_bytes = 0;
+  for (const auto &[group, ids] : result.ordered) {
+    const std::string label = "pipeline storage pool " + std::to_string(group);
+    Check(
+        std::all_of(ids.begin(), ids.end(), [](int64_t id) { return id >= 0; }),
+        label + " must have exactly one generation per iteration");
+    DFBDescriptor first = dfbs.at(ids.front());
+    int64_t capacity =
+        RequireStaticInteger(first->block_count, label + " block_count");
+    Check(capacity >= result.depth,
+          label + " capacity insufficient for pipeline window: requires " +
+              std::to_string(result.depth) + ", has " +
+              std::to_string(capacity));
+    for (int64_t id : ids) {
+      DFBDescriptor dfb = dfbs.at(id);
+      Check(ffi::StructuralEqual()(first->block_count, dfb->block_count) &&
+                first->element_dtype == dfb->element_dtype &&
+                ffi::StructuralEqual()(first->tile_shape, dfb->tile_shape) &&
+                ffi::StructuralEqual()(first->block_shape_in_tiles,
+                                       dfb->block_shape_in_tiles) &&
+                first->producer_slot == dfb->producer_slot &&
+                first->consumer_slot == dfb->consumer_slot &&
+                ffi::StructuralEqual()(first->tensor_backing,
+                                       dfb->tensor_backing),
+            label + " generations disagree on capacity, layout, or slots");
+    }
+    int64_t bytes = capacity;
+    for (const PrimExpr &extent : first->tile_shape)
+      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
+    for (const PrimExpr &extent : first->block_shape_in_tiles)
+      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
+    bytes = CheckedProduct(bytes, first->element_dtype.bytes(), label);
+    Check(payload_bytes <= std::numeric_limits<int64_t>::max() - bytes,
+          "L1 payload byte sum overflows static arithmetic");
+    payload_bytes += bytes;
+  }
+  // This is logical payload storage, counted once per pool.  It does not
+  // estimate alignment, TT-Lang scratch, firmware reservations, or free L1.
+  auto budget = mod->GetAttr<Integer>(kL1CapacityBytesAttr);
+  if (budget.has_value()) {
+    Check(budget.value()->value > 0, "tt.l1_capacity_bytes must be positive");
+    Check(payload_bytes <= budget.value()->value,
+          "L1 logical payload lower bound " + std::to_string(payload_bytes) +
+              " bytes exceeds explicit tt.l1_capacity_bytes budget " +
+              std::to_string(budget.value()->value) +
+              "; physical allocation overhead is not included");
+  }
+  auto reported = mod->GetAttr<Integer>("tt.l1_payload_bytes");
+  if (reported.has_value())
+    Check(reported.value()->value == payload_bytes,
+          "tt.l1_payload_bytes disagrees with static storage-pool payload");
+  return result;
+}
+
 void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
                           const DFBTable &dfbs) {
+  PipelineResources pipeline = VerifyPipelineResources(mod, dfbs);
   // Verify an independent structured iteration by induction: every active
   // slot has the same loop boundary, each resource is defined and fully used
   // in one iteration, and no DFB value escapes that iteration. Tensor inout
@@ -1103,6 +1258,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
   for (const auto &[global, base] : mod->functions)
     has_loop |= Downcast<PrimFunc>(base)->body.as<ForNode>() != nullptr;
   if (has_loop) {
+    Check(!pipeline.enabled,
+          "pipeline Device IR must contain explicit scheduled operations");
     ffi::Optional<For> boundary;
     IRModule iteration = mod;
     iteration.CopyOnWrite();
@@ -1164,6 +1321,10 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
   std::vector<std::vector<size_t>> dependencies;
   std::unordered_map<int64_t, size_t> producers;
   std::unordered_map<int64_t, size_t> reserves;
+  std::unordered_map<int64_t, size_t> copy_issues;
+  std::unordered_map<int64_t, size_t> copy_completions;
+  std::unordered_map<int64_t, size_t> releases;
+  std::unordered_map<int64_t, std::vector<size_t>> uses;
   std::unordered_map<int64_t, size_t> use_count;
   std::unordered_map<int64_t, std::string> consumers;
   std::unordered_map<int64_t, int> effects;
@@ -1177,6 +1338,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
               RequireStaticInteger(tensor->tile_shape[1],
                                    "Tensor tile columns") == 32,
           "Phase 4 Tensor physical tile shape must be [32,32]");
+    Check(!pipeline.enabled || tensor->effect != "inout",
+          "pipeline does not support inout Tensor prefetch dependencies");
     Check(tensor->alias_group == id,
           "Phase 4 cross-parameter storage aliases are unsupported");
     if (!tensor->strides.empty()) {
@@ -1209,7 +1372,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
           "Phase 4 physical tile shape must be [32,32]");
     Check(RequireStaticInteger(dfb->transaction_count_or_loop_relation,
                                "transaction count") == 1,
-          "Phase 4 immutable generation has exactly one publication");
+          "immutable DFB generation has exactly one publication");
     Check(ffi::StructuralEqual()(dfb->producer_domain, dfb->consumer_domain),
           "Phase 4 resource domains must match");
     if (dfb->tensor_backing.has_value()) {
@@ -1273,7 +1436,10 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
               "DFB use must be preceded by dfb_wait in consumer slot");
         Check(dfbs.at(id)->consumer_slot == slot,
               "DFB consumer slot metadata mismatch");
+        Check(!pipeline.enabled || !releases.count(id),
+              "DFB use after release risks overwritten data");
         ++use_count[id];
+        uses[id].push_back(event);
         consumers[id] = slot;
       };
       auto publish = [&](int64_t id) {
@@ -1296,14 +1462,49 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
                 "DFB generation reserved more than once");
         } else {
           Check(dfbs.at(id)->consumer_slot == slot, "DFB wait in wrong slot");
+          Check(!pipeline.enabled || !releases.count(id),
+                "DFB wait after release risks overwritten data");
           waited.insert(id);
         }
+      } else if (pipeline.enabled && call->op.same_as(dfb_copy_wait())) {
+        Check(slot == "ncrisc" && call->args.size() == 2 &&
+                  RequireStaticInteger(call->args[1], "copy wait count") == 1,
+              "dfb_copy_wait requires ncrisc and one transaction");
+        int64_t id = id_at(0);
+        Check(copy_issues.count(id),
+              "dfb_copy_wait must follow its copy issue");
+        Check(copy_completions.emplace(id, event).second,
+              "DFB copy completed more than once");
+        if (events[copy_issues.at(id)].call->op.same_as(tensor_to_dfb_nd()))
+          publish(id);
+      } else if (pipeline.enabled && call->op.same_as(dfb_release())) {
+        Check(call->args.size() == 2 &&
+                  RequireStaticInteger(call->args[1], "release count") == 1,
+              "dfb_release must release one transaction");
+        int64_t id = id_at(0);
+        Check(dfbs.at(id)->consumer_slot == slot,
+              "DFB release in wrong consumer slot");
+        Check(waited.count(id) && use_count[id] > 0,
+              "DFB release must follow wait and consumption");
+        Check(releases.emplace(id, event).second,
+              "DFB generation released more than once");
+        if (copy_issues.count(id) &&
+            events[copy_issues.at(id)].call->op.same_as(dfb_to_tensor_nd()))
+          Check(copy_completions.count(id),
+                "DFB output release before copy completion risks overwritten "
+                "data");
       } else if (call->op.same_as(dfb_compute())) {
         Check(slot == "trisc", "dfb_compute must execute in trisc");
         VerifyGeneralCompute(call, dfbs);
         logical_shapes[id_at(0)] = ComputeShape(call, "tt.logical_domain");
-        for (size_t i = 1; i < call->args.size(); ++i)
+        for (size_t i = 1; i < call->args.size(); ++i) {
           read(id_at(i));
+          if (pipeline.enabled)
+            Check(
+                pipeline.ordinals.at(id_at(i)) ==
+                    pipeline.ordinals.at(id_at(0)),
+                "dfb_compute transaction relation crosses pipeline iterations");
+        }
         publish(id_at(0));
       } else if (call->op.same_as(tensor_to_dfb_nd()) ||
                  call->op.same_as(dfb_to_tensor_nd())) {
@@ -1330,9 +1531,17 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
         effects[tensor_id] |= input ? 1 : 2;
         if (input) {
           logical_shapes[id] = tensor->shape;
-          publish(id);
+          if (!pipeline.enabled)
+            publish(id);
         } else
           read(id);
+        if (pipeline.enabled) {
+          Check(copy_issues.emplace(id, event).second,
+                "DFB generation has multiple copy issues");
+          if (input)
+            Check(reserves.count(id) && dfb->producer_slot == slot,
+                  "DFB copy issue must follow reserve in producer slot");
+        }
       } else {
         Fail("Phase 4 slot retains an unsupported Device operation");
       }
@@ -1342,6 +1551,37 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
     Check(producers.count(id) && reserves.count(id),
           "DFB generation is never published");
     Check(use_count[id] > 0, "DFB generation is never consumed");
+    if (pipeline.enabled) {
+      Check(releases.count(id), "DFB generation is missing release");
+      if (copy_issues.count(id))
+        Check(copy_completions.count(id),
+              "DFB copy is missing completion wait");
+      for (size_t use : uses[id])
+        dependencies[releases.at(id)].push_back(use);
+    }
+  }
+  if (pipeline.enabled) {
+    for (const auto &[group, ids] : pipeline.ordered) {
+      int64_t capacity = RequireStaticInteger(dfbs.at(ids.front())->block_count,
+                                              "pipeline pool block_count");
+      for (size_t ordinal = 0; ordinal < ids.size(); ++ordinal) {
+        if (ordinal > 0) {
+          Check(reserves.at(ids[ordinal - 1]) < reserves.at(ids[ordinal]),
+                "pipeline pool reserve order disagrees with transaction "
+                "relation");
+          Check(producers.at(ids[ordinal - 1]) < producers.at(ids[ordinal]) &&
+                    releases.at(ids[ordinal - 1]) < releases.at(ids[ordinal]) &&
+                    uses.at(ids[ordinal - 1]).back() <
+                        uses.at(ids[ordinal]).front(),
+                "pipeline pool publication/consumption/release order disagrees "
+                "with "
+                "transaction relation");
+        }
+        if (ordinal >= static_cast<size_t>(capacity))
+          dependencies[reserves.at(ids[ordinal])].push_back(
+              releases.at(ids[ordinal - capacity]));
+      }
+    }
   }
   for (size_t i = 0; i < events.size(); ++i) {
     if (events[i].call->op.same_as(dfb_wait())) {
@@ -1373,8 +1613,19 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
   // streams can still deadlock when their cross-slot dependencies form a cycle.
   std::vector<int> state(events.size(), 0);
   std::function<void(size_t)> visit = [&](size_t event) {
-    Check(state[event] != 1,
-          "Device transaction dependency cycle (cross-slot deadlock)");
+    if (state[event] == 1) {
+      std::string detail;
+      if (pipeline.enabled) {
+        const Call &call = events[event].call;
+        size_t index = call->op.same_as(tensor_to_dfb_nd()) ? 1 : 0;
+        int64_t id = RequireStaticInteger(call->args[index], "cycle DFB ID");
+        detail = " involving pipeline capacity/release dependencies for DFB " +
+                 std::to_string(id) + " storage pool " +
+                 std::to_string(pipeline.groups.at(id));
+      }
+      Fail("Device transaction dependency cycle (cross-slot deadlock)" +
+           detail);
+    }
     if (state[event] == 2)
       return;
     state[event] = 1;
@@ -1388,6 +1639,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
     ffi::String expected = effects[id] == 3   ? "inout"
                            : effects[id] == 2 ? "output"
                                               : "input";
+    Check(!pipeline.enabled || effects[id] != 3,
+          "pipeline does not support inout Tensor prefetch dependencies");
     Check(tensor->effect == expected,
           "Tensor effect disagrees with scheduled dataflow");
   }
@@ -1410,9 +1663,10 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
 
 IRModule VerifyModule(IRModule mod) {
   Integer version = RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr);
-  Check(version->value == kDeviceIRVersion || version->value == 2,
+  Check(version->value == kDeviceIRVersion || version->value == 2 ||
+            version->value == 3,
         "unsupported tt.device_ir_version " + std::to_string(version->value) +
-            "; expected 1 or 2");
+            "; expected 1, 2, or 3");
 
   ffi::String target_arch =
       RequireModuleAttr<ffi::String>(mod, kTargetArchAttr);
@@ -1442,10 +1696,12 @@ IRModule VerifyModule(IRModule mod) {
             kernel_order[1] == "ncrisc" && kernel_order[2] == "brisc",
         "tt.kernel_order must be exactly [trisc, ncrisc, brisc]");
 
-  const bool general = version->value == 2;
+  const bool general = version->value >= 2;
   TensorTable tensor_table = VerifyTensorTable(tensors, launch_grid, general);
   DFBTable dfb_table = VerifyDFBTable(dfbs, tensor_table, launch_grid, general);
   VerifyPipeTable(pipes, dfb_table, launch_grid);
+  if (version->value < 3)
+    VerifyLegacyL1Budget(mod, dfb_table);
   if (general) {
     Check(launch_grid->x == 1 && launch_grid->y == 1 && pipes.empty(),
           "Phase 4 is single-Core without Pipe communication");

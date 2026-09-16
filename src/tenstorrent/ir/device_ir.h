@@ -31,6 +31,17 @@ constexpr const char *kDFBTableAttr = "tt.dfb_table";
 constexpr const char *kPipeTableAttr = "tt.pipe_table";
 constexpr const char *kKernelOrderAttr = "tt.kernel_order";
 
+// Schema v3 retains immutable DFB descriptors and adds explicit storage reuse.
+// Keys are canonical decimal DFB IDs, with stable value-based string equality.
+// Groups: Map<String, Integer>, relation: Map<String, Array<Integer>> with
+// [zero-based iteration ordinal, ordinal % min(stages, extent)].
+constexpr const char *kDFBStorageGroupsAttr = "tt.dfb_storage_groups";
+constexpr const char *kPipelineRelationsAttr = "tt.pipeline_relations";
+constexpr const char *kPipelineStagesAttr = "tt.pipeline_stages";
+constexpr const char *kPipelineExtentAttr = "tt.pipeline_extent";
+// Optional caller-supplied DFB payload budget, not total physical L1 capacity.
+constexpr const char *kL1CapacityBytesAttr = "tt.l1_capacity_bytes";
+
 constexpr const char *kKernelSlotAttr = "tt.kernel_slot";
 constexpr const char *kKernelThreadAttr = "tt.kernel_thread";
 constexpr const char *kNocIndexAttr = "tt.noc_index";

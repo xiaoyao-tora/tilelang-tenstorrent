@@ -104,12 +104,23 @@ struct ScopePlan {
   Span span;
 };
 
+// An enclosing bounded serial loop is expanded by program formation. Its
+// binder is a scalar template parameter, unlike the elementwise coordinates.
+bool IsStaticScalarLoop(const For &loop) {
+  const int64_t *extent = as_const_int(loop->extent);
+  return (loop->kind == ForKind::kSerial || loop->kind == ForKind::kUnrolled) &&
+         as_const_int(loop->min) && extent &&
+         (!loop->step.has_value() || is_one(loop->step.value()));
+}
+
 // Analyze the complete scope first. Mutation only starts after this plan
 // validates.
 class ScopeAnalyzer {
 public:
-  ScopeAnalyzer(const AllocationCollector &allocation, bool require_metadata)
-      : allocation_(allocation), require_metadata_(require_metadata) {}
+  ScopeAnalyzer(const AllocationCollector &allocation, bool require_metadata,
+                Array<Var> scalar_parameters = {})
+      : allocation_(allocation), require_metadata_(require_metadata),
+        scalar_parameters_(std::move(scalar_parameters)) {}
 
   ScopePlan Analyze(const For &root, bool tiles) {
     if (root->span.defined() && root->span->source_name.defined()) {
@@ -329,6 +340,12 @@ private:
     }
     if (expr.as<IntImmNode>() || expr.as<FloatImmNode>())
       return;
+    if (auto variable = expr.as<Var>()) {
+      for (const Var &parameter : scalar_parameters_) {
+        if (parameter.same_as(variable.value()))
+          return;
+      }
+    }
     if (const auto *cast = expr.as<CastNode>()) {
       Require(cast->annotations.empty(),
               "Cast annotations have no supported template schema");
@@ -376,6 +393,7 @@ private:
   }
   const AllocationCollector &allocation_;
   bool require_metadata_;
+  Array<Var> scalar_parameters_;
   std::string context_;
   arith::Analyzer analyzer_;
 };
@@ -482,10 +500,16 @@ public:
               "canonicalization requires a bound Tenstorrent target");
       // The explicit Tiles marker selects its stricter frontend contract.
       // Capture the whole loop chain before visiting its nested binders.
-      ScopeAnalyzer analyzer(allocation_, tiles);
+      ScopeAnalyzer analyzer(allocation_, tiles, scalar_parameters_);
       return ApplyPlan(analyzer.Analyze(ffi::GetRef<For>(op), tiles));
     }
-    return StmtMutator::VisitStmt_(op);
+    bool scalar = IsStaticScalarLoop(ffi::GetRef<For>(op));
+    if (scalar)
+      scalar_parameters_.push_back(op->loop_var);
+    Stmt body = StmtMutator::VisitStmt_(op);
+    if (scalar)
+      scalar_parameters_.pop_back();
+    return body;
   }
   Stmt VisitStmt_(const SBlockNode *op) final {
     if (op->annotations.count(kTTComputeKind))
@@ -496,6 +520,7 @@ public:
 private:
   PrimFunc func_;
   AllocationCollector allocation_;
+  Array<Var> scalar_parameters_;
 };
 
 // Reconstruct only the logical binders from access descriptors, then reuse the
@@ -552,7 +577,12 @@ public:
   void VisitStmt_(const ForNode *op) final {
     Require(!op->annotations.count(kTTTilesScope),
             "uncanonicalized frontend T.Tiles scope");
+    bool scalar = IsStaticScalarLoop(ffi::GetRef<For>(op));
+    if (scalar)
+      scalar_parameters_.push_back(op->loop_var);
     StmtVisitor::VisitStmt_(op);
+    if (scalar)
+      scalar_parameters_.pop_back();
   }
   void VisitStmt_(const SBlockRealizeNode *op) final {
     if (op->block->annotations.count(kTTComputeKind)) {
@@ -597,7 +627,7 @@ public:
       body = For(variables[axis], make_zero(variables[axis].dtype()),
                  domain.value()[axis], ForKind::kParallel, body);
     }
-    ScopeAnalyzer analyzer(allocation_, false);
+    ScopeAnalyzer analyzer(allocation_, false, scalar_parameters_);
     SBlock expected =
         ApplyPlan(analyzer.Analyze(Downcast<For>(body), false))->block;
     Require(ffi::StructuralEqual()(op->reads, expected->reads),
@@ -623,6 +653,7 @@ public:
 private:
   PrimFunc func_;
   AllocationCollector allocation_;
+  Array<Var> scalar_parameters_;
 };
 
 } // namespace
