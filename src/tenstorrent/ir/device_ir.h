@@ -317,8 +317,10 @@ public:
  *
  * A collective record has one entry per destination, in x/y order. Record
  * identity is never deduplicated by endpoint coordinates. Version 4 currently
- * requires occurrence=0 and transaction_count=1; repeated dynamic occurrences
- * need a future scheduling contract. Existing descriptor layouts are unchanged.
+ * requires occurrence=0 and transaction_count=1. Schema v6 additionally allows
+ * statically expanded occurrences numbered contiguously from zero per record;
+ * each occurrence has its own immutable source and destination generations.
+ * Existing descriptor layouts are unchanged.
  */
 class PipeTransferDescriptorNode : public ffi::Object {
 public:

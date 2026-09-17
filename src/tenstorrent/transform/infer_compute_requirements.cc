@@ -42,6 +42,28 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
   std::map<int64_t, AccumulatorDescriptor> table;
   auto entries =
       mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr);
+  // Fragment storage is local to a specialized Core. A frontend Buffer handle
+  // may therefore occur in descriptors owned by different compute functions.
+  std::map<int64_t, PrimFunc> owners;
+  if (entries.has_value()) {
+    for (const auto &[global, base] : mod->functions) {
+      PrimFunc owner = Downcast<PrimFunc>(base);
+      PostOrderVisit(owner->body, [&](const ffi::ObjectRef &node) {
+        const auto *call = node.as<CallNode>();
+        if (!call || (!call->op.same_as(accumulator_init()) &&
+                      !call->op.same_as(gemm_update()) &&
+                      !call->op.same_as(accumulator_materialize())))
+          return;
+        size_t index = call->op.same_as(gemm_update()) ? 2 : 0;
+        Check(call->args.size() > index,
+              "accumulator operation arity mismatch");
+        int64_t id = IntegerValue(call->args[index]);
+        auto [it, inserted] = owners.emplace(id, owner);
+        Check(inserted || it->second.same_as(owner),
+              "accumulator operations cross Core or processor ownership");
+      });
+    }
+  }
   std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual> storage;
   if (entries.has_value()) {
     for (const auto &entry : entries.value()) {
@@ -53,8 +75,11 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       Check(region.defined() && region->buffer.defined() &&
                 region->region.size() == 2 && region->buffer->shape.size() == 2,
             "accumulator requires a rank-2 BufferRegion");
-      Check(storage.insert(region->buffer->data).second,
-            "accumulator descriptors alias the same fragment storage");
+      Check(owners.count(entry->accumulator_id),
+            "unused accumulator descriptor");
+      if (owners.at(entry->accumulator_id).same_as(func))
+        Check(storage.insert(region->buffer->data).second,
+              "accumulator descriptors alias the same fragment storage");
       Check(
           region->buffer.scope() == "local.fragment" &&
               region->buffer->dtype == entry->accumulation_dtype,
@@ -206,9 +231,12 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
   }
   for (const auto &[id, value] : state)
     Check(value == 2, "accumulator lifetime has no final materialization");
-  if (compute && entries.has_value())
-    Check(used.size() == entries.value().size(),
-          "unused accumulator descriptor");
+  if (compute && entries.has_value()) {
+    size_t owned = 0;
+    for (const auto &entry : entries.value())
+      owned += owners.at(entry->accumulator_id).same_as(func);
+    Check(used.size() == owned, "unused accumulator descriptor");
+  }
   return ComputeRequirements(width, full, used);
 }
 

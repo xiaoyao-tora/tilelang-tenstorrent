@@ -197,23 +197,46 @@ class GemmAccumulatorVerifier : public StmtExprVisitor {
     bool materialized{false};
     DataType output_dtype;
     int declaration_depth{-1};
+    int64_t core_x{-1};
+    int64_t core_y{-1};
   };
 
   class Collector : public StmtExprVisitor {
   public:
-    std::vector<Buffer> fragments;
+    struct Fragment {
+      Buffer buffer;
+      int64_t core_x;
+      int64_t core_y;
+    };
+    std::vector<Fragment> fragments;
     void VisitExpr_(const CallNode *op) final {
       if (op->op.same_as(Gemm::Get())) {
         Gemm gemm = Downcast<Gemm>(ParseOperator(ffi::GetRef<Call>(op)));
         if (gemm->c_.scope() == "local.fragment") {
-          for (const Buffer &buffer : fragments)
-            if (buffer.same_as(gemm->c_))
+          for (const Fragment &fragment : fragments)
+            if (fragment.buffer.same_as(gemm->c_) &&
+                fragment.core_x == core_x_ && fragment.core_y == core_y_)
               return;
-          fragments.push_back(gemm->c_);
+          fragments.push_back({gemm->c_, core_x_, core_y_});
         }
       }
       StmtExprVisitor::VisitExpr_(op);
     }
+
+    void VisitStmt_(const SBlockNode *op) final {
+      int64_t saved_x = core_x_, saved_y = core_y_;
+      if (op->annotations.count("tt.core_x") &&
+          op->annotations.count("tt.core_y")) {
+        core_x_ = Downcast<Integer>(op->annotations.at("tt.core_x"))->value;
+        core_y_ = Downcast<Integer>(op->annotations.at("tt.core_y"))->value;
+      }
+      StmtExprVisitor::VisitStmt_(op);
+      core_x_ = saved_x;
+      core_y_ = saved_y;
+    }
+
+  private:
+    int64_t core_x_{-1}, core_y_{-1};
   };
 
 public:
@@ -229,7 +252,8 @@ public:
     GemmAccumulatorVerifier verifier;
     auto metadata =
         func->GetAttr<ffi::Array<TTBufferMetadata>>(kBufferMetadataTableAttr);
-    for (const Buffer &buffer : collector.fragments) {
+    for (const Collector::Fragment &fragment : collector.fragments) {
+      const Buffer &buffer = fragment.buffer;
       Require(
           metadata.has_value(),
           "GEMM accumulator verification requires normalized buffer metadata");
@@ -252,7 +276,8 @@ public:
               "GEMM accumulator requires a rank-2 fragment");
       verifier.lifetimes_.push_back({buffer, BufferRegion::FullRegion(buffer),
                                      DataType::Void(), false, false, false,
-                                     DataType::Void()});
+                                     DataType::Void(), -1, fragment.core_x,
+                                     fragment.core_y});
     }
     if (!verifier.lifetimes_.empty()) {
       auto slot = func->GetAttr<ffi::String>(kKernelSlotAttr);
@@ -278,6 +303,10 @@ public:
           {"materialization", StringImm("after_complete_k_reduction")}};
       if (!fp32)
         requirement.Set("matmul_full_fp32", StringImm("forbidden"));
+      if (lifetime.core_x >= 0) {
+        requirement.Set("core_x", Integer(lifetime.core_x));
+        requirement.Set("core_y", Integer(lifetime.core_y));
+      }
       requirements.push_back(requirement);
     }
     // Recompute this table on every invocation; frontend annotations are not a
@@ -289,6 +318,10 @@ public:
 private:
   Lifetime *Find(const Buffer &buffer) {
     for (Lifetime &lifetime : lifetimes_) {
+      // Topology specialization reuses lexical Buffer handles across Core
+      // blocks. Their storage and reduction lifetimes remain Core-local.
+      if (lifetime.core_x != core_x_ || lifetime.core_y != core_y_)
+        continue;
       if (buffer->data.same_as(lifetime.buffer->data)) {
         Require(buffer.same_as(lifetime.buffer),
                 "GEMM accumulator alias makes fragment identity ambiguous");
@@ -466,10 +499,18 @@ private:
   }
 
   void VisitStmt_(const SBlockNode *op) final {
+    int64_t saved_x = core_x_, saved_y = core_y_;
+    if (op->annotations.count("tt.core_x") &&
+        op->annotations.count("tt.core_y")) {
+      core_x_ = Downcast<Integer>(op->annotations.at("tt.core_x"))->value;
+      core_y_ = Downcast<Integer>(op->annotations.at("tt.core_y"))->value;
+    }
     for (const Buffer &buffer : op->alloc_buffers)
       if (Lifetime *lifetime = Find(buffer))
         lifetime->declaration_depth = loop_depth_;
     StmtExprVisitor::VisitStmt_(op);
+    core_x_ = saved_x;
+    core_y_ = saved_y;
   }
 
   void VisitStmt_(const AllocBufferNode *op) final {
@@ -503,6 +544,7 @@ private:
   }
 
   std::vector<Lifetime> lifetimes_;
+  int64_t core_x_{-1}, core_y_{-1};
   int loop_depth_{0};
   int conditional_depth_{0};
   int unsupported_loop_depth_{0};

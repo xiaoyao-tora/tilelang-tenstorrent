@@ -636,13 +636,14 @@ private:
 
 struct PipeEndpoint {
   int64_t transfer_id;
+  int64_t occurrence;
   ffi::Array<Integer> record;
   int64_t x, y, dfb_id;
   bool source;
   Span span;
 };
 using TransferKeys =
-    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, int64_t>;
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>, int64_t>;
 
 struct AccumulatorLifetime {
   BufferRegion region;
@@ -683,6 +684,8 @@ public:
 
   const std::vector<PipeEndpoint> &Endpoints() const { return endpoints_; }
   int64_t ResourceCount() const { return resources_.size(); }
+  int64_t AccumulatorCount() const { return accumulators_.size(); }
+  bool HasProducerForwarding() const { return has_producer_forwarding_; }
   Stmt PipeBody() const { return Body(pipe_); }
 
   void FinalizeMulticore() {
@@ -894,6 +897,7 @@ public:
           continue;
         }
         size_t arg = call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
+                             call->op.same_as(tenstorrent::dfb_pipe_send()) ||
                              call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
                              call->op.same_as(tenstorrent::dfb_pipe_wait())
                          ? 1
@@ -1096,6 +1100,9 @@ private:
       if (call->op.same_as(tenstorrent::dfb_compute())) {
         for (size_t arg = 1; arg < call->args.size(); ++arg)
           last_use[*as_const_int(call->args[arg])] = index;
+      } else if (call->op.same_as(tenstorrent::gemm_update())) {
+        last_use[*as_const_int(call->args[0])] = index;
+        last_use[*as_const_int(call->args[1])] = index;
       } else if (call->op.same_as(tenstorrent::dfb_pipe_wait())) {
         int64_t id = *as_const_int(call->args[1]);
         if (resources_[id].consumer == slot)
@@ -1251,9 +1258,9 @@ private:
   }
 
   void PlanAccumulator(const Call &call, const ffi::String &kind) {
-    if (IsPipeline() || transfers_)
+    if (IsPipeline())
       ThrowUnsupported("accumulator lowering currently requires serial "
-                       "single-Core execution");
+                       "execution without pipeline overlap");
     BufferRegion region =
         NormalizeToAccessRegion(call->args[0], kAccessReadWrite).region;
     FullRegion(region);
@@ -1346,6 +1353,10 @@ private:
       }
       transfer_.push_back(
           MakeDeviceCall(tenstorrent::dfb_to_tensor_nd(), args, call->span));
+      if (transfers_)
+        transfer_.push_back(MakeDeviceCall(tenstorrent::dfb_copy_wait(),
+                                           {Integer(output_id), Integer(1)},
+                                           call->span));
     } else {
       ThrowMalformed("accumulator must materialize to shared DFB or Tensor");
     }
@@ -1458,49 +1469,69 @@ private:
             .region;
     FullRegion(region);
     int64_t id;
+    bool forward = false;
     if (send) {
       int64_t input = Read(region->buffer, "trisc");
-      id = Write(region->buffer, "trisc", std::nullopt, false);
-      resources_[id].consumer = "brisc";
-      Wait(&compute_, input, call->span);
-      Reserve(&compute_, id, call->span);
-      const auto &metadata = resources_[id].metadata;
-      ffi::Array<Integer> identity;
-      for (size_t axis = 0; axis < region->buffer->shape.size(); ++axis)
-        identity.push_back(Integer(axis));
-      ffi::Map<ffi::String, ffi::ObjectRef> annotations{
-          {"tt.compute_kind", StringImm("copy")},
-          {"tt.compute_dtype",
-           StringImm(region->buffer->dtype == DataType::BFloat(16)
-                         ? "bfloat16"
-                         : "float32")},
-          {"tt.compute_tile_shape", metadata->tile_shape},
-          {"tt.logical_domain", region->buffer->shape},
-          {"tt.input_shapes",
-           ffi::Array<ffi::Array<PrimExpr>>{region->buffer->shape}},
-          {"tt.access_maps", ffi::Array<ffi::Array<Integer>>{identity}}};
-      compute_.push_back(
-          Evaluate(Call(DataType::Void(), tenstorrent::dfb_compute(),
-                        {Integer(id), Integer(input)}, annotations, call->span),
-                   call->span));
-      Wait(&pipe_, id, call->span);
+      const ResourceVersion &resource = resources_[input];
+      forward =
+          frontend_->attrs->dict.count("tt.gemm_accumulator_requirements") &&
+          resource.producer == "ncrisc" && resource.backing.has_value();
+      if (forward) {
+        has_producer_forwarding_ = true;
+        // Forward the completed Tensor load before publishing the same panel
+        // to local computation. The verifier's publication frontier includes
+        // every send completion; no TRISC copy or second payload is needed.
+        id = input;
+      } else {
+        id = Write(region->buffer, "trisc", std::nullopt, false);
+        resources_[id].consumer = "brisc";
+        Wait(&compute_, input, call->span);
+        Reserve(&compute_, id, call->span);
+        const auto &metadata = resources_[id].metadata;
+        ffi::Array<Integer> identity;
+        for (size_t axis = 0; axis < region->buffer->shape.size(); ++axis)
+          identity.push_back(Integer(axis));
+        ffi::Map<ffi::String, ffi::ObjectRef> annotations{
+            {"tt.compute_kind", StringImm("copy")},
+            {"tt.compute_dtype",
+             StringImm(region->buffer->dtype == DataType::BFloat(16)
+                           ? "bfloat16"
+                           : "float32")},
+            {"tt.compute_tile_shape", metadata->tile_shape},
+            {"tt.logical_domain", region->buffer->shape},
+            {"tt.input_shapes",
+             ffi::Array<ffi::Array<PrimExpr>>{region->buffer->shape}},
+            {"tt.access_maps", ffi::Array<ffi::Array<Integer>>{identity}}};
+        compute_.push_back(Evaluate(
+            Call(DataType::Void(), tenstorrent::dfb_compute(),
+                 {Integer(id), Integer(input)}, annotations, call->span),
+            call->span));
+        Wait(&pipe_, id, call->span);
+      }
     } else {
       id = Write(region->buffer, "ncrisc");
       Reserve(&transfer_, id, call->span);
     }
+    // Each endpoint's lexical occurrence names the same K-stage transaction.
+    // Separate source/receiver counters also handle self-delivery.
+    auto occurrence_key =
+        std::make_tuple(record[0]->value, record[1]->value, send);
+    int64_t occurrence = occurrences_[occurrence_key]++;
     int64_t bx = send ? record[5]->value : core_x_;
     int64_t by = send ? record[6]->value : core_y_;
     int64_t ex = send ? record[7]->value : core_x_ + 1;
     int64_t ey = send ? record[8]->value : core_y_ + 1;
     for (int64_t x = bx; x < ex; ++x) {
       for (int64_t y = by; y < ey; ++y) {
-        auto key = std::make_tuple(record[0]->value, record[1]->value, x, y);
+        auto key = std::make_tuple(record[0]->value, record[1]->value,
+                                   occurrence, x, y);
         auto found = transfers_->find(key);
         int64_t transfer =
             found == transfers_->end() ? transfers_->size() : found->second;
         (*transfers_)[key] = transfer;
-        endpoints_.push_back({transfer, record, x, y, id, send, call->span});
-        auto *body = send ? &pipe_ : &transfer_;
+        endpoints_.push_back(
+            {transfer, occurrence, record, x, y, id, send, call->span});
+        auto *body = send && !forward ? &pipe_ : &transfer_;
         body->push_back(MakeDeviceCall(
             send ? tenstorrent::dfb_pipe_send() : tenstorrent::dfb_pipe_recv(),
             {Integer(transfer), Integer(id), Integer(1)}, call->span));
@@ -1514,6 +1545,8 @@ private:
   std::vector<AccumulatorLifetime> accumulators_;
   std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       accumulator_ids_;
+  std::map<std::tuple<int64_t, int64_t, bool>, int64_t> occurrences_;
+  bool has_producer_forwarding_{false};
   TransferKeys *transfers_;
   int64_t core_x_, core_y_;
   std::vector<PipeEndpoint> endpoints_;
@@ -1650,14 +1683,24 @@ PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
 // remapping and explicit Pipe transfer matching cross this boundary.
 class DeviceIDRemapper : public StmtExprMutator {
 public:
-  explicit DeviceIDRemapper(int64_t offset) : offset_(offset) {}
+  DeviceIDRemapper(int64_t offset, int64_t accumulator_offset)
+      : offset_(offset), accumulator_offset_(accumulator_offset) {}
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     auto args = call->args;
     auto shift = [&](size_t index) {
       args.Set(index, Integer(*as_const_int(args[index]) + offset_));
     };
-    if (call->op.same_as(tenstorrent::dfb_compute())) {
+    if (call->op.same_as(tenstorrent::accumulator_init()) ||
+        call->op.same_as(tenstorrent::accumulator_materialize())) {
+      args.Set(0, Integer(*as_const_int(args[0]) + accumulator_offset_));
+      if (call->op.same_as(tenstorrent::accumulator_materialize()))
+        shift(1);
+    } else if (call->op.same_as(tenstorrent::gemm_update())) {
+      shift(0);
+      shift(1);
+      args.Set(2, Integer(*as_const_int(args[2]) + accumulator_offset_));
+    } else if (call->op.same_as(tenstorrent::dfb_compute())) {
       for (size_t index = 0; index < args.size(); ++index)
         shift(index);
     } else if (call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
@@ -1678,6 +1721,7 @@ public:
 
 private:
   int64_t offset_;
+  int64_t accumulator_offset_;
 };
 
 IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
@@ -1698,10 +1742,12 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   ffi::Array<DFBDescriptor> dfbs;
   ffi::Array<PipeDescriptor> pipes;
   ffi::Array<PipeTransferDescriptor> transfers;
+  ffi::Array<AccumulatorDescriptor> accumulators;
   std::vector<int> effects(frontend->params.size(), 0);
   TransferKeys transfer_keys;
   std::vector<PipeEndpoint> endpoints;
-  int64_t offset = 0;
+  int64_t offset = 0, accumulator_offset = 0;
+  bool producer_forwarding = false;
   for (size_t index = 0; index < cores.size(); ++index) {
     int64_t x = index / gy, y = index % gy;
     const auto *realize = cores[index].as<SBlockRealizeNode>();
@@ -1715,6 +1761,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     planner.Plan(realize->block->body);
     planner.EliminateDeadWrites();
     planner.FinalizeMulticore();
+    producer_forwarding |= planner.HasProducerForwarding();
     CoreDomain domain(CoreCoord(x, y), CoreCoord(x + 1, y + 1));
     for (const DFBDescriptor &dfb : planner.Descriptors(domain)) {
       dfbs.push_back(DFBDescriptor(
@@ -1725,6 +1772,13 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
           dfb->block_count, dfb->tensor_backing, dfb->producer_slot, domain,
           dfb->consumer_slot, domain, dfb->transaction_count_or_loop_relation,
           dfb->source_span));
+    }
+    for (const AccumulatorDescriptor &accumulator : planner.Accumulators()) {
+      accumulators.push_back(AccumulatorDescriptor(
+          accumulator->accumulator_id + accumulator_offset,
+          accumulator->accumulator_region, accumulator->input_dtype,
+          accumulator->accumulation_dtype, accumulator->output_dtype,
+          accumulator->full_k_tiles, accumulator->source_span));
     }
     for (PipeEndpoint endpoint : planner.Endpoints()) {
       endpoint.dfb_id += offset;
@@ -1737,7 +1791,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                                 : effect == "output" ? 2
                                                      : 1;
     }
-    DeviceIDRemapper remap(offset);
+    DeviceIDRemapper remap(offset, accumulator_offset);
     ffi::String core_operation =
         operation + "_x" + std::to_string(x) + "_y" + std::to_string(y);
     for (const ffi::String &slot :
@@ -1781,6 +1835,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       order.push_back(symbol);
     }
     offset += planner.ResourceCount();
+    accumulator_offset += planner.AccumulatorCount();
   }
   std::map<int64_t, PipeEndpoint> senders, receivers;
   std::map<std::pair<int64_t, int64_t>, int64_t> record_payloads;
@@ -1789,8 +1844,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     auto &side = endpoint.source ? senders : receivers;
     if (!side.emplace(endpoint.transfer_id, endpoint).second)
       ThrowMalformed(
-          "Pipe record has repeated transaction occurrence; Phase 6 requires "
-          "exactly one send/receive per record and destination");
+          "Pipe record has duplicate endpoint for one transaction occurrence");
     if (endpoint.source) {
       const auto &r = endpoint.record;
       auto key = std::make_pair(r[0]->value, r[1]->value);
@@ -1804,8 +1858,10 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                                 CoreCoord(r[7]->value, r[8]->value),
                                 r[2]->value ? "collective" : "point_to_point",
                                 endpoint.dfb_id, endpoint.span));
-      } else if (previous->second != endpoint.dfb_id) {
-        ThrowMalformed("Pipe record has more than one source occurrence");
+      } else if (endpoint.occurrence == 0 &&
+                 previous->second != endpoint.dfb_id) {
+        ThrowMalformed(
+            "Pipe record has more than one source payload per occurrence");
       }
     }
   }
@@ -1839,9 +1895,9 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     if (!ffi::StructuralEqual()(r, receiver->second.record))
       ThrowMalformed("Pipe endpoint frozen descriptors disagree");
     transfers.push_back(PipeTransferDescriptor(
-        id, r[0]->value, r[1]->value, 0, CoreCoord(r[3]->value, r[4]->value),
-        CoreCoord(sender.x, sender.y), sender.dfb_id, receiver->second.dfb_id,
-        1, sender.span));
+        id, r[0]->value, r[1]->value, sender.occurrence,
+        CoreCoord(r[3]->value, r[4]->value), CoreCoord(sender.x, sender.y),
+        sender.dfb_id, receiver->second.dfb_id, 1, sender.span));
   }
   ffi::Array<ffi::String> tensor_effects;
   for (int effect : effects)
@@ -1849,8 +1905,15 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                              : effect == 2 ? "output"
                                            : "input");
   auto tensors = BuildTensorTable(frontend, metadata, tensor_effects, true);
+  bool repeated_transfers = std::any_of(
+      endpoints.begin(), endpoints.end(),
+      [](const PipeEndpoint &endpoint) { return endpoint.occurrence != 0; });
   ffi::Map<ffi::String, ffi::Any> attrs{
-      {kDeviceIRVersionAttr, Integer(4)},
+      {kDeviceIRVersionAttr,
+       Integer(!accumulators.empty() || repeated_transfers ||
+                       producer_forwarding
+                   ? 6
+                   : 4)},
       {kTargetArchAttr, arch},
       {kLaunchGridAttr, CoreCoord(gx, gy)},
       {kOperationIdentityAttr, OperationIdentity(operation, frontend->span)},
@@ -1859,6 +1922,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       {kPipeTableAttr, pipes},
       {kPipeTransferTableAttr, transfers},
       {kKernelOrderAttr, order}};
+  if (!accumulators.empty())
+    attrs.Set(kAccumulatorTableAttr, accumulators);
   auto capacity = input->GetAttr<Integer>("tt.l1_capacity_bytes");
   if (capacity.has_value())
     attrs.Set("tt.l1_capacity_bytes", capacity.value());

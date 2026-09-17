@@ -14,6 +14,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/op.h>
 #include <tvm/ir/transform.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -46,7 +47,10 @@ public:
 
   PrimExpr VisitExpr(const PrimExpr &expr) final {
     PrimExpr result = StmtExprMutator::VisitExpr(expr);
-    return result.dtype().is_handle() ? result : analyzer_.Simplify(result);
+    return result.dtype().is_handle() ||
+                   SideEffect(result) > CallEffectKind::kPure
+               ? result
+               : analyzer_.Simplify(result);
   }
 
   PrimExpr VisitExpr_(const VarNode *op) final {

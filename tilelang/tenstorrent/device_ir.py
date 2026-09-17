@@ -1,4 +1,4 @@
-"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3/v4/v5.
+"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3/v4/v5/v6.
 
 ``TTBufferMetadata`` is a normalization-stage object.  It is attached as an
 array under :data:`BUFFER_METADATA_TABLE_ATTR` before program formation and
@@ -13,8 +13,12 @@ and orders all Core/slot functions by global name in ``tt.kernel_order``.
 Schema v5 adds ``tt.accumulator_table`` and mandatory typed
 ``tt.compute_requirements`` on TRISC. Persistent fragments have one init, the
 complete static K update sequence, and one final materialization; v5 currently
-excludes pipelines and multicore execution. Earlier metadata constructors and
-their default version remain unchanged.
+excludes pipelines and multicore execution. Schema v6 combines specialized
+Core/slot functions with persistent accumulators and static PipeNet occurrence
+epochs. Each accumulator belongs to the unique TRISC function containing its
+lifetime; fragment Buffer identities are local to that Core. Forwarded Tensor
+panels become ready for their local TRISC consumer only after all outgoing Pipe
+transfers complete. Earlier metadata constructors and defaults remain unchanged.
 """
 
 from __future__ import annotations

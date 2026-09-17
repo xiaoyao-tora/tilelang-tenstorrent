@@ -28,8 +28,10 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1810,8 +1812,17 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
   std::map<std::pair<int64_t, int64_t>, PipeDescriptor> records;
   for (const PipeDescriptor &pipe : pipes)
     records.emplace(std::make_pair(pipe->pipe_net_id, pipe->event_index), pipe);
-  std::map<std::pair<int64_t, int64_t>, std::map<CoreKey, int64_t>>
-      destinations;
+  const bool extended =
+      RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr)->value == 6;
+  std::unordered_map<int64_t, AccumulatorDescriptor> accumulators;
+  if (auto entries = mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(
+          kAccumulatorTableAttr))
+    for (const auto &entry : entries.value())
+      accumulators.emplace(entry->accumulator_id, entry);
+  using OccurrenceKey = std::tuple<int64_t, int64_t, int64_t>;
+  std::map<OccurrenceKey, std::map<CoreKey, int64_t>> destinations;
+  std::map<OccurrenceKey, int64_t> sources;
+  std::map<std::pair<int64_t, int64_t>, std::set<int64_t>> occurrences;
   std::unordered_map<int64_t, int64_t> incoming;
   std::unordered_map<int64_t, std::vector<int64_t>> outgoing;
   std::map<CoreKey, int64_t> payload;
@@ -1901,8 +1912,12 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     Check(records.count(record_key),
           "Pipe transfer references missing original record");
     const PipeDescriptor &record = records.at(record_key);
-    Check(transfer->occurrence == 0,
-          "Phase 6 supports exactly one occurrence per Pipe record");
+    Check(transfer->occurrence >= 0 && (extended || transfer->occurrence == 0),
+          "schema v4 supports one occurrence; schema v6 requires a nonnegative "
+          "epoch");
+    OccurrenceKey occurrence_key{transfer->pipe_net_id, transfer->record_index,
+                                 transfer->occurrence};
+    occurrences[record_key].insert(transfer->occurrence);
     Check(transfer->transaction_count == 1,
           "Pipe transfer must contain exactly one transaction");
     VerifyCoord(transfer->src_coord, grid, "Pipe transfer source Core");
@@ -1915,21 +1930,33 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
               dest.second >= record->dst_begin->y &&
               dest.second < record->dst_end->y,
           "Pipe transfer destination Core is outside original record domain");
-    Check(destinations[record_key].emplace(dest, transfer->transfer_id).second,
+    Check(destinations[occurrence_key]
+              .emplace(dest, transfer->transfer_id)
+              .second,
           "Pipe record has a duplicate destination transaction");
     Check(dfbs.count(transfer->source_dfb_id) &&
               dfbs.count(transfer->destination_dfb_id),
           "Pipe transfer references missing source/destination DFB");
-    Check(transfer->source_dfb_id == record->payload_dfb_id,
+    Check(transfer->occurrence != 0 ||
+              transfer->source_dfb_id == record->payload_dfb_id,
           "Pipe transfer source DFB disagrees with original record payload");
+    auto [source_entry, new_source] =
+        sources.emplace(occurrence_key, transfer->source_dfb_id);
+    Check(new_source || source_entry->second == transfer->source_dfb_id,
+          "Pipe record occurrence has inconsistent source payloads");
     DFBDescriptor source = dfbs.at(transfer->source_dfb_id);
     DFBDescriptor destination = dfbs.at(transfer->destination_dfb_id);
     Check(CoreOf(source->consumer_domain) == CoreOf(transfer->src_coord) &&
               CoreOf(destination->producer_domain) == dest,
           "Pipe transfer endpoint owner Core mismatch");
-    Check(source->consumer_slot == "brisc" &&
-              destination->producer_slot == "ncrisc",
-          "Pipe source requires BRISC affinity and receiver requires NCRISC");
+    const bool forwarding = extended && source->producer_slot == "ncrisc" &&
+                            source->consumer_slot == "trisc" &&
+                            source->tensor_backing.has_value();
+    Check(
+        (source->consumer_slot == "brisc" || forwarding) &&
+            destination->producer_slot == "ncrisc",
+        "Pipe source requires BRISC affinity or a forwarding NCRISC producer, "
+        "and receiver requires NCRISC");
     Check(source->element_dtype == destination->element_dtype &&
               ffi::StructuralEqual()(source->tile_shape,
                                      destination->tile_shape) &&
@@ -1945,9 +1972,16 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
   for (const auto &[key, record] : records) {
     int64_t count = (record->dst_end->x - record->dst_begin->x) *
                     (record->dst_end->y - record->dst_begin->y);
-    Check(destinations[key].size() == static_cast<size_t>(count),
-          "Pipe record destination transactions are not closed (missing "
-          "receiver)");
+    Check(!occurrences[key].empty(), "Pipe record has no transactions");
+    int64_t expected_occurrence = 0;
+    for (int64_t occurrence : occurrences[key]) {
+      Check(occurrence == expected_occurrence++,
+            "Pipe record occurrences must be contiguous from zero");
+      OccurrenceKey occurrence_key{key.first, key.second, occurrence};
+      Check(destinations[occurrence_key].size() == static_cast<size_t>(count),
+            "Pipe record destination transactions are not closed (missing "
+            "receiver)");
+    }
   }
 
   struct Event {
@@ -1977,7 +2011,7 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     CoreKey core = CoreOf(func->GetAttr<CoreDomain>(kCoreDomainAttr).value());
     function_names.emplace(std::make_pair(core, slot), global->name_hint);
     std::unordered_set<int64_t> declared, used_tensors, waited;
-    std::unordered_map<int64_t, int64_t> last_record;
+    std::unordered_map<int64_t, std::pair<int64_t, int64_t>> last_record;
     for (const Integer &id :
          func->GetAttr<ffi::Array<Integer>>(kTensorArgIndicesAttr).value())
       declared.insert(id->value);
@@ -2072,6 +2106,32 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
           Check(releases.emplace(id, event).second,
                 "DFB generation released more than once");
         }
+      } else if (extended && (call->op.same_as(accumulator_init()) ||
+                              call->op.same_as(gemm_update()) ||
+                              call->op.same_as(accumulator_materialize()))) {
+        Check(slot == "trisc", "accumulator operation requires TRISC");
+        const bool update = call->op.same_as(gemm_update());
+        const bool init = call->op.same_as(accumulator_init());
+        Check(call->args.size() == (update ? 5
+                                    : init ? 1
+                                           : 2),
+              "accumulator operation arity mismatch");
+        int64_t accumulator =
+            RequireStaticInteger(call->args[update ? 2 : 0], "accumulator ID");
+        Check(accumulators.count(accumulator),
+              "operation references missing accumulator");
+        if (update) {
+          read(id_at(0));
+          read(id_at(1));
+        } else if (!init) {
+          int64_t output = id_at(1);
+          ffi::Array<PrimExpr> shape;
+          for (const auto &range :
+               accumulators.at(accumulator)->accumulator_region->region)
+            shape.push_back(range->extent);
+          logical_shapes[output] = shape;
+          publish(output);
+        }
       } else if (call->op.same_as(dfb_compute())) {
         Check(slot == "trisc", "dfb_compute requires TRISC");
         VerifyGeneralCompute(call, dfbs);
@@ -2145,16 +2205,30 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
               "Pipe operation payload DFB mismatch");
         if (call->op.same_as(dfb_pipe_send()) ||
             call->op.same_as(dfb_pipe_recv())) {
-          auto [previous_record, inserted] = last_record.emplace(
-              transfer->pipe_net_id, transfer->record_index);
-          Check(inserted || previous_record->second <= transfer->record_index,
-                "Pipe operations must preserve original foreach record order");
-          previous_record->second = transfer->record_index;
+          auto ordinal =
+              std::make_pair(transfer->occurrence, transfer->record_index);
+          auto [previous_record, inserted] =
+              last_record.emplace(transfer->pipe_net_id, ordinal);
+          Check(inserted || previous_record->second <= ordinal,
+                "Pipe operations must preserve occurrence and foreach record "
+                "order");
+          previous_record->second = ordinal;
         }
         if (call->op.same_as(dfb_pipe_send())) {
-          Check(source && slot == "brisc",
-                "Pipe send requires source BRISC affinity");
-          read(id);
+          const bool forwarding = extended && slot == "ncrisc" &&
+                                  dfbs.at(id)->producer_slot == slot &&
+                                  dfbs.at(id)->consumer_slot == "trisc";
+          Check(
+              source && (slot == "brisc" || forwarding),
+              "Pipe send requires source BRISC or forwarding NCRISC affinity");
+          if (forwarding) {
+            Check(copy_completions.count(id) && producers.count(id) &&
+                      events[copy_issues.at(id)].call->op.same_as(
+                          tensor_to_dfb_nd()),
+                  "Pipe forwarding must follow its Tensor copy completion");
+          } else {
+            read(id);
+          }
           Check(sends.emplace(tid, event).second,
                 "Pipe transaction sent more than once");
         } else if (call->op.same_as(dfb_pipe_recv())) {
@@ -2165,8 +2239,10 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
           Check(receives.emplace(tid, event).second,
                 "Pipe transaction received more than once");
         } else if (source) {
-          Check(slot == "brisc" && sends.count(tid),
-                "Pipe source completion must follow send in BRISC");
+          Check((slot == "brisc" || (extended && slot == "ncrisc" &&
+                                     dfbs.at(id)->producer_slot == slot)) &&
+                    sends.count(tid) && events[sends.at(tid)].slot == slot,
+                "Pipe source completion must follow send in its source slot");
           Check(send_completions.emplace(tid, event).second,
                 "Pipe source completion duplicated");
         } else {
@@ -2220,7 +2296,9 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
           "Pipe transaction producer/consumer matching is not closed");
     Check(send_completions.count(tid) && recv_completions.count(tid),
           "Pipe transaction is missing completion synchronization");
-    Check(send_completions.at(tid) < releases.at(transfer->source_dfb_id),
+    if (dfbs.at(transfer->source_dfb_id)->consumer_slot == "brisc")
+      Check(
+          send_completions.at(tid) < releases.at(transfer->source_dfb_id),
           "Pipe source release before send completion risks overwritten data");
     // Destination reservation must exist before transport completes. Reception
     // becomes readable only after the matching source transport has completed.
@@ -2231,6 +2309,12 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     if (events[i].call->op.same_as(dfb_wait())) {
       int64_t id = RequireStaticInteger(events[i].call->args[0], "DFB wait ID");
       dependencies[i].push_back(producers.at(id));
+      // A forwarding producer publishes readiness only after every outgoing
+      // transfer completes. The consumer's wait protects its eventual release.
+      if (dfbs.at(id)->producer_slot == "ncrisc" &&
+          dfbs.at(id)->consumer_slot == "trisc")
+        for (int64_t transfer : outgoing[id])
+          dependencies[i].push_back(send_completions.at(transfer));
     }
   // Reject cross-Core writes to overlapping global regions; no ordering of
   // unrelated NCRISC streams can establish a deterministic winning write.
@@ -2288,6 +2372,19 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
                   shape_of(RequireStaticInteger(call->args[i], "input DFB ID")),
                   shapes[i - 1]),
               "dfb_compute input logical shape disagrees with its producer");
+    } else if (call->op.same_as(gemm_update())) {
+      for (size_t i = 0; i < 2; ++i) {
+        int64_t id = RequireStaticInteger(call->args[i], "GEMM input DFB ID");
+        auto shape = shape_of(id);
+        Check(shape.size() == 2, "GEMM input producer must have rank two");
+        for (size_t axis = 0; axis < 2; ++axis)
+          Check(
+              RequireStaticInteger(shape[axis], "GEMM input extent") ==
+                  RequireStaticInteger(dfbs.at(id)->block_shape_in_tiles[axis],
+                                       "GEMM input tile extent") *
+                      32,
+              "GEMM input logical shape disagrees with its producer");
+      }
     } else if (call->op.same_as(dfb_to_tensor_nd())) {
       ffi::Array<PrimExpr> shape;
       for (size_t i = 3; i < call->args.size(); i += 2)
@@ -2312,13 +2409,16 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
 IRModule VerifyModule(IRModule mod) {
   Integer version = RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr);
   Check(version->value == kDeviceIRVersion || version->value == 2 ||
-            version->value == 3 || version->value == 4 || version->value == 5,
+            version->value == 3 || version->value == 4 || version->value == 5 ||
+            version->value == 6,
         "unsupported tt.device_ir_version " + std::to_string(version->value) +
-            "; expected 1, 2, 3, 4, or 5");
+            "; expected 1, 2, 3, 4, 5, or 6");
 
-  Check(version->value == 5 || !mod->attrs->dict.count(kAccumulatorTableAttr),
-        "tt.accumulator_table requires Device IR schema v5");
-  if (version->value == 5) {
+  Check(version->value == 5 || version->value == 6 ||
+            !mod->attrs->dict.count(kAccumulatorTableAttr),
+        "tt.accumulator_table requires Device IR schema v5 or v6");
+  if (version->value == 5 ||
+      (version->value == 6 && mod->attrs->dict.count(kAccumulatorTableAttr))) {
     Check(!RequireModuleAttr<ffi::Array<AccumulatorDescriptor>>(
                mod, kAccumulatorTableAttr)
                .empty(),
@@ -2329,8 +2429,9 @@ IRModule VerifyModule(IRModule mod) {
       Check(!mod->attrs->dict.count(key),
             "schema v5 accumulator pipeline scheduling is unsupported");
   }
-  Check(version->value == 4 || !mod->attrs->dict.count(kPipeTransferTableAttr),
-        "tt.pipe_transfer_table requires Device IR schema v4");
+  Check(version->value == 4 || version->value == 6 ||
+            !mod->attrs->dict.count(kPipeTransferTableAttr),
+        "tt.pipe_transfer_table requires Device IR schema v4 or v6");
 
   ffi::String target_arch =
       RequireModuleAttr<ffi::String>(mod, kTargetArchAttr);
@@ -2356,7 +2457,7 @@ IRModule VerifyModule(IRModule mod) {
       RequireModuleAttr<ffi::Array<PipeDescriptor>>(mod, kPipeTableAttr);
   ffi::Array<ffi::String> kernel_order =
       RequireModuleAttr<ffi::Array<ffi::String>>(mod, kKernelOrderAttr);
-  Check(version->value == 4 ||
+  Check(version->value == 4 || version->value == 6 ||
             (kernel_order.size() == 3 && kernel_order[0] == "trisc" &&
              kernel_order[1] == "ncrisc" && kernel_order[2] == "brisc"),
         "tt.kernel_order must be exactly [trisc, ncrisc, brisc]");
@@ -2367,9 +2468,12 @@ IRModule VerifyModule(IRModule mod) {
   VerifyPipeTable(pipes, dfb_table, launch_grid);
   if (version->value < 3 || version->value == 5)
     VerifyLegacyL1Budget(mod, dfb_table);
-  if (version->value == 4) {
+  if (version->value == 4 || version->value == 6) {
     VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr, true,
                     true);
+    if (version->value == 6)
+      for (const auto &[global, base] : mod->functions)
+        DeriveComputeRequirements(mod, Downcast<PrimFunc>(base));
     VerifyMulticoreProgram(mod, tensor_table, dfb_table, launch_grid, pipes);
   } else if (general) {
     Check(launch_grid->x == 1 && launch_grid->y == 1 && pipes.empty(),
@@ -2396,7 +2500,8 @@ IRModule VerifyModule(IRModule mod) {
         func->GetAttr<ffi::String>(kKernelSlotAttr).value() == "trisc";
     Check(compute || !requirements.has_value(),
           "data movement kernel must not carry tt.compute_requirements");
-    if (compute && (version->value == 5 || requirements.has_value())) {
+    if (compute && (version->value == 5 || version->value == 6 ||
+                    requirements.has_value())) {
       Check(requirements.has_value(),
             "schema v5 compute kernel missing tt.compute_requirements");
       ComputeRequirements expected = DeriveComputeRequirements(mod, func);

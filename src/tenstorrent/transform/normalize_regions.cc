@@ -10,12 +10,14 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace tvm {
@@ -151,12 +153,34 @@ void ValidateMatchingExtents(const BufferRegion &source,
 // Preserve operation provenance while specializing K-dependent transfer slices.
 class AccumulatorIterationSubstituter : public StmtExprMutator {
 public:
-  AccumulatorIterationSubstituter(Var variable, PrimExpr value)
-      : variable_(std::move(variable)), value_(std::move(value)) {}
+  AccumulatorIterationSubstituter(Var variable, PrimExpr value) {
+    substitutions_.emplace(std::move(variable), std::move(value));
+  }
+
+  PrimExpr VisitExpr(const PrimExpr &expr) final {
+    PrimExpr result = StmtExprMutator::VisitExpr(expr);
+    return result.dtype().is_handle() ||
+                   SideEffect(result) > CallEffectKind::kPure
+               ? result
+               : analyzer_.Simplify(result);
+  }
 
   PrimExpr VisitExpr_(const VarNode *op) final {
-    return variable_.same_as(ffi::GetRef<Var>(op)) ? value_
-                                                   : ffi::GetRef<Var>(op);
+    Var variable = ffi::GetRef<Var>(op);
+    auto found = substitutions_.find(variable);
+    return found == substitutions_.end() ? variable : found->second;
+  }
+
+  Stmt VisitStmt_(const BindNode *op) final {
+    PrimExpr value = VisitExpr(op->value);
+    // A serial iteration can make aliases such as k_begin = stage * block_k
+    // constant. Eliminate their definitions with their uses, so expanded
+    // iterations neither retain dynamic slices nor redefine the same binder.
+    if (value.as<IntImmNode>() || value.as<FloatImmNode>()) {
+      substitutions_[op->var] = value;
+      return Evaluate(Integer(0), op->span);
+    }
+    return Bind(op->var, value, op->span);
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
@@ -167,8 +191,9 @@ public:
   }
 
 private:
-  Var variable_;
-  PrimExpr value_;
+  arith::Analyzer analyzer_;
+  std::unordered_map<Var, PrimExpr, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      substitutions_;
 };
 
 class RegionNormalizer : public StmtExprMutator {
@@ -177,7 +202,17 @@ public:
       : expand_accumulator_loops_(expand_accumulator_loops) {}
 
   Stmt VisitStmt_(const ForNode *op) final {
-    if (!expand_accumulator_loops_ || !op->annotations.empty())
+    if (!expand_accumulator_loops_)
+      return StmtExprMutator::VisitStmt_(op);
+    // The single-Core path does not run topology specialization. Retain its
+    // canonical launch prefix while resolving coordinates and scalar aliases.
+    if (op->annotations.count("tt.logical_core_axis") && is_one(op->extent)) {
+      AccumulatorIterationSubstituter substitute(op->loop_var, op->min);
+      For loop = ffi::GetRef<For>(op);
+      loop.CopyOnWrite()->body = VisitStmt(substitute(op->body));
+      return loop;
+    }
+    if (!op->annotations.empty())
       return StmtExprMutator::VisitStmt_(op);
     int64_t extent =
         RequireStaticInteger(op->extent, "accumulator K loop extent");

@@ -16,11 +16,13 @@ def run_multicore_device(mod, inputs, *, seed=0):
     eager snapshot in the model. This models only the logical Device contract.
     """
     VerifyTenstorrentDeviceIR()(mod)
-    assert int(mod.attrs["tt.device_ir_version"]) == 4
+    assert int(mod.attrs["tt.device_ir_version"]) in (4, 5, 6)
     rng = np.random.default_rng(seed)
     tensors = [cast(value, desc.dtype).copy() for value, desc in zip(inputs, mod.attrs["tt.tensor_table"])]
     dfbs = {int(d.dfb_id): d for d in mod.attrs["tt.dfb_table"]}
     transfers = {int(t.transfer_id): t for t in mod.attrs["tt.pipe_transfer_table"]}
+    accumulator_descs = {int(a.accumulator_id): a for a in mod.attrs.get("tt.accumulator_table", [])}
+    accumulators = {}
     streams = []
     for name in mod.attrs["tt.kernel_order"]:
         func = mod[str(name)]
@@ -50,6 +52,14 @@ def run_multicore_device(mod, inputs, *, seed=0):
                 reserved.add(d)
             elif name == "tl.tt.dfb_wait":
                 if args[0] not in published:
+                    continue
+                # Producer-forwarded panels become visible to local compute
+                # only after all outgoing deliveries have completed.
+                if (
+                    int(mod.attrs["tt.device_ir_version"]) == 6
+                    and str(dfbs[args[0]].producer_slot) == "ncrisc"
+                    and any(tid not in send_waited for tid, t in transfers.items() if int(t.source_dfb_id) == args[0])
+                ):
                     continue
                 assert args[0] in reserved
             elif name in ("tl.tt.tensor_to_dfb_nd", "tl.tt.dfb_to_tensor_nd"):
@@ -113,6 +123,25 @@ def run_multicore_device(mod, inputs, *, seed=0):
                 published.remove(d)
                 released.add(d)
                 del values[d]
+            elif name == "tl.tt.accumulator_init":
+                (aid,) = args
+                assert aid not in accumulators
+                shape = tuple(int(axis.extent) for axis in accumulator_descs[aid].accumulator_region.region)
+                accumulators[aid] = np.zeros(shape, np.float32)
+            elif name == "tl.tt.gemm_update":
+                lhs, rhs, aid, transpose_a, transpose_b = args
+                assert lhs in published and rhs in published and aid in accumulators
+                a = values[lhs].T if transpose_a else values[lhs]
+                b = values[rhs].T if transpose_b else values[rhs]
+                accumulators[aid] = cast(
+                    accumulators[aid] + a.astype(np.float32) @ b.astype(np.float32),
+                    accumulator_descs[aid].accumulation_dtype,
+                )
+            elif name == "tl.tt.accumulator_materialize":
+                aid, out = args
+                assert out in reserved and out not in published
+                values[out] = cast(accumulators.pop(aid), dfbs[out].element_dtype).copy()
+                published.add(out)
             elif name == "tl.tt.dfb_compute":
                 out, *operands = args
                 assert out in reserved and out not in published
@@ -142,7 +171,7 @@ def run_multicore_device(mod, inputs, *, seed=0):
             progressed = True
         future = any(tick < c[0] for c in copies.values()) or any(tick < ready for tid, ready in sends.items() if tid not in delivered)
         assert progressed or future, "Logical Device streams deadlocked"
-    assert not reserved and not published and not values and not copies
+    assert not reserved and not published and not values and not copies and not accumulators
     assert released == set(dfbs)
     assert delivered == send_waited == recv_waited == set(transfers)
     return tensors, {"exports": exports, "deliveries": deliveries, "ticks": tick}
