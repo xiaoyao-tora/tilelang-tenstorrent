@@ -35,6 +35,7 @@ constexpr const char *kLaunchGridAttr = "tt.launch_grid";
 constexpr const char *kOperationIdentityAttr = "tt.operation_identity";
 constexpr const char *kTensorTableAttr = "tt.tensor_table";
 constexpr const char *kAccumulatorTableAttr = "tt.accumulator_table";
+constexpr const char *kComputeValueTableAttr = "tt.compute_value_table";
 constexpr const char *kComputeRequirementsAttr = "tt.compute_requirements";
 constexpr const char *kDFBTableAttr = "tt.dfb_table";
 constexpr const char *kPipeTableAttr = "tt.pipe_table";
@@ -261,6 +262,31 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(AccumulatorDescriptor,
                                              ffi::ObjectRef,
                                              AccumulatorDescriptorNode);
+};
+
+/*! \brief One immutable compute-local value in the schema v7 def-use graph. */
+class ComputeValueDescriptorNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t value_id;
+  tirx::Buffer buffer;
+  int64_t version;
+  int64_t previous_value_id;
+  int64_t accumulator_id;
+  Span source_span;
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.ComputeValueDescriptor",
+                                    ComputeValueDescriptorNode, ffi::Object);
+};
+class ComputeValueDescriptor : public ffi::ObjectRef {
+public:
+  TVM_DLL ComputeValueDescriptor(int64_t value_id, tirx::Buffer buffer,
+                                 int64_t version, int64_t previous_value_id,
+                                 int64_t accumulator_id, Span source_span);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ComputeValueDescriptor,
+                                             ffi::ObjectRef,
+                                             ComputeValueDescriptorNode);
 };
 
 /*! \brief Hard requirements merged across one actual compute kernel. */

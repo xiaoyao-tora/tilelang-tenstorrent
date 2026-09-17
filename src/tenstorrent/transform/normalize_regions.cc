@@ -112,6 +112,10 @@ NormalizedRegion NormalizeRegion(const BufferRegion &region,
 }
 
 ffi::String ClassifyTransfer(const Buffer &source, const Buffer &destination) {
+  if (destination.scope() == "local.fragment" &&
+      (IsDFBBuffer(source) || source.scope() == "local.fragment")) {
+    return "compute_value_copy";
+  }
   if (source.scope() == "local.fragment" &&
       (IsGlobalBuffer(destination) || IsDFBBuffer(destination))) {
     return "accumulator_materialize";
@@ -231,7 +235,8 @@ public:
           op->loop_var, IntImm(op->loop_var.dtype(), minimum + i));
       iterations.push_back(VisitStmt(substitute(op->body)));
     }
-    return SeqStmt(iterations, op->span);
+    return iterations.size() == 1 ? iterations[0]
+                                  : SeqStmt(iterations, op->span);
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {

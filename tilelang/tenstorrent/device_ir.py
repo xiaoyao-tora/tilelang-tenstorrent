@@ -1,4 +1,4 @@
-"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3/v4/v5/v6.
+"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3/v4/v5/v6/v7.
 
 ``TTBufferMetadata`` is a normalization-stage object.  It is attached as an
 array under :data:`BUFFER_METADATA_TABLE_ATTR` before program formation and
@@ -19,6 +19,8 @@ epochs. Each accumulator belongs to the unique TRISC function containing its
 lifetime; fragment Buffer identities are local to that Core. Forwarded Tensor
 panels become ready for their local TRISC consumer only after all outgoing Pipe
 transfers complete. Earlier metadata constructors and defaults remain unchanged.
+Schema v7 adds immutable ``tt.compute_value_table`` definitions, ordinary fragment
+expressions, GEMM epilogues and explicit compute materialization on one Core.
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ LAUNCH_GRID_ATTR = "tt.launch_grid"
 OPERATION_IDENTITY_ATTR = "tt.operation_identity"
 TENSOR_TABLE_ATTR = "tt.tensor_table"
 ACCUMULATOR_TABLE_ATTR = "tt.accumulator_table"
+COMPUTE_VALUE_TABLE_ATTR = "tt.compute_value_table"
 COMPUTE_REQUIREMENTS_ATTR = "tt.compute_requirements"
 DFB_TABLE_ATTR = "tt.dfb_table"
 PIPE_TABLE_ATTR = "tt.pipe_table"
@@ -186,6 +189,22 @@ class AccumulatorDescriptor(Node):
             DataType(accumulation_dtype),
             DataType(output_dtype),
             int(full_k_tiles),
+            source_span,
+        )
+
+
+@tvm_ffi.register_object("tl.tenstorrent.ComputeValueDescriptor")
+class ComputeValueDescriptor(Node):
+    """Immutable fragment version; previous and accumulator IDs use -1 when absent."""
+
+    def __init__(self, value_id, buffer, version, previous_value_id, accumulator_id, source_span):
+        self.__init_handle_by_constructor__(
+            _ffi_api.ComputeValueDescriptor,
+            int(value_id),
+            buffer,
+            int(version),
+            int(previous_value_id),
+            int(accumulator_id),
             source_span,
         )
 
@@ -408,6 +427,8 @@ def VerifyTenstorrentDeviceIR():
 __all__ = (
     "is_supported_accumulator_dtype_triple",
     "AccumulatorDescriptor",
+    "ComputeValueDescriptor",
+    "COMPUTE_VALUE_TABLE_ATTR",
     "ComputeRequirements",
     "ACCUMULATOR_TABLE_ATTR",
     "COMPUTE_REQUIREMENTS_ATTR",

@@ -28,8 +28,10 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <algorithm>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -129,9 +131,11 @@ void ValidateDType(DataType dtype) {
               DTypeName(dtype));
 }
 
-void ValidateRegion(const BufferRegion &region, const std::string &owner) {
+void ValidateRegion(const BufferRegion &region, const std::string &owner,
+                    bool allow_fragment = false) {
   const Buffer &buffer = region->buffer;
-  Require(buffer.scope() == "shared" || buffer.scope() == "shared.dyn",
+  Require(buffer.scope() == "shared" || buffer.scope() == "shared.dyn" ||
+              (allow_fragment && buffer.scope() == "local.fragment"),
           owner + " requires a shared DFB buffer");
   ValidateDType(buffer->dtype);
   Require(!buffer->shape.empty() &&
@@ -199,6 +203,8 @@ class GemmAccumulatorVerifier : public StmtExprVisitor {
     int declaration_depth{-1};
     int64_t core_x{-1};
     int64_t core_y{-1};
+    ffi::Array<Annotations> elementwise_updates;
+    int initialization_depth{-1};
   };
 
   class Collector : public StmtExprVisitor {
@@ -303,6 +309,8 @@ public:
           {"materialization", StringImm("after_complete_k_reduction")}};
       if (!fp32)
         requirement.Set("matmul_full_fp32", StringImm("forbidden"));
+      if (!lifetime.elementwise_updates.empty())
+        requirement.Set("elementwise_updates", lifetime.elementwise_updates);
       if (lifetime.core_x >= 0) {
         requirement.Set("core_x", Integer(lifetime.core_x));
         requirement.Set("core_y", Integer(lifetime.core_y));
@@ -331,6 +339,32 @@ private:
     return nullptr;
   }
 
+  std::vector<size_t> Origins(const Buffer &buffer) {
+    if (Lifetime *lifetime = Find(buffer))
+      return {static_cast<size_t>(lifetime - lifetimes_.data())};
+    auto found = provenance_.find(buffer);
+    return found == provenance_.end() ? std::vector<size_t>{} : found->second;
+  }
+
+  void Materialize(size_t origin, const Buffer &output) {
+    Lifetime &lifetime = lifetimes_[origin];
+    CheckContext();
+    Require(loop_depth_ == lifetime.initialization_depth,
+            "GEMM accumulator cannot materialize inside its K reduction "
+            "loop; pack only after all updates");
+    Require(
+        lifetime.updated,
+        "GEMM accumulator requires final materialization after all updates");
+    Require(IsSupportedAccumulatorDTypeTriple(
+                lifetime.input_dtype, lifetime.buffer->dtype, output->dtype),
+            "GEMM capability registry has no (input=" +
+                DTypeName(lifetime.input_dtype) +
+                ", accum=" + DTypeName(lifetime.buffer->dtype) +
+                ", output=" + DTypeName(output->dtype) + ") combination");
+    lifetime.output_dtype = output->dtype;
+    lifetime.materialized = true;
+  }
+
   void CheckContext() {
     Require(conditional_depth_ == 0,
             "GEMM accumulator conditional access has no proven dominating "
@@ -352,13 +386,18 @@ private:
 
   void Initialize(Lifetime *lifetime) {
     CheckContext();
-    Require(loop_depth_ == lifetime->declaration_depth,
-            "GEMM accumulator initialization inside a K loop cannot preserve "
-            "one complete reduction lifetime");
+    // Independent outer-loop reductions initialize and publish at one depth.
+    // A clear inside a K loop followed by an outer store remains invalid.
+    if (lifetime->materialized) {
+      lifetime->initialized = false;
+      lifetime->updated = false;
+      lifetime->materialized = false;
+    }
     Require(!lifetime->initialized && !lifetime->updated,
             "GEMM accumulator requires unique initialization; an ordinary "
             "write must not overwrite its live value");
     lifetime->initialized = true;
+    lifetime->initialization_depth = loop_depth_;
   }
 
   void VisitStmt_(const EvaluateNode *op) final {
@@ -398,8 +437,8 @@ private:
                 "complete K reduction lifetime");
         Require(gemm->a_->dtype == gemm->b_->dtype,
                 "GEMM requires matching input storage dtypes");
-        ValidateRegion(gemm->aRegion_, "GEMM matrix input A");
-        ValidateRegion(gemm->bRegion_, "GEMM matrix input B");
+        ValidateRegion(gemm->aRegion_, "GEMM matrix input A", true);
+        ValidateRegion(gemm->bRegion_, "GEMM matrix input B", true);
         Require(!Find(gemm->a_) && !Find(gemm->b_),
                 "GEMM matrix inputs must not alias an accumulator");
         Require(is_zero(gemm->clearAccum_) || is_one(gemm->clearAccum_),
@@ -432,47 +471,42 @@ private:
         Initialize(lifetime);
         return;
       }
+      provenance_.erase(fill->dst);
     } else if (call->op.same_as(Copy::Get())) {
       Copy copy = Downcast<Copy>(ParseOperator(call));
       Require(!Find(copy->dst),
               "ordinary copy must not write a GEMM accumulator");
-      if (Lifetime *lifetime = Find(copy->src)) {
-        CheckContext();
-        CheckRegion(BufferRegion(copy->src, copy->src_range), *lifetime);
-        Require(loop_depth_ == lifetime->declaration_depth,
-                "GEMM accumulator cannot materialize inside its K reduction "
-                "loop; pack only after all updates");
-        Require(lifetime->updated && !lifetime->materialized,
-                "GEMM accumulator requires one final materialization after "
-                "all updates");
-        Require(copy->dst.scope() == "shared" ||
-                    copy->dst.scope() == "shared.dyn" ||
-                    copy->dst.scope() == "global" || copy->dst.scope().empty(),
-                "GEMM fragment must materialize to output DFB or Tensor");
-        Require(copy->dst_range.size() == lifetime->region->region.size(),
+      std::vector<size_t> origins = Origins(copy->src);
+      if (!origins.empty()) {
+        if (Lifetime *lifetime = Find(copy->src))
+          CheckRegion(BufferRegion(copy->src, copy->src_range), *lifetime);
+        Require(copy->src_range.size() == copy->dst_range.size(),
                 "GEMM output materialization rank mismatch");
         arith::Analyzer analyzer;
         for (size_t i = 0; i < copy->dst_range.size(); ++i)
           Require(analyzer.CanProveEqual(copy->dst_range[i]->extent,
-                                         lifetime->region->region[i]->extent),
+                                         copy->src_range[i]->extent),
                   "GEMM output materialization shape mismatch");
-        DataType input = lifetime->input_dtype;
-        DataType accum = lifetime->buffer->dtype;
-        DataType output = copy->dst->dtype;
-        Require(IsSupportedAccumulatorDTypeTriple(input, accum, output),
-                "GEMM capability registry has no (input=" + DTypeName(input) +
-                    ", accum=" + DTypeName(accum) +
-                    ", output=" + DTypeName(output) + ") combination");
-        lifetime->output_dtype = output;
-        lifetime->materialized = true;
+        if (copy->dst.scope() == "local.fragment") {
+          provenance_[copy->dst] = origins;
+        } else {
+          Require(copy->dst.scope() == "shared" ||
+                      copy->dst.scope() == "shared.dyn" ||
+                      copy->dst.scope() == "global" ||
+                      copy->dst.scope().empty(),
+                  "GEMM fragment must materialize to output DFB or Tensor");
+          for (size_t origin : origins)
+            Materialize(origin, copy->dst);
+        }
         return;
       }
+      provenance_.erase(copy->dst);
     }
     StmtExprVisitor::VisitStmt_(op);
   }
 
   void VisitExpr_(const BufferLoadNode *op) final {
-    Require(!Find(op->buffer),
+    Require(Origins(op->buffer).empty(),
             "GEMM accumulator may only be read by GEMM updates and final copy; "
             "ordinary reads or cross-slot uses are unsupported");
     StmtExprVisitor::VisitExpr_(op);
@@ -484,6 +518,10 @@ private:
       Require(!var.same_as(lifetime.buffer->data),
               "opaque pointer access to a GEMM accumulator is unsupported; "
               "use GEMM updates and final copy");
+    for (const auto &entry : provenance_)
+      Require(
+          !var.same_as(entry.first->data),
+          "opaque pointer access to a GEMM epilogue fragment is unsupported");
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
@@ -493,9 +531,54 @@ private:
   }
 
   void VisitStmt_(const IfThenElseNode *op) final {
-    ++conditional_depth_;
-    StmtExprVisitor::VisitStmt_(op);
-    --conditional_depth_;
+    arith::Analyzer analyzer;
+    PrimExpr condition = analyzer.Simplify(op->condition);
+    if (is_one(condition)) {
+      VisitStmt(op->then_case);
+      return;
+    }
+    if (is_zero(condition)) {
+      if (op->else_case.has_value())
+        VisitStmt(op->else_case.value());
+      return;
+    }
+    VisitExpr(op->condition);
+    auto entry = lifetimes_;
+    auto entry_provenance = provenance_;
+    VisitStmt(op->then_case);
+    auto then_lifetimes = lifetimes_;
+    auto then_provenance = provenance_;
+    lifetimes_ = entry;
+    provenance_ = entry_provenance;
+    if (op->else_case.has_value())
+      VisitStmt(op->else_case.value());
+    for (size_t i = 0; i < lifetimes_.size(); ++i) {
+      Lifetime &merged = lifetimes_[i];
+      const Lifetime &then_value = then_lifetimes[i];
+      Require(merged.initialized == then_value.initialized,
+              "GEMM accumulator conditional access has no proven dominating "
+              "initialization or final materialization");
+      Require(!merged.initialized || merged.initialization_depth ==
+                                         then_value.initialization_depth,
+              "GEMM accumulator branch initialization loop depths disagree");
+      Require(!merged.updated || !then_value.updated ||
+                  merged.input_dtype == then_value.input_dtype,
+              "GEMM accumulator branch merge has incompatible input dtypes");
+      merged.updated &= then_value.updated;
+      merged.materialized &= then_value.materialized;
+      if (merged.materialized)
+        Require(merged.output_dtype == then_value.output_dtype,
+                "GEMM accumulator branch merge has incompatible output dtypes");
+      for (const Annotations &update : then_value.elementwise_updates)
+        merged.elementwise_updates.push_back(update);
+    }
+    for (auto it = provenance_.begin(); it != provenance_.end();) {
+      auto other = then_provenance.find(it->first);
+      if (other == then_provenance.end() || other->second != it->second)
+        it = provenance_.erase(it);
+      else
+        ++it;
+    }
   }
 
   void VisitStmt_(const SBlockNode *op) final {
@@ -508,7 +591,58 @@ private:
     for (const Buffer &buffer : op->alloc_buffers)
       if (Lifetime *lifetime = Find(buffer))
         lifetime->declaration_depth = loop_depth_;
-    StmtExprVisitor::VisitStmt_(op);
+    if (IsElementwiseBlock(ffi::GetRef<SBlock>(op))) {
+      // The compute verifier has proved a pure, single-store expression and
+      // complete effects. Read the old value before recording the new value;
+      // keep the relation for future SSA/materialization consumers.
+      const auto *store = op->body.as<BufferStoreNode>();
+      ICHECK(store != nullptr);
+      Lifetime *output = Find(store->buffer);
+      bool reads_output = false;
+      std::vector<size_t> origins;
+      for (const BufferRegion &read : op->reads) {
+        if (Lifetime *input = Find(read->buffer)) {
+          CheckContext();
+          CheckRegion(read, *input);
+          Require(input->updated,
+                  "GEMM Tiles read requires a live initialized accumulator "
+                  "before final materialization");
+          reads_output |= input == output;
+        }
+        for (size_t origin : Origins(read->buffer)) {
+          if (std::find(origins.begin(), origins.end(), origin) ==
+              origins.end())
+            origins.push_back(origin);
+        }
+      }
+      if (!origins.empty()) {
+        if (store->buffer.scope() == "local.fragment") {
+          if (!output)
+            provenance_[store->buffer] = origins;
+        } else {
+          Require(store->buffer.scope() == "shared" ||
+                      store->buffer.scope() == "shared.dyn",
+                  "GEMM Tiles epilogue must materialize to an output DFB");
+          for (size_t origin : origins)
+            Materialize(origin, store->buffer);
+        }
+      } else {
+        provenance_.erase(store->buffer);
+      }
+      if (output) {
+        Require(reads_output,
+                "ordinary write must not overwrite a live GEMM accumulator; "
+                "Tiles update must read its old value");
+        CheckRegion(op->writes[0], *output);
+        output->elementwise_updates.push_back(
+            {{"accumulator", output->buffer},
+             {"region", output->region},
+             {"expression", store->value},
+             {"relation", StringImm("pointwise_old_to_new")}});
+      }
+    } else {
+      StmtExprVisitor::VisitStmt_(op);
+    }
     core_x_ = saved_x;
     core_y_ = saved_y;
   }
@@ -544,6 +678,9 @@ private:
   }
 
   std::vector<Lifetime> lifetimes_;
+  std::unordered_map<Buffer, std::vector<size_t>, ffi::ObjectPtrHash,
+                     ffi::ObjectPtrEqual>
+      provenance_;
   int64_t core_x_{-1}, core_y_{-1};
   int loop_depth_{0};
   int conditional_depth_{0};
@@ -552,13 +689,18 @@ private:
 
 Stmt MakeCompute(const BufferRegion &output,
                  const ffi::Array<BufferRegion> &inputs,
-                 Annotations annotations, Span span) {
-  ValidateRegion(output, "compute output");
+                 Annotations annotations, Span span,
+                 bool allow_tensor_output = false) {
+  if (allow_tensor_output &&
+      (output->buffer.scope() == "global" || output->buffer.scope().empty()))
+    ValidateDType(output->buffer->dtype);
+  else
+    ValidateRegion(output, "compute output", true);
   ffi::Array<PrimExpr> arguments{output->ToPrimExpr()};
   ffi::Array<ffi::Array<Integer>> maps;
   ffi::Array<ffi::Array<PrimExpr>> input_shapes;
   for (const BufferRegion &input : inputs) {
-    ValidateRegion(input, "compute input");
+    ValidateRegion(input, "compute input", true);
     arguments.push_back(input->ToPrimExpr());
     maps.push_back(IdentityAxes(input->buffer));
     input_shapes.push_back(input->buffer->shape);
@@ -598,9 +740,48 @@ public:
                       .value_or(ffi::Array<TTBufferMetadata>{})),
         accumulator_requirements_(func->GetAttr<ffi::Array<Annotations>>(
                                           "tt.gemm_accumulator_requirements")
-                                      .value_or(ffi::Array<Annotations>{})) {}
+                                      .value_or(ffi::Array<Annotations>{})) {
+    std::unordered_map<Buffer, int, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+        copies;
+    PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
+      if (auto call = object.as<Call>()) {
+        if (call.value()->op.same_as(Copy::Get())) {
+          Copy copy = Downcast<Copy>(ParseOperator(call.value()));
+          if (copy->src.scope() == "local.fragment")
+            has_fragment_compute_ |=
+                !IsAccumulator(copy->src) ||
+                ++copies[copy->src] > AccumulatorLifetimes(copy->src);
+          has_fragment_compute_ |= copy->dst.scope() == "local.fragment";
+        } else if (call.value()->op.same_as(Fill::Get())) {
+          Fill fill = Downcast<Fill>(ParseOperator(call.value()));
+          has_fragment_compute_ |= fill->dst.scope() == "local.fragment" &&
+                                   !IsAccumulator(fill->dst);
+        }
+      }
+      if (auto block = object.as<SBlock>()) {
+        if (!IsElementwiseBlock(block.value()))
+          return;
+        for (const BufferRegion &region : block.value()->reads)
+          has_fragment_compute_ |= region->buffer.scope() == "local.fragment";
+        for (const BufferRegion &region : block.value()->writes)
+          has_fragment_compute_ |= region->buffer.scope() == "local.fragment";
+      }
+    });
+  }
 
 private:
+  bool IsAccumulator(const Buffer &buffer) const {
+    return AccumulatorLifetimes(buffer) != 0;
+  }
+
+  int AccumulatorLifetimes(const Buffer &buffer) const {
+    int count = 0;
+    for (const Annotations &requirement : accumulator_requirements_)
+      if (Downcast<Buffer>(requirement.at("accumulator")).same_as(buffer))
+        ++count;
+    return count;
+  }
+
   Stmt VisitStmt_(const SBlockRealizeNode *op) final {
     const SBlock &block = op->block;
     if (!IsElementwiseBlock(block))
@@ -668,6 +849,16 @@ private:
     if (call->op.same_as(Fill::Get())) {
       Fill fill = Downcast<Fill>(ParseOperator(call));
       if (fill->dst.scope() == "local.fragment") {
+        if (!IsAccumulator(fill->dst)) {
+          Require(call->annotations.empty(),
+                  "Fill scheduling annotations are unsupported");
+          ComputeDTypeVerifier dtype_verifier;
+          dtype_verifier(cast(fill->dst->dtype, fill->value));
+          Annotations annotations = BaseAnnotations(fill->dst, "fill");
+          annotations.Set("tt.expression", cast(fill->dst->dtype, fill->value));
+          return MakeCompute(BufferRegion(fill->dst, fill->region), {},
+                             annotations, span);
+        }
         bool verified = false;
         for (const auto &requirement : accumulator_requirements_)
           verified |= Downcast<Buffer>(requirement.at("accumulator"))
@@ -825,6 +1016,26 @@ private:
     }
     if (call->op.same_as(Copy::Get())) {
       Copy copy = Downcast<Copy>(ParseOperator(call));
+      if ((has_fragment_compute_ && copy->src.scope() == "local.fragment") ||
+          copy->dst.scope() == "local.fragment") {
+        for (const auto &entry : call->annotations)
+          Require(entry.first == "tt.transfer_kind",
+                  "Fragment copy scheduling annotations are unsupported");
+        const char *kind =
+            copy->src->dtype == copy->dst->dtype ? "copy" : "typecast";
+        Annotations annotations = BaseAnnotations(copy->dst, kind);
+        ffi::Array<PrimExpr> zeros, domain;
+        for (const Range &range : copy->src_range)
+          zeros.push_back(make_zero(range->min.dtype()));
+        for (const Range &range : copy->dst_range)
+          domain.push_back(range->extent);
+        annotations.Set("tt.logical_domain", domain);
+        annotations.Set("tt.expression",
+                        cast(copy->dst->dtype, BufferLoad(copy->src, zeros)));
+        return MakeCompute(BufferRegion(copy->dst, copy->dst_range),
+                           {BufferRegion(copy->src, copy->src_range)},
+                           annotations, span, true);
+      }
       if (copy->src.scope() == "local.fragment")
         return MakeAccumulatorCompute(
             BufferRegion(copy->src, copy->src_range),
@@ -886,6 +1097,7 @@ private:
 
   ffi::Array<TTBufferMetadata> metadata_;
   ffi::Array<Annotations> accumulator_requirements_;
+  bool has_fragment_compute_{false};
 };
 
 } // namespace
@@ -895,8 +1107,11 @@ tvm::transform::Pass VerifyTTGemmAccumulators() {
                       const tvm::transform::PassContext &context) {
     return GemmAccumulatorVerifier::Verify(std::move(func));
   };
-  return tirx::transform::CreatePrimFuncPass(
-      pass_func, 0, "tl.tenstorrent.VerifyTTGemmAccumulators", {});
+  return tvm::transform::Sequential(
+      {VerifyTTComputeBlocks(),
+       tirx::transform::CreatePrimFuncPass(
+           pass_func, 0, "tl.tenstorrent.VerifyTTGemmAccumulators", {})},
+      "tl.tenstorrent.VerifyTTGemmAccumulators");
 }
 
 tvm::transform::Pass LegalizeTenstorrentTileOps() {

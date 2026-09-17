@@ -43,6 +43,9 @@ class StructuredDataflowVerifier : public StmtExprVisitor {
 public:
   static void Verify(const PrimFunc &func) {
     StructuredDataflowVerifier verifier;
+    auto slot = func->GetAttr<ffi::String>(kKernelSlotAttr);
+    verifier.fragment_slot_allowed_ =
+        !slot.has_value() || slot.value() == "trisc";
     for (const auto &[parameter, buffer] : func->buffer_map) {
       verifier.known_.emplace(buffer->data, buffer);
       verifier.Write_(BufferRegion::FullRegion(buffer));
@@ -65,6 +68,7 @@ private:
   }
 
   void CheckRegion_(const BufferRegion &region) {
+    CheckFragmentSlot_(region);
     const Buffer &buffer = region->buffer;
     auto it = known_.find(buffer->data);
     if (it == known_.end() || !it->second.same_as(buffer))
@@ -178,6 +182,20 @@ private:
         initialized_[data].push_back(region);
   }
 
+  void VisitStmt_(const WhileNode *) final {
+    // A possibly zero-trip body cannot establish definite initialization.
+    // Keep the standalone verifier within the same static subset as the
+    // frontend validator instead of inheriting one-pass visitor semantics.
+    Fail("while loops cannot be verified for structured dataflow; only "
+         "provably positive serial loops are supported");
+  }
+
+  void CheckFragmentSlot_(const BufferRegion &region) {
+    if (region->buffer.scope() == "local.fragment" && !fragment_slot_allowed_)
+      Fail("fragment cannot cross processor slots; materialize through an "
+           "output DFB");
+  }
+
   void VisitStmt_(const IfThenElseNode *op) final {
     if (SideEffect(op->condition) > CallEffectKind::kReadState)
       Fail("effectful condition at structured boundary");
@@ -269,6 +287,7 @@ private:
   }
 
   arith::Analyzer analyzer_;
+  bool fragment_slot_allowed_{true};
   Regions initialized_;
   std::unordered_map<Var, Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       known_;

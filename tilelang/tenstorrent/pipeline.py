@@ -40,6 +40,18 @@ def _has_compute_blocks(func: tirx.PrimFunc) -> bool:
     return found
 
 
+def _has_fragment_compute(func: tirx.PrimFunc) -> bool:
+    found = False
+
+    def visit(node):
+        nonlocal found
+        if isinstance(node, tirx.SBlock) and "tl.tt.compute_kind" in node.annotations:
+            found |= any(region.buffer.scope() == "local.fragment" for region in (*node.reads, *node.writes))
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+    return found
+
+
 def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
     """Return verified Device IR or a complete, validated structured module.
 
@@ -83,12 +95,20 @@ def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
         mod = compiler_pass(mod)
 
     normalized = mod
+    if any(_has_fragment_compute(func) for func in normalized.functions.values() if isinstance(func, tirx.PrimFunc)):
+        # Prove frontend dominance before selecting expressions or specializing
+        # control flow; malformed input must never become a successful fallback.
+        normalized = transform.VerifyTTStructuredDataflow()(normalized)
     mod = transform.LegalizeTenstorrentTileOps()(normalized)
     reasons = []
     for symbol, func in mod.functions.items():
         if not isinstance(func, tirx.PrimFunc):
             raise ValueError("Tenstorrent lowering accepts only PrimFunc globals")
-        if _has_compute_blocks(func):
+        if _has_fragment_compute(func):
+            reasons.append(
+                f"{symbol.name_hint}: fragment compute block has no Device consumer; value-version and materialization lowering is required"
+            )
+        elif _has_compute_blocks(func):
             reasons.append(f"{symbol.name_hint}: compute block has no Device consumer")
         # Pipe-only programs have a communication ABI and are verified by the
         # multicore formation path even when no Tensor parameter is present.

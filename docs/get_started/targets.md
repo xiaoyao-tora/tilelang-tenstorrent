@@ -17,7 +17,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `cutedsl` | NVIDIA CUTLASS/CuTe DSL backend. Requires `nvidia-cutlass-dsl`. |
 | `hip` | AMD GPUs via ROCm. Use a config dict for options such as `{"kind": "hip", "mcpu": "gfx90a"}`. |
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
-| `tenstorrent` | Tenstorrent devices. Requires `wormhole_b0` or `blackhole`; supports verified single-Core BF16/FP32 Device Lower for multi-tile compute, broadcast, Fill, Typecast, Transpose, GEMM and Reduction. TTL codegen remains unimplemented. |
+| `tenstorrent` | Tenstorrent devices. Requires `wormhole_b0` or `blackhole`; supports verified single-Core BF16/FP32 Device Lower for multi-tile compute, broadcast, Fill, Typecast, Transpose, GEMM and Reduction. Restricted source-only TTL mapping is available; execution remains unsupported. |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
 | `webgpu` | Browser / WebGPU runtimes. |
 | `c` | Emit plain C source for inspection or custom toolchains. |
@@ -62,9 +62,11 @@ Reduction, logical batch dimensions, and bounded control flow reach verified thr
 Full lowering diagnoses unsupported input; it never returns `tt.ir_stage="structured"` as success.
 Capture-only clients invoke the capture and compute verifier passes directly.
 GEMM fragments have a separate [frontend precision and lifetime contract](../developer_guide/tenstorrent_frontend.md).
-`VerifyTTGemmAccumulators` validates that contract, while complete Device Lower rejects the currently
-unsupported fragment lifetime schedule instead of silently lowering its precision.
-TTL source generation and hardware execution remain unimplemented.
+`VerifyTTGemmAccumulators` validates that contract. Single-Core
+[Device IR v7](../compiler_internals/tenstorrent_compute_values.md) supports immutable
+fragment values, mixed shared/fragment elementwise computation, old/new versions,
+GEMM epilogues and exact-dtype materialization. Source-only TTL mapping covers a
+restricted subset; FP32/full-K GEMM schedules and hardware execution remain unavailable.
 
 Tenstorrent's language facade exposes inter-Core communication topology under `T.comm`:
 

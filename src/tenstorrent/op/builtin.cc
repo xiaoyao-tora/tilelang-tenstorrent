@@ -61,6 +61,22 @@ TIR_DEFINE_TT_BUILTIN(dfb_compute)
 TIR_DEFINE_TT_BUILTIN(dfb_load).set_num_inputs(1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kPure));
 
+TIR_DEFINE_TT_BUILTIN(compute_value)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TT_BUILTIN(compute_value_load)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
+TIR_DEFINE_TT_BUILTIN(compute_value_store)
+    .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TT_BUILTIN(compute_value_gemm)
+    .set_num_inputs(6)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TT_BUILTIN(tensor_to_dfb_nd)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));

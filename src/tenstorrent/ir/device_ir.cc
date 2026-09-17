@@ -52,6 +52,28 @@ void AccumulatorDescriptorNode::RegisterReflection() {
       .def_ro("full_k_tiles", &AccumulatorDescriptorNode::full_k_tiles)
       .def_ro("source_span", &AccumulatorDescriptorNode::source_span);
 }
+ComputeValueDescriptor::ComputeValueDescriptor(
+    int64_t value_id, tirx::Buffer buffer, int64_t version,
+    int64_t previous_value_id, int64_t accumulator_id, Span source_span) {
+  auto node = ffi::make_object<ComputeValueDescriptorNode>();
+  node->value_id = value_id;
+  node->buffer = std::move(buffer);
+  node->version = version;
+  node->previous_value_id = previous_value_id;
+  node->accumulator_id = accumulator_id;
+  node->source_span = std::move(source_span);
+  data_ = std::move(node);
+}
+void ComputeValueDescriptorNode::RegisterReflection() {
+  ffi::reflection::ObjectDef<ComputeValueDescriptorNode>()
+      .def_ro("value_id", &ComputeValueDescriptorNode::value_id)
+      .def_ro("buffer", &ComputeValueDescriptorNode::buffer)
+      .def_ro("version", &ComputeValueDescriptorNode::version)
+      .def_ro("previous_value_id",
+              &ComputeValueDescriptorNode::previous_value_id)
+      .def_ro("accumulator_id", &ComputeValueDescriptorNode::accumulator_id)
+      .def_ro("source_span", &ComputeValueDescriptorNode::source_span);
+}
 ComputeRequirements::ComputeRequirements(
     ffi::String destination_width, ffi::String matmul_full_fp32,
     ffi::Array<AccumulatorDescriptor> accumulators) {
@@ -431,6 +453,7 @@ void DeviceFunctionMetadataNode::RegisterReflection() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   AccumulatorDescriptorNode::RegisterReflection();
+  ComputeValueDescriptorNode::RegisterReflection();
   ComputeRequirementsNode::RegisterReflection();
   CoreCoordNode::RegisterReflection();
   CoreDomainNode::RegisterReflection();
@@ -509,6 +532,13 @@ TVM_FFI_STATIC_INIT_BLOCK() {
              return AccumulatorDescriptor(id, std::move(region), input,
                                           accumulation, output, full_k,
                                           std::move(span));
+           })
+      .def("tl.tenstorrent.ComputeValueDescriptor",
+           [](int64_t id, tirx::Buffer buffer, int64_t version,
+              int64_t previous, int64_t accumulator, Span span) {
+             return ComputeValueDescriptor(id, std::move(buffer), version,
+                                           previous, accumulator,
+                                           std::move(span));
            })
       .def("tl.tenstorrent.ComputeRequirements",
            [](ffi::String width, ffi::String full,

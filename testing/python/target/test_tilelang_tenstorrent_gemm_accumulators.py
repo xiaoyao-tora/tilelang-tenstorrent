@@ -396,3 +396,80 @@ def test_accumulator_materializes_to_shared_output_with_storage_dtype():
     descriptor = next(dfb for dfb in mod.attrs["tt.dfb_table"] if dfb.dfb_id == int(materialize.args[1]))
     assert str(descriptor.element_dtype) == "bfloat16"
     assert mod.attrs["tt.accumulator_table"][0].full_k_tiles == 2
+
+
+def epilogue_program(mode="fresh", output_dtype="bfloat16"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((32, 32), "bfloat16"),
+        B: T.Tensor((32, 32), "bfloat16"),
+        C: T.Tensor((32, 32), output_dtype),
+        D: T.Tensor((32, 32), "bfloat16"),
+    ):
+        with T.Kernel(1, 1, threads=1):
+            a = T.alloc_shared((32, 32), "bfloat16", annotations={"tt.dfb_block_count": 2})
+            b = T.alloc_shared((32, 32), "bfloat16", annotations={"tt.dfb_block_count": 2})
+            acc = T.alloc_fragment((32, 32), "float32")
+            old = T.alloc_fragment((32, 32), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.gemm(a, b, acc, clear_accum=True)
+            if mode == "copies":
+                T.copy(acc, C)
+                T.copy(acc, D)
+            else:
+                for i, j in T.Tiles(old):
+                    old[i, j] = acc[i, j] * T.float32(0.5)
+                if mode == "old_new":
+                    for i, j in T.Tiles(acc):
+                        acc[i, j] = acc[i, j] * T.float32(2)
+                    T.copy(acc, D)
+                T.copy(old, C)
+
+    return main
+
+
+@pytest.mark.parametrize("mode", ["fresh", "old_new", "copies"])
+def test_accumulator_epilogue_supports_fresh_values_and_multiple_consumers(mode):
+    mod = verify(epilogue_program(mode))
+    (requirement,) = mod["main"].attrs["tt.gemm_accumulator_requirements"]
+    assert requirement["input_dtype"].value == "bfloat16"
+    assert requirement["accum_dtype"].value == "float32"
+    assert requirement["output_dtype"].value == "bfloat16"
+    legalized = transform.LegalizeTenstorrentTileOps()(mod)
+    assert "tl.tt.elementwise" not in legalized.script()
+    assert "tl.tileop.copy(old" not in legalized.script()
+    assert ir.structural_equal(mod, transform.VerifyTTGemmAccumulators()(mod))
+
+
+def test_derived_accumulator_output_checks_dtype_capability():
+    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="capability registry"):
+        verify(epilogue_program(output_dtype="float32"))
+
+
+def test_both_branch_initializers_dominate_gemm_update():
+    mod = normalize(program())
+
+    def branch_clear(node):
+        if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tileop.fill":
+            return tirx.IfThenElse(tirx.Var("condition", "bool"), node, node)
+        return None
+
+    body = tirx.stmt_functor.ir_transform(mod["main"].body, None, branch_clear, ["tirx.Evaluate"])
+    mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
+    verified = transform.VerifyTTGemmAccumulators()(mod)
+    assert len(verified["main"].attrs["tt.gemm_accumulator_requirements"]) == 1
+
+
+def test_branch_without_update_does_not_complete_the_reduction():
+    mod = normalize(program())
+
+    def branch_update(node):
+        if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tileop.gemm":
+            return tirx.IfThenElse(tirx.Var("condition", "bool"), node, None)
+        return None
+
+    body = tirx.stmt_functor.ir_transform(mod["main"].body, None, branch_update, ["tirx.Evaluate"])
+    mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
+    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="after all updates"):
+        transform.VerifyTTGemmAccumulators()(mod)

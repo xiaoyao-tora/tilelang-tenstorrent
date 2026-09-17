@@ -13,6 +13,7 @@ constexpr const char *kTTBlockShape = "tl.tt.block_shape";
 constexpr const char *kTTIteratorTypes = "tl.tt.iterator_types";
 constexpr const char *kTTAccessMaps = "tl.tt.access_maps";
 constexpr const char *kTTBroadcastRecipes = "tl.tt.broadcast_recipes";
+constexpr const char *kTTValueKinds = "tl.tt.value_kinds";
 enum class TTTilesStage : int {
   kFrontend = 0,
   kStructured = 1,

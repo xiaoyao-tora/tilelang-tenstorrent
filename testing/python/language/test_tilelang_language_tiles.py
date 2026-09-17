@@ -1,3 +1,5 @@
+import inspect
+
 import pytest
 
 import tilelang
@@ -54,34 +56,67 @@ def test_tiles_buffer_domain_constructs_annotated_serial_loops():
     assert store.value.indices[1].same_as(inner.loop_var)
 
 
-def test_tiles_explicit_domain_and_parallel_false():
+@pytest.mark.parametrize("args", [((32, 32),), ([32, 32],), (32, 32), (tvm.tirx.decl_buffer((32, 32), "float32"),)])
+def test_tiles_parallel_false_is_rejected_before_ir_construction(monkeypatch, args):
+    def unexpected_builder_call(*args, **kwargs):
+        pytest.fail("Unsupported parallel=False reached the IR builder")
+
+    monkeypatch.setattr(tilelang.language.loop._ffi_api, "Tiles", unexpected_builder_call)
+    with pytest.raises(NotImplementedError, match="requires parallel=True"):
+        T.Tiles(*args, parallel=False)
+
+
+def test_tiles_domain_forms_construct_equivalent_ir():
     @T.prim_func
-    def main(A: T.Tensor((4, 8), T.float32), B: T.Tensor((4, 8), T.float32)):
-        for i, j in T.Tiles([4, 8], parallel=False):
+    def from_buffer(A: T.Tensor((64, 128), T.float32), B: T.Tensor((64, 128), T.float32)):
+        for i, j in T.Tiles(B):
             B[i, j] = A[i, j]
 
-    outer, inner = _tiles_loops(main)
-    assert [int(outer.extent), int(inner.extent)] == [4, 8]
-    _assert_tiles_annotations(outer, inner, [4, 8], 0)
-
-
-def test_tiles_preserves_symbolic_and_batch_domains_until_capture():
     @T.prim_func
-    def main(n: T.int32):
-        for batch, i, j in T.Tiles([2, n, 32]):
-            T.evaluate(batch + i + j)
+    def from_list(A: T.Tensor((64, 128), T.float32), B: T.Tensor((64, 128), T.float32)):
+        for i, j in T.Tiles([64, 128]):
+            B[i, j] = A[i, j]
 
-    outer = next(loop for loop in _collect_loops(main) if "tl.tt.tiles_scope" in loop.annotations)
-    domain = outer.annotations["tl.tt.tiles_domain"]
-    assert len(domain) == 3
-    assert int(domain[0]) == 2 and int(domain[2]) == 32
-    assert domain[1].same_as(main.params[0])
-    assert outer.body.extent.same_as(main.params[0])
+    @T.prim_func
+    def from_tuple(A: T.Tensor((64, 128), T.float32), B: T.Tensor((64, 128), T.float32)):
+        for i, j in T.Tiles((64, 128)):
+            B[i, j] = A[i, j]
+
+    @T.prim_func
+    def from_extents(A: T.Tensor((64, 128), T.float32), B: T.Tensor((64, 128), T.float32)):
+        for i, j in T.Tiles(64, 128):
+            B[i, j] = A[i, j]
+
+    for func in (from_list, from_tuple, from_extents):
+        tvm.ir.assert_structural_equal(from_buffer.without_attr("global_symbol"), func.without_attr("global_symbol"))
 
 
-@pytest.mark.parametrize("domain", [[], [4]])
+@pytest.mark.parametrize("scope", ["shared", "shared.dyn", "local.fragment"])
+def test_tiles_buffer_domain_needs_no_allocation_metadata(scope):
+    domain = tvm.tirx.decl_buffer((64, 128), "float32", scope=scope)
+    frame = T.Tiles(domain)
+    assert [int(extent.extent) for extent in frame.doms] == [64, 128]
+
+
+@pytest.mark.parametrize("as_buffer", [False, True])
+def test_tiles_rejects_dynamic_domain(as_buffer):
+    shape = (tvm.tirx.Var("n", "int32"), 32)
+    domain = tvm.tirx.decl_buffer(shape, "float32") if as_buffer else shape
+    with pytest.raises(ValueError, match="compile-time constant"):
+        T.Tiles(domain)
+
+
+def test_tiles_parallel_is_keyword_only():
+    assert inspect.signature(T.Tiles).parameters["parallel"].kind == inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError, match="one Buffer, one tuple/list"):
+        T.Tiles((32, 32), False)
+    with pytest.raises(TypeError, match="scalar integer"):
+        T.Tiles(32, False)
+
+
+@pytest.mark.parametrize("domain", [[], [4], [2, 32, 32]])
 def test_tiles_rejects_unsupported_domain_rank(domain):
-    expected = "non-empty" if not domain else "rank at least 2"
+    expected = "non-empty" if not domain else "rank 2"
     with pytest.raises(ValueError, match=expected):
 
         @T.prim_func
@@ -90,8 +125,8 @@ def test_tiles_rejects_unsupported_domain_rank(domain):
                 T.evaluate(0)
 
 
-def test_tiles_rejects_non_iterable_domain():
-    with pytest.raises(TypeError, match="Buffer or an iterable"):
+def test_tiles_rejects_single_extent_domain():
+    with pytest.raises(ValueError, match="rank 2"):
 
         @T.prim_func
         def main():
@@ -101,8 +136,30 @@ def test_tiles_rejects_non_iterable_domain():
 
 @pytest.mark.parametrize("domain", ["32", b"32", [32, 1.5], [True, 32], [32, None]])
 def test_tiles_rejects_non_integer_domain(domain):
-    with pytest.raises(TypeError, match="iterable|scalar integer"):
+    with pytest.raises(TypeError, match="scalar integer"):
         T.Tiles(domain)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (),
+        (tvm.tirx.decl_buffer((32, 32), "float32"), 32),
+        (32, tvm.tirx.decl_buffer((32, 32), "float32")),
+        ((32, 32), 32),
+        (32, 32, 32),
+        (32, tvm.tirx.Var("n", "int32")),
+        (32, 0),
+        (True, 32),
+    ],
+)
+def test_tiles_invalid_arguments_do_not_create_ir(monkeypatch, args):
+    def unexpected_builder_call(*args, **kwargs):
+        pytest.fail("Invalid domain reached the IR builder")
+
+    monkeypatch.setattr(tilelang.language.loop._ffi_api, "Tiles", unexpected_builder_call)
+    with pytest.raises((TypeError, ValueError)):
+        T.Tiles(*args)
 
 
 @pytest.mark.parametrize("extent", [tvm.tirx.const(True), tvm.tirx.const(32, "float32"), tvm.tirx.Broadcast(32, 2)])

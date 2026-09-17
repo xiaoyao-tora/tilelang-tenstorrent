@@ -1147,6 +1147,417 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
   }
 }
 
+// Reuse the expression/geometry verifier with temporary descriptor IDs. These
+// descriptors are local proof objects, never storage allocations in Device IR.
+using ComputeValueTable = std::map<int64_t, ComputeValueDescriptor>;
+
+void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
+                           const ComputeValueTable &values,
+                           const std::set<int64_t> &defined) {
+  bool local_output = call->op.same_as(compute_value());
+  ffi::String compute_kind = ComputeString(call, "tt.compute_kind");
+  bool scalar_expression = compute_kind == "elementwise" ||
+                           compute_kind == "fill" || compute_kind == "typecast";
+  Check(!local_output || scalar_expression,
+        "compute_value requires an elementwise, fill or typecast expression");
+  Check(
+      scalar_expression || !call->annotations.count("tt.expression"),
+      "non-elementwise Device operation must not carry an ignored expression");
+  DFBTable proof = dfbs;
+  int64_t next = 0;
+  for (const auto &[id, ignored] : proof) {
+    Check(id < std::numeric_limits<int64_t>::max() -
+                   static_cast<int64_t>(values.size()) - 2,
+          "DFB ID overflows compute value verification");
+    next = std::max(next, id + 1);
+  }
+  std::map<int64_t, int64_t> virtual_ids;
+  CoreDomain domain(CoreCoord(0, 0), CoreCoord(1, 1));
+  for (const auto &[id, value] : values) {
+    ffi::Array<PrimExpr> grid;
+    for (const PrimExpr &extent : value->buffer->shape)
+      grid.push_back(
+          Integer(RequireStaticInteger(extent, "value extent") / 32));
+    virtual_ids[id] = next;
+    proof.emplace(next,
+                  DFBDescriptor(next, "compute proof", value->buffer->dtype,
+                                {Integer(32), Integer(32)}, grid, Integer(1),
+                                std::nullopt, "trisc", domain, "trisc", domain,
+                                Integer(1), value->source_span));
+    ++next;
+  }
+  Check(!call->args.empty(), "compute value missing output ID");
+  ffi::Array<PrimExpr> args = call->args;
+  if (local_output) {
+    int64_t id = RequireStaticInteger(args[0], "compute output ID");
+    Check(values.count(id), "compute value references missing descriptor");
+    args.Set(0, Integer(virtual_ids.at(id)));
+  }
+  auto attrs = call->annotations;
+  auto input_attr = attrs.Get("tt.value_inputs");
+  auto maps_attr = attrs.Get("tt.value_access_maps");
+  auto shapes_attr = attrs.Get("tt.value_input_shapes");
+  if (!local_output && !input_attr.has_value() && !maps_attr.has_value() &&
+      !shapes_attr.has_value()) {
+    VerifyGeneralCompute(call, dfbs);
+    return;
+  }
+  Check(input_attr.has_value() && maps_attr.has_value() &&
+            shapes_attr.has_value(),
+        "v7 expression missing compute value input metadata");
+  auto inputs = input_attr.value().as<ffi::Array<Integer>>();
+  Check(inputs.has_value(), "invalid tt.value_inputs");
+  auto maps = CheckedMaps(maps_attr.value());
+  auto shapes = CheckedShapes(shapes_attr.value(), "tt.value_input_shapes");
+  Check(inputs.value().size() == maps.size() && maps.size() == shapes.size(),
+        "compute value input metadata count mismatch");
+  auto all_maps = CheckedMaps(attrs.at("tt.access_maps"));
+  auto all_shapes =
+      CheckedShapes(attrs.at("tt.input_shapes"), "tt.input_shapes");
+  std::set<int64_t> declared;
+  for (size_t i = 0; i < inputs.value().size(); ++i) {
+    int64_t id = inputs.value()[i]->value;
+    Check(values.count(id) && defined.count(id),
+          "compute value use is not dominated by its definition");
+    Check(declared.insert(id).second, "duplicate compute value input");
+    Check(ffi::StructuralEqual()(values.at(id)->buffer->shape, shapes[i]),
+          "compute value input shape disagrees with definition");
+    args.push_back(Integer(virtual_ids.at(id)));
+    all_maps.push_back(maps[i]);
+    all_shapes.push_back(shapes[i]);
+  }
+  ffi::String kind = ComputeString(call, "tt.compute_kind");
+  if (kind == "elementwise" || kind == "typecast" || kind == "fill")
+    for (const auto &map : all_maps)
+      for (size_t axis = 0; axis < map.size(); ++axis)
+        Check(map[axis]->value == -1 ||
+                  map[axis]->value == static_cast<int64_t>(axis),
+              "v7 elementwise access maps require identity or zero-axis "
+              "broadcast");
+  attrs.Set("tt.access_maps", all_maps);
+  attrs.Set("tt.input_shapes", all_shapes);
+  auto expression = attrs.Get("tt.expression");
+  if (expression.has_value()) {
+    class RewriteLoads : public ExprMutator {
+    public:
+      RewriteLoads(const ComputeValueTable &values,
+                   const std::map<int64_t, int64_t> &ids,
+                   const std::set<int64_t> &declared)
+          : values_(values), ids_(ids), declared_(declared) {}
+      PrimExpr VisitExpr_(const CallNode *op) final {
+        if (!op->op.same_as(compute_value_load()))
+          return ExprMutator::VisitExpr_(op);
+        Check(op->args.size() == 1 && op->annotations.empty(),
+              "compute_value_load requires one ID and no annotations");
+        int64_t id = RequireStaticInteger(op->args[0], "compute value load ID");
+        Check(declared_.count(id), "undeclared compute value input");
+        Check(op->dtype == values_.at(id)->buffer->dtype,
+              "compute value load dtype mismatch");
+        return Call(op->dtype, dfb_load(), {Integer(ids_.at(id))});
+      }
+
+    private:
+      const ComputeValueTable &values_;
+      const std::map<int64_t, int64_t> &ids_;
+      const std::set<int64_t> &declared_;
+    } rewrite(values, virtual_ids, declared);
+    auto expr = expression.value().as<PrimExpr>();
+    Check(expr.has_value(), "invalid compute value expression");
+    attrs.Set("tt.expression", rewrite(expr.value()));
+  }
+  VerifyGeneralCompute(
+      Call(call->dtype, dfb_compute(), args, attrs, call->span), proof);
+}
+
+class ComputeValueVerifier {
+public:
+  explicit ComputeValueVerifier(const IRModule &mod) {
+    if (RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr)->value != 7)
+      return;
+    enabled_ = true;
+    auto entries = RequireModuleAttr<ffi::Array<ComputeValueDescriptor>>(
+        mod, kComputeValueTableAttr);
+    Check(!entries.empty(), "v7 requires a nonempty compute value table");
+    std::unordered_map<Var, ComputeValueDescriptor, ffi::ObjectPtrHash,
+                       ffi::ObjectPtrEqual>
+        previous;
+    for (const ComputeValueDescriptor &entry : entries) {
+      Check(entry.defined() && entry->value_id >= 0 &&
+                entry->buffer.defined() && entry->source_span.defined(),
+            "invalid compute value descriptor");
+      Check(values_.emplace(entry->value_id, entry).second,
+            "duplicate compute value ID");
+      Check(entry->buffer.scope() == "local.fragment" &&
+                SupportedComputeDType(entry->buffer->dtype) &&
+                entry->buffer->shape.size() == 2,
+            "compute value requires a rank-2 BF16/FP32 fragment");
+      for (const PrimExpr &extent : entry->buffer->shape) {
+        int64_t n = RequireStaticInteger(extent, "compute value shape");
+        Check(n > 0 && n % 32 == 0,
+              "compute value shape must be positive and tile-aligned");
+      }
+      auto old = previous.find(entry->buffer->data);
+      Check(old == previous.end()
+                ? entry->version == 0 && entry->previous_value_id == -1
+                : entry->buffer.same_as(old->second->buffer) &&
+                      entry->version == old->second->version + 1 &&
+                      entry->previous_value_id == old->second->value_id,
+            "compute value Buffer/version predecessor chain is invalid");
+      previous[entry->buffer->data] = entry;
+      Check(entry->accumulator_id >= -1,
+            "invalid compute value accumulator ID");
+    }
+    auto acc =
+        mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr);
+    if (acc.has_value())
+      for (const AccumulatorDescriptor &entry : acc.value()) {
+        Check(entry.defined() && entry->accumulator_id >= 0 &&
+                  accumulators_.emplace(entry->accumulator_id, entry).second,
+              "invalid or duplicate v7 accumulator descriptor");
+        Check(entry->accumulator_region.defined() &&
+                  entry->accumulator_region->buffer.defined() &&
+                  entry->accumulator_region->buffer.scope() ==
+                      "local.fragment" &&
+                  entry->accumulator_region->buffer->dtype ==
+                      entry->accumulation_dtype &&
+                  entry->full_k_tiles > 0 && entry->source_span.defined() &&
+                  IsSupportedAccumulatorDTypeTriple(entry->input_dtype,
+                                                    entry->accumulation_dtype,
+                                                    entry->output_dtype),
+              "invalid v7 accumulator precision/lifetime descriptor");
+        const auto &region = entry->accumulator_region;
+        Check(region->region.size() == 2 && region->buffer->shape.size() == 2,
+              "v7 accumulator region must have rank two");
+        for (size_t axis = 0; axis < 2; ++axis) {
+          int64_t minimum = RequireStaticInteger(region->region[axis]->min,
+                                                 "accumulator region minimum");
+          int64_t extent = RequireStaticInteger(region->region[axis]->extent,
+                                                "accumulator region extent");
+          Check(
+              minimum == 0 && extent > 0 && extent % 32 == 0 &&
+                  extent == RequireStaticInteger(region->buffer->shape[axis],
+                                                 "accumulator buffer extent"),
+              "v7 accumulator region must cover its full tile-aligned Buffer");
+        }
+      }
+    for (const auto &[id, entry] : values_)
+      Check(entry->accumulator_id == -1 ||
+                accumulators_.count(entry->accumulator_id),
+            "compute value references missing accumulator descriptor");
+  }
+  bool Enabled() const { return enabled_; }
+  const ComputeValueTable &Values() const { return values_; }
+  const ComputeValueDescriptor &Read(int64_t id) const {
+    Check(values_.count(id) && defined_.count(id),
+          "compute value use is not dominated by its definition");
+    return values_.at(id);
+  }
+  std::set<int64_t> Expression(const Call &call, const DFBTable &dfbs) {
+    std::set<int64_t> sources;
+    for (size_t i = 1; i < call->args.size(); ++i)
+      sources.insert(
+          RequireStaticInteger(call->args[i], "expression DFB input"));
+    VerifyValueExpression(call, dfbs, values_, defined_);
+    std::set<int64_t> roots;
+    std::map<int64_t, int64_t> completed_k;
+    auto inputs = call->annotations.Get("tt.value_inputs");
+    if (inputs.has_value()) {
+      for (const Integer &id : Downcast<ffi::Array<Integer>>(inputs.value())) {
+        Read(id->value);
+        const auto &borrowed = sources_.at(id->value);
+        sources.insert(borrowed.begin(), borrowed.end());
+        for (const auto &[root, count] : value_k_.at(id->value)) {
+          roots.insert(root);
+          auto [it, inserted] = completed_k.emplace(root, count);
+          if (!inserted)
+            it->second = std::min(it->second, count);
+          if (!call->op.same_as(compute_value()))
+            Check(count == accumulators_.at(root)->full_k_tiles,
+                  "GEMM output materialization precedes complete K reduction");
+        }
+      }
+    }
+    for (size_t i = 1; i < call->args.size(); ++i) {
+      int64_t input =
+          RequireStaticInteger(call->args[i], "DFB provenance input");
+      auto found = dfb_roots_.find(input);
+      if (found != dfb_roots_.end()) {
+        for (int64_t root : found->second) {
+          roots.insert(root);
+          completed_k.emplace(root, accumulators_.at(root)->full_k_tiles);
+        }
+      }
+    }
+    if (call->op.same_as(compute_value())) {
+      int64_t id = RequireStaticInteger(call->args[0], "compute value output");
+      const auto &entry = values_.at(id);
+      if (roots.empty() && entry->accumulator_id >= 0) {
+        auto acc = accumulators_.at(entry->accumulator_id);
+        auto expression = call->annotations.Get("tt.expression");
+        Check(entry->buffer.same_as(acc->accumulator_region->buffer) &&
+                  ComputeString(call, "tt.compute_kind") == "fill" &&
+                  expression.has_value() &&
+                  (is_zero(Downcast<PrimExpr>(expression.value())) ||
+                   (expression.value().as<FloatImmNode>() &&
+                    expression.value().as<FloatImmNode>()->value == 0)),
+              "accumulator initial value must be a unique zero definition");
+        Check(initialized_.insert(entry->accumulator_id).second,
+              "accumulator has multiple initial definitions");
+        completed_k[entry->accumulator_id] = 0;
+      } else {
+        bool owns_accumulator =
+            entry->accumulator_id >= 0 && roots.count(entry->accumulator_id) &&
+            entry->buffer.same_as(accumulators_.at(entry->accumulator_id)
+                                      ->accumulator_region->buffer);
+        Check(entry->accumulator_id == -1 || owns_accumulator ||
+                  entry->accumulator_id ==
+                      (roots.size() == 1 ? *roots.begin() : -1),
+              "compute value accumulator provenance disagrees with inputs");
+      }
+      if (entry->previous_value_id >= 0) {
+        auto previous = values_.at(entry->previous_value_id);
+        bool previous_owner =
+            previous->accumulator_id >= 0 &&
+            previous->buffer.same_as(accumulators_.at(previous->accumulator_id)
+                                         ->accumulator_region->buffer);
+        if (previous_owner &&
+            (entry->accumulator_id == -1 ||
+             entry->accumulator_id == previous->accumulator_id)) {
+          bool reads_previous = false;
+          if (inputs.has_value())
+            for (const Integer &input :
+                 Downcast<ffi::Array<Integer>>(inputs.value()))
+              reads_previous |= input->value == entry->previous_value_id;
+          Check(
+              reads_previous,
+              "accumulator elementwise update must read its previous version");
+        }
+      }
+      value_k_[id] = completed_k;
+      sources_[id] = sources;
+      Define(id);
+    }
+    if (!call->op.same_as(compute_value())) {
+      dfb_roots_[RequireStaticInteger(call->args[0], "DFB provenance output")] =
+          roots;
+    }
+    return sources;
+  }
+  void Define(int64_t id) {
+    Check(values_.count(id) && defined_.insert(id).second,
+          "compute value definition missing or duplicated");
+    const auto &entry = values_.at(id);
+    Check(entry->previous_value_id == -1 ||
+              defined_.count(entry->previous_value_id),
+          "compute value predecessor is not defined");
+  }
+  std::set<int64_t> Gemm(const Call &call, const DFBTable &dfbs) {
+    Check(call->args.size() == 6 && call->annotations.empty(),
+          "compute_value_gemm requires six IDs/flags without annotations");
+    auto integer = [&](size_t i) {
+      return RequireStaticInteger(call->args[i], "value GEMM operand");
+    };
+    int64_t out = integer(0), lhs = integer(1), rhs = integer(2),
+            old = integer(3);
+    Check(values_.count(out) && dfbs.count(lhs) && dfbs.count(rhs),
+          "value GEMM references missing operand");
+    auto value = values_.at(out);
+    Check(accumulators_.count(value->accumulator_id),
+          "value GEMM has no accumulator provenance");
+    const auto &acc = accumulators_.at(value->accumulator_id);
+    Check(value->buffer.same_as(acc->accumulator_region->buffer) &&
+              value->buffer->dtype == acc->accumulation_dtype,
+          "value GEMM accumulator identity or dtype mismatch");
+    Check(old >= 0 && Read(old)->buffer.same_as(value->buffer) &&
+              value->previous_value_id == old &&
+              Read(old)->accumulator_id == value->accumulator_id,
+          "value GEMM update must consume its previous accumulator version");
+    auto a = dfbs.at(lhs), b = dfbs.at(rhs);
+    Check(a->element_dtype == acc->input_dtype &&
+              b->element_dtype == acc->input_dtype,
+          "value GEMM input dtype mismatch");
+    int64_t ta = integer(4), tb = integer(5);
+    Check((ta == 0 || ta == 1) && (tb == 0 || tb == 1) &&
+              a->block_shape_in_tiles.size() == 2 &&
+              b->block_shape_in_tiles.size() == 2,
+          "value GEMM transpose/rank mismatch");
+    auto size = [&](const PrimExpr &e) {
+      return RequireStaticInteger(e, "value GEMM shape");
+    };
+    int64_t k = size(a->block_shape_in_tiles[ta ? 0 : 1]);
+    Check(k == size(b->block_shape_in_tiles[tb ? 1 : 0]) &&
+              size(a->block_shape_in_tiles[ta ? 1 : 0]) * 32 ==
+                  size(value->buffer->shape[0]) &&
+              size(b->block_shape_in_tiles[tb ? 0 : 1]) * 32 ==
+                  size(value->buffer->shape[1]),
+          "value GEMM M/N/K mismatch");
+    Check(k > 0 && k_tiles_[value->accumulator_id] <= acc->full_k_tiles - k,
+          "value GEMM updates exceed full K");
+    Check(value_k_.at(old).count(value->accumulator_id) &&
+              value_k_.at(old).at(value->accumulator_id) ==
+                  k_tiles_[value->accumulator_id],
+          "value GEMM uses a stale K accumulator version");
+    k_tiles_[value->accumulator_id] += k;
+    value_k_[out] = value_k_.at(old);
+    value_k_[out][value->accumulator_id] = k_tiles_[value->accumulator_id];
+    sources_[out] = sources_.at(old);
+    sources_[out].insert(lhs);
+    sources_[out].insert(rhs);
+    Define(out);
+    return sources_.at(out);
+  }
+  std::set<int64_t> Store(const Call &call, const DFBTable &dfbs) {
+    Check(
+        call->args.size() == 2 && call->annotations.empty(),
+        "compute_value_store requires a value and DFB ID without annotations");
+    auto value =
+        Read(RequireStaticInteger(call->args[0], "stored compute value"));
+    int64_t id = RequireStaticInteger(call->args[1], "materialization DFB");
+    Check(dfbs.count(id), "compute value store references missing DFB");
+    Check(value->buffer->dtype == dfbs.at(id)->element_dtype,
+          "compute value materialization must preserve dtype");
+    VerifyTileGrid(value->buffer->shape, dfbs.at(id)->block_shape_in_tiles,
+                   "compute value store");
+    for (const auto &[root, count] : value_k_.at(value->value_id)) {
+      Check(count == accumulators_.at(root)->full_k_tiles,
+            "GEMM materialization precedes complete K reduction");
+      dfb_roots_[id].insert(root);
+    }
+    return sources_.at(value->value_id);
+  }
+  void Export(int64_t id, DataType dtype) const {
+    auto found = dfb_roots_.find(id);
+    if (found == dfb_roots_.end())
+      return;
+    for (int64_t root : found->second)
+      Check(accumulators_.at(root)->output_dtype == dtype,
+            "GEMM final output dtype disagrees with accumulator capability "
+            "registry");
+  }
+  void Finish() const {
+    if (!enabled_)
+      return;
+    Check(defined_.size() == values_.size(),
+          "unused or undefined compute value descriptor");
+    for (const auto &[id, acc] : accumulators_) {
+      auto it = k_tiles_.find(id);
+      Check(it != k_tiles_.end() && it->second == acc->full_k_tiles,
+            "value GEMM lifetime does not contain complete full-K updates");
+    }
+  }
+
+private:
+  bool enabled_{false};
+  ComputeValueTable values_;
+  std::map<int64_t, AccumulatorDescriptor> accumulators_;
+  std::map<int64_t, int64_t> k_tiles_;
+  std::set<int64_t> defined_;
+  std::set<int64_t> initialized_;
+  std::map<int64_t, std::map<int64_t, int64_t>> value_k_;
+  std::map<int64_t, std::set<int64_t>> sources_;
+  std::map<int64_t, std::set<int64_t>> dfb_roots_;
+};
+
 // Schema v3 preserves immutable DFB generations while assigning generations
 // from the same lexical write to a bounded storage pool.  These identities are
 // intentionally independent: waiting publishes readiness, releasing returns
@@ -1302,6 +1713,8 @@ PipelineResources VerifyPipelineResources(const IRModule &mod,
 void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
                           const DFBTable &dfbs) {
   PipelineResources pipeline = VerifyPipelineResources(mod, dfbs);
+  ComputeValueVerifier values(mod);
+  bool value_program = values.Enabled();
   bool accumulators =
       RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr)->value == 5;
   std::unordered_map<int64_t, AccumulatorDescriptor> accumulator_table;
@@ -1319,8 +1732,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
   for (const auto &[global, base] : mod->functions)
     has_loop |= Downcast<PrimFunc>(base)->body.as<ForNode>() != nullptr;
   if (has_loop) {
-    Check(!accumulators,
-          "schema v5 requires statically expanded serial K updates");
+    Check(!accumulators && !value_program,
+          "schema v5/v7 requires statically expanded serial K updates");
     Check(!pipeline.enabled,
           "pipeline Device IR must contain explicit scheduled operations");
     ffi::Optional<For> boundary;
@@ -1444,11 +1857,11 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
       Check(RequireStaticInteger(backing->byte_offset, "backing byte offset") ==
                 0,
             "Phase 4 backing offset must be zero");
-      Check(
-          dfb->element_dtype == tensor->dtype &&
-              (accumulators || ffi::StructuralEqual()(dfb->block_shape_in_tiles,
-                                                      tensor->tile_grid_shape)),
-          "DFB Tensor backing metadata mismatch");
+      Check(dfb->element_dtype == tensor->dtype &&
+                (accumulators || value_program ||
+                 ffi::StructuralEqual()(dfb->block_shape_in_tiles,
+                                        tensor->tile_grid_shape)),
+            "DFB Tensor backing metadata mismatch");
     }
   }
   for (const auto &[global, base] : mod->functions) {
@@ -1500,7 +1913,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
               "DFB use must be preceded by dfb_wait in consumer slot");
         Check(dfbs.at(id)->consumer_slot == slot,
               "DFB consumer slot metadata mismatch");
-        Check(!pipeline.enabled || !releases.count(id),
+        Check(!(pipeline.enabled || value_program) || !releases.count(id),
               "DFB use after release risks overwritten data");
         ++use_count[id];
         uses[id].push_back(event);
@@ -1526,7 +1939,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
                 "DFB generation reserved more than once");
         } else {
           Check(dfbs.at(id)->consumer_slot == slot, "DFB wait in wrong slot");
-          Check(!pipeline.enabled || !releases.count(id),
+          Check(!(pipeline.enabled || value_program) || !releases.count(id),
                 "DFB wait after release risks overwritten data");
           waited.insert(id);
         }
@@ -1541,7 +1954,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
               "DFB copy completed more than once");
         if (events[copy_issues.at(id)].call->op.same_as(tensor_to_dfb_nd()))
           publish(id);
-      } else if (pipeline.enabled && call->op.same_as(dfb_release())) {
+      } else if ((pipeline.enabled || value_program) &&
+                 call->op.same_as(dfb_release())) {
         Check(call->args.size() == 2 &&
                   RequireStaticInteger(call->args[1], "release count") == 1,
               "dfb_release must release one transaction");
@@ -1583,9 +1997,31 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
           logical_shapes[id_at(1)] = shape;
           publish(id_at(1));
         }
+      } else if (value_program && (call->op.same_as(compute_value()) ||
+                                   call->op.same_as(compute_value_gemm()) ||
+                                   call->op.same_as(compute_value_store()))) {
+        Check(slot == "trisc", "compute values cannot cross processor slots");
+        if (call->op.same_as(compute_value())) {
+          for (int64_t id : values.Expression(call, dfbs))
+            read(id);
+        } else if (call->op.same_as(compute_value_gemm())) {
+          for (int64_t id : values.Gemm(call, dfbs))
+            read(id);
+        } else {
+          for (int64_t id : values.Store(call, dfbs))
+            read(id);
+          auto source =
+              values.Read(RequireStaticInteger(call->args[0], "stored value"));
+          logical_shapes[id_at(1)] = source->buffer->shape;
+          publish(id_at(1));
+        }
       } else if (call->op.same_as(dfb_compute())) {
         Check(slot == "trisc", "dfb_compute must execute in trisc");
-        VerifyGeneralCompute(call, dfbs);
+        if (value_program) {
+          for (int64_t id : values.Expression(call, dfbs))
+            read(id);
+        } else
+          VerifyGeneralCompute(call, dfbs);
         logical_shapes[id_at(0)] = ComputeShape(call, "tt.logical_domain");
         for (size_t i = 1; i < call->args.size(); ++i) {
           read(id_at(i));
@@ -1611,7 +2047,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
         for (size_t axis = 0; axis < tensor->shape.size(); ++axis) {
           const PrimExpr &start = call->args[2 + 2 * axis];
           const PrimExpr &extent = call->args[3 + 2 * axis];
-          if (accumulators) {
+          if (accumulators || value_program) {
             arith::Analyzer analyzer;
             int64_t begin = RequireStaticInteger(start, "transfer start");
             int64_t size = RequireStaticInteger(extent, "transfer extent");
@@ -1652,11 +2088,12 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
       }
     }
   }
+  values.Finish();
   for (const auto &[id, descriptor] : dfbs) {
     Check(producers.count(id) && reserves.count(id),
           "DFB generation is never published");
     Check(use_count[id] > 0, "DFB generation is never consumed");
-    if (pipeline.enabled) {
+    if (pipeline.enabled || value_program) {
       Check(releases.count(id), "DFB generation is missing release");
       if (copy_issues.count(id))
         Check(copy_completions.count(id),
@@ -1696,7 +2133,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
   }
   for (const Event &event : events) {
     const Call &call = event.call;
-    if (call->op.same_as(dfb_compute())) {
+    if (call->op.same_as(dfb_compute()) || call->op.same_as(compute_value())) {
       auto shapes = Downcast<ffi::Array<ffi::Array<PrimExpr>>>(
           call->annotations.at("tt.input_shapes"));
       for (size_t i = 1; i < call->args.size(); ++i) {
@@ -1723,6 +2160,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
       }
     } else if (call->op.same_as(dfb_to_tensor_nd())) {
       int64_t id = RequireStaticInteger(call->args[0], "export DFB ID");
+      if (value_program)
+        values.Export(id, dfbs.at(id)->element_dtype);
       ffi::Array<PrimExpr> shape;
       for (size_t axis = 3; axis < call->args.size(); axis += 2)
         shape.push_back(call->args[axis]);
@@ -2410,11 +2849,11 @@ IRModule VerifyModule(IRModule mod) {
   Integer version = RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr);
   Check(version->value == kDeviceIRVersion || version->value == 2 ||
             version->value == 3 || version->value == 4 || version->value == 5 ||
-            version->value == 6,
+            version->value == 6 || version->value == 7,
         "unsupported tt.device_ir_version " + std::to_string(version->value) +
-            "; expected 1, 2, 3, 4, 5, or 6");
+            "; expected 1, 2, 3, 4, 5, 6, or 7");
 
-  Check(version->value == 5 || version->value == 6 ||
+  Check(version->value == 5 || version->value == 6 || version->value == 7 ||
             !mod->attrs->dict.count(kAccumulatorTableAttr),
         "tt.accumulator_table requires Device IR schema v5 or v6");
   if (version->value == 5 ||
@@ -2428,6 +2867,15 @@ IRModule VerifyModule(IRModule mod) {
           kPipelineExtentAttr, "tt.pipeline_wait_policy"})
       Check(!mod->attrs->dict.count(key),
             "schema v5 accumulator pipeline scheduling is unsupported");
+  }
+  Check(version->value == 7 || !mod->attrs->dict.count(kComputeValueTableAttr),
+        "tt.compute_value_table requires Device IR v7");
+  if (version->value == 7) {
+    for (const char *key :
+         {kDFBStorageGroupsAttr, kPipelineRelationsAttr, kPipelineStagesAttr,
+          kPipelineExtentAttr, "tt.pipeline_wait_policy"})
+      Check(!mod->attrs->dict.count(key),
+            "v7 compute values cannot use pipeline metadata");
   }
   Check(version->value == 4 || version->value == 6 ||
             !mod->attrs->dict.count(kPipeTransferTableAttr),
@@ -2466,7 +2914,7 @@ IRModule VerifyModule(IRModule mod) {
   TensorTable tensor_table = VerifyTensorTable(tensors, launch_grid, general);
   DFBTable dfb_table = VerifyDFBTable(dfbs, tensor_table, launch_grid, general);
   VerifyPipeTable(pipes, dfb_table, launch_grid);
-  if (version->value < 3 || version->value == 5)
+  if (version->value < 3 || version->value == 5 || version->value == 7)
     VerifyLegacyL1Budget(mod, dfb_table);
   if (version->value == 4 || version->value == 6) {
     VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr, true,
@@ -2501,7 +2949,7 @@ IRModule VerifyModule(IRModule mod) {
     Check(compute || !requirements.has_value(),
           "data movement kernel must not carry tt.compute_requirements");
     if (compute && (version->value == 5 || version->value == 6 ||
-                    requirements.has_value())) {
+                    version->value == 7 || requirements.has_value())) {
       Check(requirements.has_value(),
             "schema v5 compute kernel missing tt.compute_requirements");
       ComputeRequirements expected = DeriveComputeRequirements(mod, func);

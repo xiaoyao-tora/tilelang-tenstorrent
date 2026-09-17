@@ -58,6 +58,11 @@ TVM_DLL const Op &tile_add();
 TVM_DLL const Op &tile_compute();
 TVM_DLL const Op &dfb_compute();
 TVM_DLL const Op &dfb_load();
+// Schema v7 immutable compute-local definitions, references and stores.
+TVM_DLL const Op &compute_value();
+TVM_DLL const Op &compute_value_load();
+TVM_DLL const Op &compute_value_store();
+TVM_DLL const Op &compute_value_gemm();
 // Schema v5: init(id), update(lhs, rhs, id, transpose_a, transpose_b),
 // materialize(id, output_dfb). Materialization is the sole narrowing point.
 TVM_DLL const Op &accumulator_init();

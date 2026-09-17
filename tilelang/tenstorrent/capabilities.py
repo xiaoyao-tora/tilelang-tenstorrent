@@ -41,9 +41,9 @@ def gemm_capability(
         return GemmCapability(False, False, False, False, f"Unsupported architecture {arch!r}")
     if not is_supported_accumulator_dtype_triple(input_dtype, accumulation_dtype, output_dtype):
         return GemmCapability(False, False, False, False, "Dtype triple is not supported by the native accumulator contract")
-    if ir_version != 5 or pipelined or multicore or rank != 2 or tuple(tile_shape) != (32, 32):
+    if ir_version not in (5, 7) or pipelined or multicore or rank != 2 or tuple(tile_shape) != (32, 32):
         return GemmCapability(
-            False, False, False, False, "Accumulator Lower requires v5, single Core, static rank-2 32x32 tiles without pipelines"
+            False, False, False, False, "Accumulator Lower requires v5/v7, single Core, static rank-2 32x32 tiles without pipelines"
         )
     if update_count < 1:
         return GemmCapability(False, False, False, False, "Accumulator requires at least one update")

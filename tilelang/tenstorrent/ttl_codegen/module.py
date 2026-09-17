@@ -11,6 +11,7 @@ from tvm import tirx
 
 from .attributes import attach_function_attributes
 from .bindings import load_bindings
+from .expression import ExpressionEmitter, check_expression
 
 
 def _calls(body):
@@ -29,10 +30,36 @@ def _kind(call):
     return str(call.annotations["tt.compute_kind"].value)
 
 
+def _zero_fill(call):
+    if call is None or call.op.name != "tl.tt.compute_value" or _kind(call) != "fill":
+        return False
+    expression = call.annotations["tt.expression"]
+    while isinstance(expression, tirx.Cast):
+        expression = expression.value
+    return isinstance(expression, (tirx.IntImm, tirx.FloatImm)) and expression.value == 0
+
+
+def _check_broadcast_requirements(call, requirements, dfbs, values):
+    if requirements is None or str(requirements.destination_width) != "bits32_required":
+        return
+    sources = [
+        (str(dfbs[int(index)].element_dtype), axes) for index, axes in zip(call.args[1:], call.annotations.get("tt.access_maps", []))
+    ]
+    sources.extend(
+        (str(values[int(index)].buffer.dtype), axes)
+        for index, axes in zip(call.annotations.get("tt.value_inputs", []), call.annotations.get("tt.value_access_maps", []))
+    )
+    if any(dtype == "bfloat16" and any(int(axis) == -1 for axis in axes) for dtype, axes in sources):
+        raise NotImplementedError(
+            "Pinned TT-Lang cannot lower BF16 row/column/scalar broadcast with the kernel's required 32-bit destination; "
+            "broadcast LLKs require 16-bit destination for BF16 inputs on wormhole_b0 and blackhole"
+        )
+
+
 def check_capability(mod):
     """Reject unsupported semantics before importing the optional compiler."""
     version = int(mod.attrs["tt.device_ir_version"])
-    if version not in (1, 2, 5):
+    if version not in (1, 2, 5, 7):
         raise NotImplementedError("TTL mapping for Device pipelines and multicore programs (v3/v4) is not implemented")
     grid = mod.attrs["tt.launch_grid"]
     if (int(grid.x), int(grid.y)) != (1, 1):
@@ -45,6 +72,8 @@ def check_capability(mod):
     for dfb in mod.attrs["tt.dfb_table"]:
         if str(dfb.element_dtype) not in ("bfloat16", "float32") or len(dfb.block_shape_in_tiles) != 2:
             raise NotImplementedError("TTL emitter requires rank-2 BF16/FP32 DFB blocks")
+    dfbs = {int(d.dfb_id): d for d in mod.attrs["tt.dfb_table"]}
+    values = {int(d.value_id): d for d in mod.attrs.get("tt.compute_value_table", [])}
     supported = {
         "tl.tt.dfb_reserve",
         "tl.tt.dfb_wait",
@@ -57,11 +86,15 @@ def check_capability(mod):
         "tl.tt.accumulator_init",
         "tl.tt.gemm_update",
         "tl.tt.accumulator_materialize",
+        "tl.tt.compute_value",
+        "tl.tt.compute_value_store",
+        "tl.tt.compute_value_gemm",
+        "tl.tt.dfb_release",
     }
-    if version == 5:
+    if version in (5, 7):
         from ..capabilities import gemm_capability
 
-        for descriptor in mod.attrs["tt.accumulator_table"]:
+        for descriptor in mod.attrs.get("tt.accumulator_table", []):
             capability = gemm_capability(
                 str(descriptor.input_dtype),
                 str(descriptor.accumulation_dtype),
@@ -73,21 +106,17 @@ def check_capability(mod):
     for function in mod.functions.values():
         calls = list(_calls(function.body))
         updates = Counter()
+        definitions = {}
         requirements = function.attrs.get("tt.compute_requirements")
         for call in calls:
             name = call.op.name
             if name not in supported:
                 raise NotImplementedError(f"TTL emitter has no mapping for Device operation {name}")
-            if name == "tl.tt.dfb_compute":
+            if name in ("tl.tt.dfb_compute", "tl.tt.compute_value"):
                 kind = _kind(call)
-                if kind == "elementwise":
-                    expr = call.annotations["tt.expression"]
-                    if not isinstance(expr, tirx.Add) or not all(
-                        isinstance(value, tirx.Call) and value.op.name == "tl.tt.dfb_load" for value in (expr.a, expr.b)
-                    ):
-                        raise NotImplementedError("TTL elementwise consumer currently supports direct Add only")
-                    if any([int(axis) for axis in axes] != [0, 1] for axes in call.annotations["tt.access_maps"]):
-                        raise NotImplementedError("TTL Add broadcast mapping is not implemented")
+                if kind in ("elementwise", "fill", "typecast", "copy") and "tt.expression" in call.annotations:
+                    check_expression(call.annotations["tt.expression"])
+                    _check_broadcast_requirements(call, requirements, dfbs, values)
                 elif kind == "gemm":
                     if not int(call.annotations["tt.clear"]) or int(call.annotations["tt.transpose_a"]):
                         raise NotImplementedError("TTL legacy GEMM requires clear=True and transpose_a=False")
@@ -99,6 +128,14 @@ def check_capability(mod):
                 if int(call.args[3]):
                     raise NotImplementedError("TTL accumulator GEMM transpose_a mapping is not implemented")
                 updates[int(call.args[2])] += 1
+            if name == "tl.tt.compute_value_gemm":
+                _check_gemm_requirements(requirements)
+                if int(call.args[4]):
+                    raise NotImplementedError("TTL accumulator GEMM transpose_a mapping is not implemented")
+                if int(call.args[3]) >= 0 and not _zero_fill(definitions.get(int(call.args[3]))):
+                    raise NotImplementedError("TTL multiple updates need a verified persistent-DST schedule")
+            if name in ("tl.tt.compute_value", "tl.tt.compute_value_gemm"):
+                definitions[int(call.args[0])] = call
         if any(count != 1 for count in updates.values()):
             raise NotImplementedError(
                 "TTL accumulator mapping currently requires one complete-K GEMM update; "
@@ -150,6 +187,7 @@ class _Emitter:
         self.dfbs = {int(d.dfb_id): d for d in mod.attrs["tt.dfb_table"]}
         self.tensors = {int(t.global_arg_index): t for t in mod.attrs["tt.tensor_table"]}
         self.types = {index: self.block_type(d) for index, d in self.dfbs.items()}
+        self.value_descriptors = {int(d.value_id): d for d in mod.attrs.get("tt.compute_value_table", [])}
 
     def tile_type(self, dtype, tile_shape):
         dtype = {"bfloat16": self.b.ttcore.DataType.BFloat16, "float32": self.b.ttcore.DataType.Float32}[str(dtype)]
@@ -183,6 +221,7 @@ class _Emitter:
         block = operation.add_entry_block()
         self.args = dict(zip(indices, block.arguments))
         self.cbs, self.values, self.reserved, self.accumulators = {}, {}, {}, {}
+        self.compute_values = {}
         calls = list(_calls(function.body))
         slot = str(function.attrs["tt.kernel_slot"])
         with ir.InsertionPoint(block):
@@ -238,9 +277,8 @@ class _Emitter:
             self.store(args[2], ttl.add(self.values[args[0]], self.values[args[1]]))
         elif name == "tl.tt.dfb_compute":
             kind = _kind(call)
-            if kind == "elementwise":
-                expr = call.annotations["tt.expression"]
-                value = ttl.add(self.values[int(expr.a.args[0])], self.values[int(expr.b.args[0])])
+            if kind in ("elementwise", "fill", "typecast", "copy") and "tt.expression" in call.annotations:
+                value = ExpressionEmitter(self, call, self.types[args[0]]).emit(call.annotations["tt.expression"])
             elif kind == "gemm":
                 value = ttl.matmul(
                     self.types[args[0]],
@@ -260,6 +298,19 @@ class _Emitter:
             self.accumulators[args[2]] = ttl.matmul(result_type, self.values[args[0]], self.values[args[1]], transpose_rhs=bool(args[4]))
         elif name == "tl.tt.accumulator_materialize":
             self.store(args[1], self.accumulators[args[0]])
+        elif name == "tl.tt.compute_value":
+            buffer = self.value_descriptors[args[0]].buffer
+            result_type = ir.RankedTensorType.get([int(size) // 32 for size in buffer.shape], self.tile_type(buffer.dtype, (32, 32)))
+            self.compute_values[args[0]] = ExpressionEmitter(self, call, result_type).emit(call.annotations["tt.expression"])
+        elif name == "tl.tt.compute_value_store":
+            self.store(args[1], self.compute_values[args[0]])
+        elif name == "tl.tt.compute_value_gemm":
+            buffer = self.value_descriptors[args[0]].buffer
+            result_type = ir.RankedTensorType.get([int(size) // 32 for size in buffer.shape], self.types[args[1]].element_type)
+            self.compute_values[args[0]] = ttl.matmul(result_type, self.values[args[1]], self.values[args[2]], transpose_rhs=bool(args[5]))
+        elif name == "tl.tt.dfb_release":
+            # TT-Lang acquire/release analysis emits the physical pop from SSA uses.
+            self.values.pop(args[0], None)
 
     def store(self, dfb, value):
         self.b.ttl.store(value, self.reserved[dfb])

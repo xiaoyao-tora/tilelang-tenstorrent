@@ -116,6 +116,18 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
                      "bfloat16 and float32");
   }
 
+  if (kind == "compute_fragment") {
+    if (rank != 2 || metadata->dfb_block_count.has_value() ||
+        metadata->tensor_backing.has_value())
+      ThrowUnsupported("compute fragment requires rank-2 geometry without DFB "
+                       "storage metadata");
+    for (size_t axis = 0; axis < rank; ++axis)
+      if (RequireStaticExtent(buffer->shape[axis], buffer_id, axis) % 32 != 0)
+        ThrowUnsupported(
+            "compute fragment shape requires a padding/mask contract");
+    // Infer compute geometry only; no DFB capacity or backing is synthesized.
+  }
+
   ffi::Array<PrimExpr> tile_shape = metadata->tile_shape;
   ffi::String tile_shape_origin = metadata->tile_shape_origin;
   if (tile_shape.empty()) {
@@ -213,20 +225,6 @@ PrimFunc InferLayout(PrimFunc func) {
   bool changed = false;
   ffi::Array<TTBufferMetadata> inferred;
   for (const TTBufferMetadata &metadata : table.value()) {
-    if (metadata->kind == "compute_fragment") {
-      bool verified_accumulator = false;
-      auto requirements =
-          func->GetAttr<ffi::Array<ffi::Map<ffi::String, ffi::ObjectRef>>>(
-              "tt.gemm_accumulator_requirements");
-      if (requirements.has_value())
-        for (const auto &requirement : requirements.value())
-          verified_accumulator |=
-              Downcast<Buffer>(requirement.at("accumulator"))
-                  .same_as(metadata->buffer);
-      if (!verified_accumulator)
-        ThrowUnsupported(
-            "compute fragment layout requires a verified GEMM accumulator");
-    }
     inferred.push_back(InferOne(metadata, &changed));
   }
   if (!changed) {

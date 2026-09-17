@@ -31,6 +31,7 @@ using Metadata =
 using Allocations =
     std::unordered_map<Var, Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 using AxisMaps = Map<Var, Array<Integer>>;
+using ValueKinds = Map<Var, String>;
 
 [[noreturn]] void ThrowElementwiseError(const std::string &message) {
   TVM_FFI_THROW(ValueError) << "Tenstorrent elementwise: " << message;
@@ -44,6 +45,15 @@ int64_t Static(const PrimExpr &expr, const std::string &field) {
 void Require(bool condition, const std::string &message) {
   if (!condition)
     ThrowElementwiseError(message);
+}
+
+String GetValueKind(const Buffer &buffer) {
+  if (buffer.scope() == "shared" || buffer.scope() == "shared.dyn")
+    return "shared_dfb";
+  Require(buffer.scope() == "local.fragment",
+          "buffer '" + std::string(buffer->name) +
+              "' must have shared, shared.dyn or local.fragment scope");
+  return "compute_fragment";
 }
 
 bool HasFrontendTilesAnnotations(const Entries &annotations) {
@@ -61,7 +71,8 @@ bool HasStructuredComputeAnnotations(const Entries &annotations) {
          annotations.count(kTTBlockShape) ||
          annotations.count(kTTIteratorTypes) ||
          annotations.count(kTTAccessMaps) ||
-         annotations.count(kTTBroadcastRecipes);
+         annotations.count(kTTBroadcastRecipes) ||
+         annotations.count(kTTValueKinds);
 }
 
 class AllocationCollector : public StmtVisitor {
@@ -153,6 +164,8 @@ public:
       auto values = domain.value().as<Array<PrimExpr>>();
       Require(values.has_value(), "logical domain must be an Array of extents");
       plan.domain = values.value();
+      Require(plan.domain.size() == 2,
+              "explicit T.Tiles logical domain must have rank 2");
     }
     Stmt body = root;
     for (size_t axis = 0;
@@ -194,6 +207,13 @@ public:
       }
       Require(plan.domain.size() >= 2 || !tiles,
               "logical domain must have rank at least 2");
+      // Check the original extent before arithmetic proof: simplifying an
+      // expression such as effectful_call() * 0 + N would erase its effects
+      // when the logical loop binders are removed.
+      Require(!loop->extent.dtype().is_bool(),
+              "loop extent must be an integer constant, not bool");
+      Require(Static(loop->extent, "loop extent") > 0,
+              "loop extent must be positive");
       Require(analyzer_.CanProveEqual(loop->extent, plan.domain[axis]),
               "loop extent disagrees with domain");
       plan.variables.push_back(loop->loop_var);
@@ -216,6 +236,10 @@ public:
             "store expression dtype mismatch");
     RecordAccess(plan, store->buffer, store->indices, false);
     AnalyzeExpression(plan, store->value);
+    // Storage metadata belongs to the actual effects, never to the Buffer
+    // that merely supplied the frontend domain shape.
+    for (const Access &access : plan.accesses)
+      ValidateBuffer(access.buffer, access.axes, plan.domain);
     return plan;
   }
 
@@ -260,9 +284,7 @@ private:
               "buffer storage strides must be static and cannot reference loop "
               "variables");
     }
-    Require(buffer.scope() == "shared" || buffer.scope() == "shared.dyn",
-            "buffer '" + std::string(buffer->name) +
-                "' must have shared scope");
+    String value_kind = GetValueKind(buffer);
     Require(buffer->shape.size() == domain.size(),
             "buffer shape must match logical domain rank");
     Require(buffer->dtype.lanes() == 1,
@@ -296,6 +318,21 @@ private:
                   "shape");
     }
     auto record = allocation_.metadata.find(buffer->data);
+    if (value_kind == "compute_fragment") {
+      Require(domain.size() == 2,
+              "fragment elementwise computation requires a rank-2 domain");
+      // Fragment storage is a compute-local value. Its geometry uses the
+      // target's 32x32 compute tile, without manufacturing a DFB allocation.
+      if (record != allocation_.metadata.end()) {
+        for (const char *key :
+             {"tt.tile_shape", "tt.dfb_block_count", "tt.tensor_backed"}) {
+          Require(!record->second.count(key),
+                  "fragment buffer '" + std::string(buffer->name) +
+                      "' cannot carry DFB allocation metadata " + key);
+        }
+      }
+      return;
+    }
     if (record == allocation_.metadata.end()) {
       Require(!require_metadata_,
               "buffer is missing Tenstorrent allocation metadata");
@@ -348,7 +385,6 @@ private:
         Reject("access indices in buffer '" + std::string(buffer->name) +
                "' must be identity or zero-axis broadcast in Phase 1");
     }
-    ValidateBuffer(buffer, axes, plan.domain);
     for (Access &access : plan.accesses) {
       if (access.buffer->data.same_as(buffer->data)) {
         Require(access.buffer.same_as(buffer),
@@ -455,6 +491,7 @@ private:
 SBlockRealize ApplyPlan(const ScopePlan &plan) {
   Array<BufferRegion> reads, writes;
   AxisMaps maps;
+  ValueKinds value_kinds;
   Map<Var, Map<String, ffi::Any>> recipes;
   for (const Access &access : plan.accesses) {
     Array<Range> ranges;
@@ -479,6 +516,7 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
     if (access.write)
       writes.push_back(region);
     maps.Set(access.buffer->data, access.axes);
+    value_kinds.Set(access.buffer->data, GetValueKind(access.buffer));
     if (!broadcast_axes.empty()) {
       String kind =
           plan.domain.size() == 2
@@ -511,6 +549,7 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
       {kTTBlockShape, block_shape},
       {kTTIteratorTypes, iterator_types},
       {kTTAccessMaps, maps},
+      {kTTValueKinds, value_kinds},
       {kTTBroadcastRecipes, recipes}};
   TemplateBuilder builder;
   SBlock block({}, reads, writes, "tl.tt.elementwise", builder(plan.store),
@@ -641,13 +680,17 @@ public:
             "allocations");
     for (const char *key :
          {kTTComputeKind, kTTTilesStage, kTTLogicalDomain, kTTPhysicalTileShape,
-          kTTBlockShape, kTTIteratorTypes, kTTAccessMaps,
-          kTTBroadcastRecipes}) {
+          kTTBlockShape, kTTIteratorTypes, kTTAccessMaps, kTTBroadcastRecipes,
+          kTTValueKinds}) {
       Require(op->annotations.count(key),
               std::string("structured block missing metadata ") + key);
     }
     auto domain = op->annotations.at(kTTLogicalDomain).as<Array<PrimExpr>>();
     auto maps = op->annotations.at(kTTAccessMaps).as<AxisMaps>();
+    auto value_kinds = op->annotations.at(kTTValueKinds).as<ValueKinds>();
+    Require(value_kinds.has_value(),
+            "invalid structured tl.tt.value_kinds schema: expected "
+            "Map<Var, String> keyed by Buffer data identity");
     Require(
         domain.has_value() && domain.value().size() >= 2 && maps.has_value(),
         "invalid structured tl.tt.logical_domain or tl.tt.access_maps schema");

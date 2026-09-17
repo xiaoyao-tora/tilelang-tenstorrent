@@ -223,20 +223,21 @@ def test_reduction_rejects_unsupported_kind():
 
 
 @T.prim_func
-def batch_tiles(A: T.Tensor((2, 64, 64), "float32"), B: T.Tensor((1, 32, 64), "float32"), C: T.Tensor((2, 64, 64), "float32")):
+def batch_nested_parallel(A: T.Tensor((2, 64, 64), "float32"), B: T.Tensor((1, 32, 64), "float32"), C: T.Tensor((2, 64, 64), "float32")):
     with T.Kernel(1, 1, threads=1):
         a = shared((2, 64, 64))
         b = shared((1, 32, 64))
         c = shared((2, 64, 64))
         T.copy(A, a)
         T.copy(B, b)
-        for k, i, j in T.Tiles((2, 64, 64)):
-            c[k, i, j] = a[k, i, j] - b[0, 0, j]
+        for k in T.Parallel(2):
+            for i, j in T.Parallel(64, 64):
+                c[k, i, j] = a[k, i, j] - b[0, 0, j]
         T.copy(c, C)
 
 
-def test_batch_tiles_parallel_same_device_selection():
-    left, right = (calls(legalize(func))[0] for func in (batch_elementwise, batch_tiles))
+def test_batch_flat_and_nested_parallel_same_device_selection():
+    left, right = (calls(legalize(func))[0] for func in (batch_elementwise, batch_nested_parallel))
     assert ir.structural_equal(left, right, map_free_vars=True)
     assert [[int(axis) for axis in axes] for axes in left.annotations["tt.access_maps"]] == [[0, 1, 2], [-1, -1, 2]]
 

@@ -3,6 +3,7 @@
 
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -39,6 +40,76 @@ ffi::String StringAnnotation(const Call &call, const char *key) {
 
 ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
                                               const tirx::PrimFunc &func) {
+  if (mod->GetAttr<Integer>(kDeviceIRVersionAttr).value_or(Integer(0))->value ==
+      7) {
+    auto values = mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
+        kComputeValueTableAttr);
+    Check(values.has_value(), "v7 missing compute value table");
+    if (func->GetAttr<ffi::String>(kKernelSlotAttr).value_or("") != "trisc")
+      return ComputeRequirements("unconstrained", "allowed", {});
+    std::map<int64_t, ComputeValueDescriptor> by_id;
+    bool requires_fp32 = false;
+    for (const auto &value : values.value()) {
+      Check(value.defined() && value->buffer.defined() &&
+                by_id.emplace(value->value_id, value).second,
+            "invalid or duplicate compute value descriptor");
+      requires_fp32 |= value->buffer->dtype == DataType::Float(32);
+    }
+    std::map<int64_t, AccumulatorDescriptor> accumulators;
+    auto table =
+        mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr);
+    if (table.has_value())
+      for (const auto &entry : table.value()) {
+        Check(entry.defined() &&
+                  accumulators.emplace(entry->accumulator_id, entry).second,
+              "invalid or duplicate accumulator descriptor");
+      }
+    std::set<int64_t> used;
+    PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
+      const auto *call = node.as<CallNode>();
+      if (call && (call->op.same_as(compute_value()) ||
+                   call->op.same_as(dfb_compute()))) {
+        auto expression = call->annotations.Get("tt.expression");
+        if (expression.has_value()) {
+          auto expr = expression.value().as<PrimExpr>();
+          Check(expr.has_value(), "invalid compute precision expression");
+          PostOrderVisit(expr.value(), [&](const ffi::ObjectRef &item) {
+            if (auto value = item.as<PrimExpr>())
+              requires_fp32 |= value.value().dtype() == DataType::Float(32);
+          });
+        }
+      }
+      if (!call || !call->op.same_as(compute_value_gemm()))
+        return;
+      Check(call->args.size() == 6, "value GEMM arity mismatch");
+      int64_t id = IntegerValue(call->args[0]);
+      Check(by_id.count(id) && accumulators.count(by_id.at(id)->accumulator_id),
+            "value GEMM references missing accumulator");
+      used.insert(by_id.at(id)->accumulator_id);
+    });
+    ffi::Array<AccumulatorDescriptor> requirements;
+    ffi::String full = "allowed",
+                width = requires_fp32 ? "bits32_required" : "unconstrained";
+    for (int64_t id : used) {
+      auto acc = accumulators.at(id);
+      Check(IsSupportedAccumulatorDTypeTriple(
+                acc->input_dtype, acc->accumulation_dtype, acc->output_dtype),
+            "unsupported accumulator dtype triple");
+      bool fp32 = acc->accumulation_dtype == DataType::Float(32);
+      ffi::String next_width = fp32 ? "bits32_required" : "bits16_required";
+      ffi::String next_full = fp32 ? "required" : "forbidden";
+      Check((width == "unconstrained" || width == next_width) &&
+                (full == "allowed" || full == next_full),
+            "conflicting hard destination width requirements in one compute "
+            "kernel");
+      width = next_width;
+      full = next_full;
+      requirements.push_back(acc);
+    }
+    Check(used.size() == accumulators.size(),
+          "unused v7 accumulator descriptor");
+    return ComputeRequirements(width, full, requirements);
+  }
   std::map<int64_t, AccumulatorDescriptor> table;
   auto entries =
       mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr);
@@ -152,6 +223,18 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
   };
   collect(func->body);
   for (const Call &call : calls) {
+    if (call->op.same_as(dfb_compute())) {
+      auto expression = call->annotations.Get("tt.expression");
+      if (expression.has_value()) {
+        auto expr = expression.value().as<PrimExpr>();
+        Check(expr.has_value(), "invalid compute precision expression");
+        PostOrderVisit(expr.value(), [&](const ffi::ObjectRef &node) {
+          if (auto value = node.as<PrimExpr>())
+            if (value.value().dtype() == DataType::Float(32))
+              merge("bits32_required", "allowed");
+        });
+      }
+    }
     bool init = call->op.same_as(accumulator_init());
     bool update = call->op.same_as(gemm_update());
     bool materialize = call->op.same_as(accumulator_materialize());
