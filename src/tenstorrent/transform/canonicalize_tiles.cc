@@ -431,7 +431,28 @@ private:
     TT_BINARY(DivNode)
     TT_BINARY(MinNode)
     TT_BINARY(MaxNode)
+    TT_BINARY(EQNode)
+    TT_BINARY(NENode)
+    TT_BINARY(LTNode)
+    TT_BINARY(LENode)
+    TT_BINARY(GTNode)
+    TT_BINARY(GENode)
+    TT_BINARY(AndNode)
+    TT_BINARY(OrNode)
 #undef TT_BINARY
+    if (const auto *logical_not = expr.as<NotNode>()) {
+      AnalyzeExpression(plan, logical_not->a);
+      return;
+    }
+    if (const auto *select = expr.as<SelectNode>()) {
+      Require(select->condition.dtype().is_bool() &&
+                  select->true_value.dtype() == select->false_value.dtype(),
+              "Select requires a Boolean condition and equal arm dtypes");
+      AnalyzeExpression(plan, select->condition);
+      AnalyzeExpression(plan, select->true_value);
+      AnalyzeExpression(plan, select->false_value);
+      return;
+    }
     if (const auto *call = expr.as<CallNode>()) {
       Require(call->annotations.empty(),
               "Call annotations have no supported template schema");
@@ -557,6 +578,10 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
   return SBlockRealize({}, const_true(), block, plan.span);
 }
 
+Stmt MergeComputeBranch(const IfThenElse &branch,
+                        const AllocationCollector &allocation,
+                        const Array<Var> &scalar_parameters);
+
 class Canonicalizer : public StmtMutator {
 public:
   explicit Canonicalizer(const PrimFunc &func) : func_(func) {
@@ -587,6 +612,10 @@ public:
     if (op->annotations.count(kTTComputeKind))
       return ffi::GetRef<Stmt>(op);
     return StmtMutator::VisitStmt_(op);
+  }
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    IfThenElse branch = Downcast<IfThenElse>(StmtMutator::VisitStmt_(op));
+    return MergeComputeBranch(branch, allocation_, scalar_parameters_);
   }
 
 private:
@@ -639,6 +668,95 @@ private:
   AxisMaps maps_;
   Array<Var> variables_;
 };
+
+// If-conversion is safe only for one pure, full-region assignment per arm.
+// It creates a value merge without introducing conditional DFB transactions.
+// Other branches retain their control-flow boundary for later diagnostics.
+Stmt MergeComputeBranch(const IfThenElse &branch,
+                        const AllocationCollector &allocation,
+                        const Array<Var> &scalar_parameters) {
+  if (as_const_int(branch->condition))
+    return branch;
+  auto get_compute = [](const Stmt &stmt) -> ffi::Optional<SBlock> {
+    auto realize = stmt.as<SBlockRealize>();
+    if (!realize.has_value() || !is_one(realize.value()->predicate) ||
+        !realize.value()->iter_values.empty())
+      return std::nullopt;
+    SBlock block = realize.value()->block;
+    if (!block->annotations.count(kTTComputeKind) ||
+        !block->body.as<BufferStoreNode>() || block->init.has_value() ||
+        !block->iter_vars.empty() || !block->alloc_buffers.empty() ||
+        !block->match_buffers.empty())
+      return std::nullopt;
+    return block;
+  };
+  auto then_block = get_compute(branch->then_case);
+  auto else_block = branch->else_case.has_value()
+                        ? get_compute(branch->else_case.value())
+                        : ffi::Optional<SBlock>();
+  bool empty_else = !branch->else_case.has_value();
+  if (branch->else_case.has_value()) {
+    if (const auto *evaluate = branch->else_case.value().as<EvaluateNode>())
+      empty_else = is_zero(evaluate->value);
+  }
+  if (!then_block.has_value() || (!empty_else && !else_block.has_value()))
+    return branch;
+  bool local_condition = true;
+  bool reads_local_value = false;
+  PostOrderVisit(branch->condition, [&](const ffi::ObjectRef &object) {
+    if (const auto *load = object.as<BufferLoadNode>()) {
+      reads_local_value = true;
+      std::string scope = load->buffer.scope();
+      local_condition &= scope == "shared" || scope == "shared.dyn" ||
+                         scope == "local.fragment";
+      for (const PrimExpr &index : load->indices)
+        local_condition &= is_zero(index);
+    }
+  });
+  if (!local_condition || !reads_local_value)
+    return branch;
+
+  Array<PrimExpr> domain = Downcast<Array<PrimExpr>>(
+      then_block.value()->annotations.at(kTTLogicalDomain));
+  BufferStore then_store = Downcast<BufferStore>(then_block.value()->body);
+  if (else_block.has_value()) {
+    BufferStore other = Downcast<BufferStore>(else_block.value()->body);
+    if (!other->buffer.same_as(then_store->buffer) ||
+        !ffi::StructuralEqual()(
+            else_block.value()->annotations.at(kTTLogicalDomain), domain))
+      return branch;
+  }
+  Array<Var> variables;
+  Array<PrimExpr> indices;
+  for (const PrimExpr &extent : domain) {
+    Var variable("tt_merge_axis", extent.dtype());
+    variables.push_back(variable);
+    indices.push_back(variable);
+  }
+  TemplateRestorer then_restorer(
+      Downcast<AxisMaps>(then_block.value()->annotations.at(kTTAccessMaps)),
+      variables);
+  then_store = Downcast<BufferStore>(then_restorer(then_store));
+  PrimExpr otherwise =
+      BufferLoad(then_store->buffer, indices, std::nullopt, branch->span);
+  if (else_block.has_value()) {
+    TemplateRestorer else_restorer(
+        Downcast<AxisMaps>(else_block.value()->annotations.at(kTTAccessMaps)),
+        variables);
+    otherwise =
+        Downcast<BufferStore>(else_restorer(else_block.value()->body))->value;
+  }
+  Stmt merged = BufferStore(
+      then_store->buffer,
+      Select(branch->condition, then_store->value, otherwise, branch->span),
+      indices, std::nullopt, branch->span);
+  for (int axis = static_cast<int>(variables.size()) - 1; axis >= 0; --axis)
+    merged = For(variables[axis], make_zero(variables[axis].dtype()),
+                 domain[axis], ForKind::kParallel, merged, std::nullopt, {},
+                 std::nullopt, branch->span);
+  ScopeAnalyzer analyzer(allocation, false, scalar_parameters);
+  return ApplyPlan(analyzer.Analyze(Downcast<For>(merged), false));
+}
 
 class ComputeVerifier : public StmtVisitor {
 public:

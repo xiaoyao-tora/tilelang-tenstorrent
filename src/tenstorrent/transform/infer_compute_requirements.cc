@@ -53,7 +53,6 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       Check(value.defined() && value->buffer.defined() &&
                 by_id.emplace(value->value_id, value).second,
             "invalid or duplicate compute value descriptor");
-      requires_fp32 |= value->buffer->dtype == DataType::Float(32);
     }
     std::map<int64_t, AccumulatorDescriptor> accumulators;
     auto table =
@@ -67,6 +66,13 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
     std::set<int64_t> used;
     PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
       const auto *call = node.as<CallNode>();
+      if (call && (call->op.same_as(compute_value()) ||
+                   call->op.same_as(compute_value_gemm()))) {
+        Check(!call->args.empty(), "compute value definition missing ID");
+        int64_t id = IntegerValue(call->args[0]);
+        Check(by_id.count(id), "compute value references missing descriptor");
+        requires_fp32 |= by_id.at(id)->buffer->dtype == DataType::Float(32);
+      }
       if (call && (call->op.same_as(compute_value()) ||
                    call->op.same_as(dfb_compute()))) {
         auto expression = call->annotations.Get("tt.expression");
@@ -106,8 +112,6 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       full = next_full;
       requirements.push_back(acc);
     }
-    Check(used.size() == accumulators.size(),
-          "unused v7 accumulator descriptor");
     return ComputeRequirements(width, full, requirements);
   }
   std::map<int64_t, AccumulatorDescriptor> table;

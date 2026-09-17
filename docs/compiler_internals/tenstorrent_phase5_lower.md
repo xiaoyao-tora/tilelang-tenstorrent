@@ -5,6 +5,11 @@ Device IR 和 verifier。Phase 3 继续跳过；TTL Codegen、TTL parser/verifie
 TT-Lang compile-only、物理分配差分、Simulator 和硬件验证均延期。这里的流水是
 编译器可验证的 transaction 调度，不是设备执行、性能或 L1 物理可落地的认证。
 
+本文保留最初 v3 的实现记录。后续新增的循环前后一次性资源、静态 Tensor 切片、
+持久 accumulator 和多 Core / compute-value 组合，以及更新后的 metadata 契约，
+见 [Lower 组合能力](tenstorrent_lower_composition.md)。下文原始范围和测试数量
+不代表当前实现的全部能力。
+
 ## 1. 范围与设计选择
 
 本轮采用静态有界窗口流水。对 extent 为 N、请求 stage 为 S 的独立循环，

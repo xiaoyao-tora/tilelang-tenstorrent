@@ -27,6 +27,8 @@ from testing.python.target.test_tilelang_tenstorrent_phase4_compute import (
 
 
 def cast(value, dtype):
+    if str(dtype) == "bool":
+        return np.asarray(value, dtype=bool)
     if str(dtype).startswith(("int", "uint")):
         return np.asarray(value, dtype=str(dtype))
     value = np.asarray(value, dtype=np.float32)
@@ -45,6 +47,14 @@ def expression(expr, values, maps, domain):
         result = expr.value
     elif isinstance(expr, tirx.Cast):
         result = expression(expr.value, values, maps, domain)
+    elif isinstance(expr, tirx.Select):
+        result = np.where(
+            expression(expr.condition, values, maps, domain),
+            expression(expr.true_value, values, maps, domain),
+            expression(expr.false_value, values, maps, domain),
+        )
+    elif isinstance(expr, tirx.Not):
+        result = np.logical_not(expression(expr.a, values, maps, domain))
     elif isinstance(expr, tirx.Call):
         if expr.op.name == "tl.tt.dfb_load":
             resource = int(expr.args[0])
@@ -75,6 +85,14 @@ def expression(expr, values, maps, domain):
             tirx.Div: np.divide,
             tirx.Min: np.minimum,
             tirx.Max: np.maximum,
+            tirx.EQ: np.equal,
+            tirx.NE: np.not_equal,
+            tirx.LT: np.less,
+            tirx.LE: np.less_equal,
+            tirx.GT: np.greater,
+            tirx.GE: np.greater_equal,
+            tirx.And: np.logical_and,
+            tirx.Or: np.logical_or,
         }
         operation = operations[type(expr)]
         result = operation(expression(expr.a, values, maps, domain), expression(expr.b, values, maps, domain))
@@ -260,7 +278,7 @@ def tensor_inout(A: T.Tensor((64, 64), "float32")):
 def test_same_tensor_inout_preserves_read_before_write():
     a = np.arange(4096, dtype=np.float32).reshape(64, 64)
     mod = lower(tensor_inout)
-    assert str(mod.attrs["tt.tensor_table"][0].effect) == "inout"
+    assert str(mod.attrs["tt.tensor_table"][0].effect) == "inout"  # codespell:ignore inout
     np.testing.assert_array_equal(run_device(mod, [a])[0], a + 2)
 
 

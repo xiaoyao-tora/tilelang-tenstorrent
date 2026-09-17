@@ -1,6 +1,6 @@
 # Tenstorrent compute values (Device IR v7)
 
-The single-Core v7 protocol extends structured `T.Tiles` lowering to ordinary
+The v7 protocol extends structured `T.Tiles` lowering to ordinary
 fragments and GEMM epilogues. It preserves immutable values independently of
 DFB storage and keeps the existing v1–v6 protocols for their original programs.
 The complete pass sequence remains in `tilelang/tenstorrent/pipeline.py`.
@@ -18,9 +18,12 @@ The complete pass sequence remains in `tilelang/tenstorrent/pipeline.py`.
 
 Shared allocation metadata continues to describe DFB storage. Fragment geometry
 is inferred without inventing DFB capacity or Tensor backing. Data-dependent
-branches retain frontend dominance checks but do not have a v7 Device control
-ABI. Dynamic tails/masks, direct cross-slot fragments, and v7 combinations with
-PipeNet or pipelined scheduling are explicitly unsupported.
+branches with one pure assignment per arm can become `Select` expressions when
+their local scalar predicate and old output satisfy definite initialization.
+This does not introduce a Device control-flow ABI. Dynamic tails/masks and
+direct cross-slot fragments remain unsupported. Per-Core values, materialized
+PipeNet communication and independent pipelined value chains are described in
+[the Lower composition contract](tenstorrent_lower_composition.md).
 
 ## Authoritative IR
 

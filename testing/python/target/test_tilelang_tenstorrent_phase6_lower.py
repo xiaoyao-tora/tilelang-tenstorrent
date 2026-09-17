@@ -273,16 +273,26 @@ def test_missing_receive_is_diagnosed_by_complete_lower():
         lower_multicore(program)
 
 
-def test_multicore_pipeline_composition_is_explicitly_deferred():
+def test_multicore_pipeline_composition_retains_verified_pools():
+    from tilelang.tenstorrent import transform
+
     @T.prim_func
-    def program():
-        with T.Kernel(2, 1, threads=1):
-            a = shared()
+    def program(C: T.Tensor((64, 32), "float32")):
+        with T.Kernel(2, 1, threads=1) as (x, y):
+            a = T.alloc_shared((32, 32), "float32", annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 2})
             for _k in T.Pipelined(2, num_stages=2):
                 T.fill(a, 4)
+                T.copy(a, C[x * 32 : (x + 1) * 32, 0:32])
 
-    with pytest.raises(NotImplementedError, match="combined with T.Pipelined is deferred"):
-        lower_multicore(program)
+    mod = lower_multicore(program)
+    assert int(mod.attrs["tt.device_ir_version"]) == 4
+    assert int(mod.attrs["tt.pipeline_extent"]) == 2
+    assert int(mod.attrs["tt.pipeline_stages"]) == 2
+    assert len(mod.functions) == 6
+    assert len(set(map(int, mod.attrs["tt.dfb_storage_groups"].values()))) == 4
+    restored = ir.load_json(ir.save_json(mod))
+    ir.assert_structural_equal(mod, restored)
+    assert transform.VerifyTenstorrentDeviceIR()(restored).same_as(restored)
 
 
 def test_topology_normalization_is_idempotent():

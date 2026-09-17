@@ -45,7 +45,8 @@ constexpr const char *kKernelOrderAttr = "tt.kernel_order";
 // Schema v3 retains immutable DFB descriptors and adds explicit storage reuse.
 // Keys are canonical decimal DFB IDs, with stable value-based string equality.
 // Groups: Map<String, Integer>, relation: Map<String, Array<Integer>> with
-// [zero-based iteration ordinal, ordinal % min(stages, extent)].
+// [zero-based iteration ordinal, ordinal % min(stages, extent)]. Composed
+// pipelines use [-1, 0] for one prologue/epilogue DFB in its own storage group.
 constexpr const char *kDFBStorageGroupsAttr = "tt.dfb_storage_groups";
 constexpr const char *kPipelineRelationsAttr = "tt.pipeline_relations";
 constexpr const char *kPipelineStagesAttr = "tt.pipeline_stages";

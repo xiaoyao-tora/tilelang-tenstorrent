@@ -85,10 +85,6 @@ public:
     auto src = op->annotations.Get("tl.tt.foreach_src");
     auto dst = op->annotations.Get("tl.tt.foreach_dst");
     if (!src.has_value() && !dst.has_value()) {
-      if (op->annotations.count("num_stages"))
-        TVM_FFI_THROW(NotImplementedError)
-            << "[NormalizeTenstorrentTopology] multi-Core/PipeNet combined "
-               "with T.Pipelined is deferred";
       return StmtExprMutator::VisitStmt_(op);
     }
     if (src.has_value() && dst.has_value())

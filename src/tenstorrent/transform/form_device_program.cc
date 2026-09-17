@@ -632,8 +632,28 @@ public:
       : variable_(std::move(variable)), value_(std::move(value)) {}
 
   PrimExpr VisitExpr_(const VarNode *op) final {
-    return variable_.same_as(ffi::GetRef<Var>(op)) ? value_
-                                                   : ffi::GetRef<Var>(op);
+    Var variable = ffi::GetRef<Var>(op);
+    if (variable_.same_as(variable))
+      return value_;
+    auto found = aliases_.find(variable);
+    return found == aliases_.end() ? variable : found->second;
+  }
+
+  PrimExpr VisitExpr(const PrimExpr &expr) final {
+    PrimExpr result = StmtExprMutator::VisitExpr(expr);
+    return result.dtype().is_handle() ||
+                   SideEffect(result) > CallEffectKind::kPure
+               ? result
+               : analyzer_.Simplify(result);
+  }
+
+  Stmt VisitStmt_(const BindNode *op) final {
+    PrimExpr value = VisitExpr(op->value);
+    if (value.as<IntImmNode>() || value.as<FloatImmNode>()) {
+      aliases_[op->var] = value;
+      return Evaluate(Integer(0), op->span);
+    }
+    return Bind(op->var, value, op->span);
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
@@ -646,6 +666,9 @@ public:
 private:
   Var variable_;
   PrimExpr value_;
+  arith::Analyzer analyzer_;
+  std::unordered_map<Var, PrimExpr, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      aliases_;
 };
 
 struct PipeEndpoint {
@@ -712,16 +735,12 @@ public:
         compute_value_mode_ |= region->buffer.scope() == "local.fragment";
       }
     });
-    if (compute_value_mode_ && transfers_)
-      ThrowUnsupported(
-          "compute values require a single Core; cross-Core values "
-          "must first materialize through shared DFBs");
   }
 
   bool HasComputeValues() const { return compute_value_mode_; }
   ffi::Array<ComputeValueDescriptor> ComputeValues() const { return values_; }
   void FinalizeComputeValues() {
-    if (!compute_value_mode_)
+    if (!compute_value_mode_ || IsPipeline())
       return;
     AddReleases(&compute_, "trisc");
     AddReleases(&transfer_, "ncrisc");
@@ -740,6 +759,10 @@ public:
         Wait(&transfer_, id, frontend_->span);
       }
     }
+    if (IsPipeline()) {
+      FinalizePipeline();
+      return;
+    }
     AddReleases(&compute_, "trisc");
     AddReleases(&transfer_, "ncrisc");
     AddReleases(&pipe_, "brisc");
@@ -748,9 +771,9 @@ public:
   // Phase 5 materializes bounded windows. A value remains an immutable
   // generation, while the same lexical write site shares one capacity pool.
   void PlanPipeline(const For &loop) {
-    if (compute_value_mode_)
-      ThrowUnsupported("compute-local value pipeline scheduling requires an "
-                       "explicit spill plan");
+    if (IsPipeline())
+      ThrowUnsupported("one bounded T.Pipelined loop per Core is supported");
+    pipeline_resource_begin_ = resources_.size();
     for (const auto &[key, value] : loop->annotations) {
       if (key != "num_stages" && key != "tt.pipeline_wait_policy")
         ThrowUnsupported(
@@ -802,6 +825,7 @@ public:
     size_t writes_per_iteration = 0;
     for (int64_t iteration = 0; iteration < pipeline_extent_; ++iteration) {
       current_.clear();
+      pipeline_value_begin_ = values_.size();
       size_t begin = resources_.size();
       StaticIterationSubstituter substitute(
           loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + iteration));
@@ -824,6 +848,7 @@ public:
                          "use a serial loop for cross-iteration Tensor state");
       }
     }
+    pipeline_value_begin_ = 0;
   }
 
   bool IsPipeline() const { return pipeline_extent_ != 0; }
@@ -835,7 +860,9 @@ public:
     ffi::Map<ffi::String, Integer> groups;
     for (size_t id = 0; id < resources_.size(); ++id) {
       if (live_.count(id)) {
-        groups.Set(std::to_string(id), Integer(resources_[id].pool));
+        groups.Set(std::to_string(id),
+                   Integer(resources_[id].pool < 0 ? resources_.size() + id
+                                                   : resources_[id].pool));
       }
     }
     return groups;
@@ -848,7 +875,8 @@ public:
         int64_t iteration = resources_[id].iteration;
         relations.Set(
             std::to_string(id),
-            {Integer(iteration), Integer(iteration % pipeline_depth_)});
+            {Integer(iteration),
+             Integer(iteration < 0 ? 0 : iteration % pipeline_depth_)});
       }
     }
     return relations;
@@ -858,22 +886,65 @@ public:
     if (!IsPipeline())
       return;
     ffi::Array<Stmt> scheduled;
+    auto append_singleton = [&](const Stmt &statement) {
+      const CallNode *call = statement.as<EvaluateNode>()->value.as<CallNode>();
+      if (call->op.same_as(dfb_copy_wait()))
+        return;
+      scheduled.push_back(statement);
+      if (call->op.same_as(tensor_to_dfb_nd()) ||
+          call->op.same_as(dfb_to_tensor_nd())) {
+        size_t arg = call->op.same_as(tensor_to_dfb_nd()) ? 1 : 0;
+        scheduled.push_back(MakeDeviceCall(
+            dfb_copy_wait(), {call->args[arg], Integer(1)}, statement->span));
+      }
+    };
+    auto resource_id = [](const CallNode *call) {
+      bool second = call->op.same_as(tensor_to_dfb_nd()) ||
+                    call->op.same_as(dfb_pipe_recv()) ||
+                    call->op.same_as(dfb_pipe_send()) ||
+                    call->op.same_as(dfb_pipe_wait());
+      return *as_const_int(call->args[second ? 1 : 0]);
+    };
+    for (const Stmt &statement : transfer_) {
+      int64_t id =
+          resource_id(statement.as<EvaluateNode>()->value.as<CallNode>());
+      if (resources_[id].iteration < 0 && id < pipeline_resource_begin_)
+        append_singleton(statement);
+    }
     // Delayed policy issues the entire input window before copy completion;
     // conservative policy completes each copy immediately. Output waits stay
     // after all input publications, avoiding a cross-slot cycle.
     for (int64_t begin = 0; begin < pipeline_extent_;
          begin += pipeline_depth_) {
       ffi::Array<Stmt> completions, outputs;
+      std::unordered_set<int64_t> forwarding_completions;
       for (const Stmt &statement : transfer_) {
         const CallNode *call =
             statement.as<EvaluateNode>()->value.as<CallNode>();
         bool input_copy = call->op.same_as(tenstorrent::tensor_to_dfb_nd());
-        int64_t id = *as_const_int(call->args[input_copy ? 1 : 0]);
+        if (call->op.same_as(dfb_copy_wait()))
+          continue;
+        bool pipe = call->op.same_as(dfb_pipe_recv()) ||
+                    call->op.same_as(dfb_pipe_send()) ||
+                    call->op.same_as(dfb_pipe_wait());
+        int64_t id = *as_const_int(call->args[input_copy || pipe ? 1 : 0]);
         const ResourceVersion &resource = resources_[id];
         if (resource.iteration < begin ||
             resource.iteration >= begin + pipeline_depth_)
           continue;
         if (resource.producer == "ncrisc") {
+          // A forwarded panel must complete its Tensor copy before transport.
+          // Complete only that dependency here; other input copies retain the
+          // delayed window, and future K panels can overlap local computation.
+          if (call->op.same_as(dfb_pipe_send()) &&
+              forwarding_completions.insert(id).second) {
+            for (const Stmt &completion : completions) {
+              const auto *pending =
+                  completion.as<EvaluateNode>()->value.as<CallNode>();
+              if (*as_const_int(pending->args[0]) == id)
+                scheduled.push_back(completion);
+            }
+          }
           scheduled.push_back(statement);
           if (input_copy) {
             Stmt completion =
@@ -892,14 +963,26 @@ public:
                                              statement->span));
         }
       }
-      for (const Stmt &statement : completions)
-        scheduled.push_back(statement);
+      for (const Stmt &statement : completions) {
+        const auto *completion =
+            statement.as<EvaluateNode>()->value.as<CallNode>();
+        if (!forwarding_completions.count(*as_const_int(completion->args[0])))
+          scheduled.push_back(statement);
+      }
       for (const Stmt &statement : outputs)
         scheduled.push_back(statement);
+    }
+    for (const Stmt &statement : transfer_) {
+      int64_t id =
+          resource_id(statement.as<EvaluateNode>()->value.as<CallNode>());
+      if (resources_[id].iteration < 0 && id >= pipeline_resource_begin_)
+        append_singleton(statement);
     }
     transfer_ = std::move(scheduled);
     AddReleases(&compute_, "trisc");
     AddReleases(&transfer_, "ncrisc");
+    if (transfers_)
+      AddReleases(&pipe_, "brisc");
   }
 
   void EliminateDeadWrites() {
@@ -996,6 +1079,10 @@ public:
       return;
     }
     if (const auto *loop = stmt.as<ForNode>()) {
+      if (loop->annotations.count("num_stages")) {
+        PlanPipeline(ffi::GetRef<For>(loop));
+        return;
+      }
       if (loop->kind != ForKind::kSerial && loop->kind != ForKind::kUnrolled) {
         ThrowUnsupported(
             "control flow must use a static serial or unrolled loop");
@@ -1128,7 +1215,7 @@ public:
 private:
   PrimExpr Capacity(const ResourceVersion &resource) const {
     PrimExpr count = resource.metadata->dfb_block_count.value();
-    if (!IsPipeline())
+    if (!IsPipeline() || resource.iteration < 0)
       return count;
     if (resource.metadata->block_count_origin == "explicit") {
       if (RequirePositiveStaticInteger(count, "DFB block_count") <
@@ -1328,6 +1415,10 @@ private:
     if (found == current_values_.end())
       ThrowMalformed("fragment read-before-definition for buffer '" +
                      std::string(buffer->name) + "'");
+    if (IsPipeline() && found->second < pipeline_value_begin_)
+      ThrowUnsupported("T.Pipelined fragment '" + std::string(buffer->name) +
+                       "' carries a value across iterations; bounded prefetch "
+                       "requires independently initialized fragment values");
     const Buffer &defined = values_[found->second]->buffer;
     if (defined->dtype != buffer->dtype ||
         !ffi::StructuralEqual()(defined->shape, buffer->shape))
@@ -1587,6 +1678,39 @@ private:
       value_roots_[value] = roots;
       if (own_accumulator != accumulator_ids_.end())
         value_roots_[value].insert(own_accumulator->second);
+      if (dfb_only) {
+        // DFB-only operators retain their established operand/result contract.
+        // Re-enter the value domain through an exact-dtype identity load; the
+        // borrowed DFB stays live through every transitive value consumer.
+        int64_t storage = MakeValueStorage(output->buffer, call->span);
+        resources_[storage].consumer = "trisc";
+        Reserve(&compute_, storage, call->span);
+        ffi::Array<PrimExpr> operation_args{Integer(storage)};
+        for (const PrimExpr &arg : dfb_args)
+          operation_args.push_back(arg);
+        compute_.push_back(Evaluate(Call(DataType::Void(), dfb_compute(),
+                                         operation_args, attrs, call->span),
+                                    call->span));
+        Wait(&compute_, storage, call->span);
+        ffi::Map<ffi::String, ffi::ObjectRef> load_attrs{
+            {"tt.compute_kind", StringImm("elementwise")},
+            {"tt.compute_dtype", attrs.at("tt.compute_dtype")},
+            {"tt.compute_tile_shape", attrs.at("tt.compute_tile_shape")},
+            {"tt.logical_domain", domain},
+            {"tt.expression", Call(output->buffer->dtype, dfb_load(),
+                                   {Integer(storage)}, {}, call->span)},
+            {"tt.access_maps",
+             ffi::Array<ffi::Array<Integer>>{IdentityMap(domain.size())}},
+            {"tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>{domain}},
+            {"tt.value_inputs", ffi::Array<Integer>()},
+            {"tt.value_access_maps", ffi::Array<ffi::Array<Integer>>()},
+            {"tt.value_input_shapes", ffi::Array<ffi::Array<PrimExpr>>()}};
+        compute_.push_back(Evaluate(Call(DataType::Void(), compute_value(),
+                                         {Integer(value), Integer(storage)},
+                                         load_attrs, call->span),
+                                    call->span));
+        return;
+      }
       ffi::Array<PrimExpr> args{Integer(value)};
       for (const PrimExpr &arg : dfb_args)
         args.push_back(arg);
@@ -1601,6 +1725,7 @@ private:
           decl_buffer(domain, output->buffer->dtype,
                       output->buffer->name + "_export", "local.fragment");
       int64_t tensor = output_metadata->global_arg_index.value()->value;
+      tensor_writes_[tensor] = true;
       output_id = MakeValueStorage(storage_shape, call->span,
                                    TensorBacking(tensor, Integer(0)));
       resources_[output_id].consumer = "ncrisc";
@@ -1611,6 +1736,9 @@ private:
         args.push_back(range->extent);
       }
       transfer_.push_back(MakeDeviceCall(dfb_to_tensor_nd(), args, call->span));
+      if (transfers_)
+        transfer_.push_back(MakeDeviceCall(
+            dfb_copy_wait(), {Integer(output_id), Integer(1)}, call->span));
     } else {
       output_id = Write(output->buffer, "trisc");
     }
@@ -1657,6 +1785,8 @@ private:
       if (call->op.same_as(dfb_to_tensor_nd()))
         mark(*as_const_int(call->args[0]));
     }
+    for (const PipeEndpoint &endpoint : endpoints_)
+      mark(endpoint.dfb_id);
     auto filter = [&](const ffi::Array<Stmt> &body) {
       ffi::Array<Stmt> result;
       for (const Stmt &stmt : body) {
@@ -1730,9 +1860,6 @@ private:
   }
 
   void PlanAccumulator(const Call &call, const ffi::String &kind) {
-    if (IsPipeline())
-      ThrowUnsupported("accumulator lowering currently requires serial "
-                       "execution without pipeline overlap");
     BufferRegion region =
         NormalizeToAccessRegion(call->args[0], kAccessReadWrite).region;
     FullRegion(region);
@@ -1845,11 +1972,11 @@ private:
     BufferRegion destination(copy->dst, copy->dst_range);
     bool has_accumulator =
         frontend_->attrs->dict.count("tt.gemm_accumulator_requirements");
-    if ((!transfers_ && !has_accumulator) || copy->src.scope() == "shared" ||
-        copy->src.scope() == "shared.dyn")
+    if ((!transfers_ && !has_accumulator && !IsPipeline()) ||
+        copy->src.scope() == "shared" || copy->src.scope() == "shared.dyn")
       FullRegion(source);
-    if ((!transfers_ && !has_accumulator) || copy->dst.scope() == "shared" ||
-        copy->dst.scope() == "shared.dyn")
+    if ((!transfers_ && !has_accumulator && !IsPipeline()) ||
+        copy->dst.scope() == "shared" || copy->dst.scope() == "shared.dyn")
       FullRegion(destination);
     const TTBufferMetadata &src =
         RequireMetadata(metadata_, copy->src, "copy source");
@@ -2042,6 +2169,8 @@ private:
   int64_t pipeline_stages_{0};
   int64_t pipeline_extent_{0};
   int64_t pipeline_depth_{0};
+  int64_t pipeline_value_begin_{0};
+  int64_t pipeline_resource_begin_{0};
 };
 
 bool HasGeneralCompute(const Stmt &body) {
@@ -2161,16 +2290,37 @@ PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
 // remapping and explicit Pipe transfer matching cross this boundary.
 class DeviceIDRemapper : public StmtExprMutator {
 public:
-  DeviceIDRemapper(int64_t offset, int64_t accumulator_offset)
-      : offset_(offset), accumulator_offset_(accumulator_offset) {}
+  DeviceIDRemapper(int64_t offset, int64_t accumulator_offset,
+                   int64_t value_offset)
+      : offset_(offset), accumulator_offset_(accumulator_offset),
+        value_offset_(value_offset) {}
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     auto args = call->args;
     auto shift = [&](size_t index) {
       args.Set(index, Integer(*as_const_int(args[index]) + offset_));
     };
-    if (call->op.same_as(tenstorrent::accumulator_init()) ||
-        call->op.same_as(tenstorrent::accumulator_materialize())) {
+    auto shift_value = [&](size_t index) {
+      int64_t value = *as_const_int(args[index]);
+      if (value >= 0)
+        args.Set(index, Integer(value + value_offset_));
+    };
+    if (call->op.same_as(compute_value())) {
+      shift_value(0);
+      for (size_t index = 1; index < args.size(); ++index)
+        shift(index);
+    } else if (call->op.same_as(compute_value_gemm())) {
+      shift_value(0);
+      shift(1);
+      shift(2);
+      shift_value(3);
+    } else if (call->op.same_as(compute_value_store())) {
+      shift_value(0);
+      shift(1);
+    } else if (call->op.same_as(compute_value_load())) {
+      shift_value(0);
+    } else if (call->op.same_as(tenstorrent::accumulator_init()) ||
+               call->op.same_as(tenstorrent::accumulator_materialize())) {
       args.Set(0, Integer(*as_const_int(args[0]) + accumulator_offset_));
       if (call->op.same_as(tenstorrent::accumulator_materialize()))
         shift(1);
@@ -2194,12 +2344,21 @@ public:
                call->op.same_as(tenstorrent::dfb_load())) {
       shift(0);
     }
-    return Call(call->dtype, call->op, args, call->annotations, op->span);
+    auto attrs = call->annotations;
+    auto inputs = attrs.Get("tt.value_inputs");
+    if (inputs.has_value()) {
+      ffi::Array<Integer> remapped;
+      for (const Integer &value : Downcast<ffi::Array<Integer>>(inputs.value()))
+        remapped.push_back(Integer(value->value + value_offset_));
+      attrs.Set("tt.value_inputs", remapped);
+    }
+    return Call(call->dtype, call->op, args, attrs, op->span);
   }
 
 private:
   int64_t offset_;
   int64_t accumulator_offset_;
+  int64_t value_offset_;
 };
 
 IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
@@ -2221,10 +2380,15 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   ffi::Array<PipeDescriptor> pipes;
   ffi::Array<PipeTransferDescriptor> transfers;
   ffi::Array<AccumulatorDescriptor> accumulators;
+  ffi::Array<ComputeValueDescriptor> compute_values;
   std::vector<int> effects(frontend->params.size(), 0);
   TransferKeys transfer_keys;
   std::vector<PipeEndpoint> endpoints;
-  int64_t offset = 0, accumulator_offset = 0;
+  int64_t offset = 0, accumulator_offset = 0, value_offset = 0;
+  int64_t pipeline_stages = 0, pipeline_extent = 0, group_offset = 0;
+  ffi::String pipeline_wait_policy;
+  ffi::Map<ffi::String, Integer> storage_groups;
+  ffi::Map<ffi::String, ffi::Array<Integer>> pipeline_relations;
   bool producer_forwarding = false;
   for (size_t index = 0; index < cores.size(); ++index) {
     int64_t x = index / gy, y = index % gy;
@@ -2239,6 +2403,26 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     planner.Plan(realize->block->body);
     planner.EliminateDeadWrites();
     planner.FinalizeMulticore();
+    if (planner.IsPipeline()) {
+      if (pipeline_extent &&
+          (pipeline_extent != planner.PipelineExtent() ||
+           pipeline_stages != planner.PipelineStages() ||
+           pipeline_wait_policy != planner.PipelineWaitPolicy()))
+        ThrowUnsupported("all Core pipelines require identical static extent, "
+                         "num_stages and wait policy");
+      pipeline_extent = planner.PipelineExtent();
+      pipeline_stages = planner.PipelineStages();
+      pipeline_wait_policy = planner.PipelineWaitPolicy();
+      for (const auto &[key, group] : planner.StorageGroups())
+        storage_groups.Set(
+            std::to_string(std::stoll(std::string(key)) + offset),
+            Integer(group->value + group_offset));
+      for (const auto &[key, relation] : planner.PipelineRelations())
+        pipeline_relations.Set(
+            std::to_string(std::stoll(std::string(key)) + offset), relation);
+    } else if (pipeline_extent || !storage_groups.empty()) {
+      ThrowUnsupported("all active Core bodies must retain their pipeline");
+    }
     producer_forwarding |= planner.HasProducerForwarding();
     CoreDomain domain(CoreCoord(x, y), CoreCoord(x + 1, y + 1));
     for (const DFBDescriptor &dfb : planner.Descriptors(domain)) {
@@ -2251,12 +2435,38 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
           dfb->consumer_slot, domain, dfb->transaction_count_or_loop_relation,
           dfb->source_span));
     }
+    std::unordered_map<Var, Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+        core_buffers;
+    auto isolate_buffer = [&](const Buffer &buffer) -> Buffer {
+      auto found = core_buffers.find(buffer->data);
+      if (found != core_buffers.end())
+        return found->second;
+      Buffer isolated = buffer;
+      isolated.CopyOnWrite()->data = buffer->data.copy_with_suffix(
+          "_core" + std::to_string(x) + "_" + std::to_string(y));
+      core_buffers.emplace(buffer->data, isolated);
+      return isolated;
+    };
     for (const AccumulatorDescriptor &accumulator : planner.Accumulators()) {
       accumulators.push_back(AccumulatorDescriptor(
           accumulator->accumulator_id + accumulator_offset,
-          accumulator->accumulator_region, accumulator->input_dtype,
-          accumulator->accumulation_dtype, accumulator->output_dtype,
-          accumulator->full_k_tiles, accumulator->source_span));
+          BufferRegion(isolate_buffer(accumulator->accumulator_region->buffer),
+                       accumulator->accumulator_region->region),
+          accumulator->input_dtype, accumulator->accumulation_dtype,
+          accumulator->output_dtype, accumulator->full_k_tiles,
+          accumulator->source_span));
+    }
+    for (const ComputeValueDescriptor &value : planner.ComputeValues()) {
+      compute_values.push_back(ComputeValueDescriptor(
+          value->value_id + value_offset, isolate_buffer(value->buffer),
+          value->version,
+          value->previous_value_id < 0
+              ? -1
+              : value->previous_value_id + value_offset,
+          value->accumulator_id < 0
+              ? -1
+              : value->accumulator_id + accumulator_offset,
+          value->source_span));
     }
     for (PipeEndpoint endpoint : planner.Endpoints()) {
       endpoint.dfb_id += offset;
@@ -2269,7 +2479,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                                 : effect == "output" ? 2
                                                      : 1;
     }
-    DeviceIDRemapper remap(offset, accumulator_offset);
+    DeviceIDRemapper remap(offset, accumulator_offset, value_offset);
     ffi::String core_operation =
         operation + "_x" + std::to_string(x) + "_y" + std::to_string(y);
     for (const ffi::String &slot :
@@ -2314,6 +2524,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     }
     offset += planner.ResourceCount();
     accumulator_offset += planner.AccumulatorCount();
+    value_offset += planner.ComputeValues().size();
+    group_offset += 2 * planner.ResourceCount();
   }
   std::map<int64_t, PipeEndpoint> senders, receivers;
   std::map<std::pair<int64_t, int64_t>, int64_t> record_payloads;
@@ -2388,7 +2600,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       [](const PipeEndpoint &endpoint) { return endpoint.occurrence != 0; });
   ffi::Map<ffi::String, ffi::Any> attrs{
       {kDeviceIRVersionAttr,
-       Integer(!accumulators.empty() || repeated_transfers ||
+       Integer(!compute_values.empty() ? 7
+               : !accumulators.empty() || repeated_transfers ||
                        producer_forwarding
                    ? 6
                    : 4)},
@@ -2402,6 +2615,15 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       {kKernelOrderAttr, order}};
   if (!accumulators.empty())
     attrs.Set(kAccumulatorTableAttr, accumulators);
+  if (!compute_values.empty())
+    attrs.Set(kComputeValueTableAttr, compute_values);
+  if (pipeline_extent) {
+    attrs.Set("tt.dfb_storage_groups", storage_groups);
+    attrs.Set("tt.pipeline_relations", pipeline_relations);
+    attrs.Set("tt.pipeline_stages", Integer(pipeline_stages));
+    attrs.Set("tt.pipeline_extent", Integer(pipeline_extent));
+    attrs.Set("tt.pipeline_wait_policy", pipeline_wait_policy);
+  }
   auto capacity = input->GetAttr<Integer>("tt.l1_capacity_bytes");
   if (capacity.has_value())
     attrs.Set("tt.l1_capacity_bytes", capacity.value());

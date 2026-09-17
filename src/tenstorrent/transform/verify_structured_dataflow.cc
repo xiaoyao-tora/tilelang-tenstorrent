@@ -10,7 +10,9 @@
 #include "../../op/copy.h"
 #include "../../op/fill.h"
 #include "../../op/operator.h"
+#include "../../op/utils.h"
 #include "../ir/device_ir.h"
+#include "../op/builtin.h"
 #include "attr.h"
 
 #include <tvm/arith/analyzer.h>
@@ -50,6 +52,7 @@ public:
       verifier.known_.emplace(buffer->data, buffer);
       verifier.Write_(BufferRegion::FullRegion(buffer));
     }
+    verifier.parameter_initialization_ = verifier.initialized_;
     verifier(func->body);
   }
 
@@ -115,6 +118,13 @@ private:
   }
 
   void VisitStmt_(const SBlockNode *op) final {
+    const bool core_region = op->annotations.count("tt.core_x") &&
+                             op->annotations.count("tt.core_y");
+    Regions previous_core_state;
+    if (core_region) {
+      previous_core_state = initialized_;
+      initialized_ = parameter_initialization_;
+    }
     if (!op->match_buffers.empty())
       Fail("match-buffer aliases cannot be verified for structured return");
     for (const Buffer &buffer : op->alloc_buffers) {
@@ -142,6 +152,8 @@ private:
       initialized_.erase(buffer->data);
       known_.erase(buffer->data);
     }
+    if (core_region)
+      initialized_ = std::move(previous_core_state);
   }
 
   void VisitStmt_(const ForNode *op) final {
@@ -238,11 +250,28 @@ private:
     if (!operator_node)
       Fail("unknown effect at structured boundary");
     const std::string name = operator_node->name;
+    Call call = ffi::GetRef<Call>(node);
+    if (call->op.same_as(pipe_send()) || call->op.same_as(pipe_recv())) {
+      const bool send = call->op.same_as(pipe_send());
+      if (call->args.size() != 2 || !call->annotations.count("tt.pipe_record"))
+        Fail("Pipe transfer requires normalized endpoint and record metadata");
+      BufferRegion payload =
+          NormalizeToAccessRegion(call->args[send ? 0 : 1],
+                                  send ? kAccessRead : kAccessWrite)
+              .region;
+      if (payload->buffer.scope() != "shared" &&
+          payload->buffer.scope() != "shared.dyn")
+        Fail("Pipe transfer requires a materialized shared DFB payload");
+      if (send)
+        Read_(payload);
+      else
+        Write_(payload);
+      return;
+    }
     if (name != "tl.tileop.copy" && name != "tl.tileop.fill" &&
         name != "tl.tileop.gemm" && name != "tl.tileop.transpose" &&
         name != "tl.tileop.reduce")
       Fail("unverified operation '" + name + "' at structured boundary");
-    Call call = ffi::GetRef<Call>(node);
     if (call->op.same_as(Copy::Get())) {
       Copy copy = Downcast<Copy>(ParseOperator(call));
       if (copy->src->dtype != copy->dst->dtype &&
@@ -287,6 +316,7 @@ private:
   }
 
   arith::Analyzer analyzer_;
+  Regions parameter_initialization_;
   bool fragment_slot_allowed_{true};
   Regions initialized_;
   std::unordered_map<Var, Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>

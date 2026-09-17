@@ -91,8 +91,7 @@ def test_structured_iteration_malformed_schedule_is_rejected(mutation):
     assert ir.save_json(mod) == before
 
 
-@pytest.mark.parametrize("kind", ["select", "float16_cast"])
-def test_device_expression_subset_is_verified(kind):
+def test_unsupported_device_expression_dtype_is_rejected():
     mod = lower(elementwise_program())
     call = next(
         stmt.value
@@ -100,10 +99,7 @@ def test_device_expression_subset_is_verified(kind):
         if isinstance(stmt.value, tirx.Call) and stmt.value.op.name == "tl.tt.dfb_compute"
     )
     expression = call.annotations["tt.expression"]
-    if kind == "select":
-        expression = tirx.Select(tirx.const(True, "bool"), expression, tirx.const(0, "float32"))
-    else:
-        expression = tirx.Cast("float32", tirx.Cast("float16", expression))
+    expression = tirx.Cast("float32", tirx.Cast("float16", expression))
     replace_compute_annotation(mod, "tt.expression", expression)
     with pytest.raises(ValueError, match="unsupported.*(dtype|expression)|expression.*unsupported"):
         VerifyTenstorrentDeviceIR()(mod)

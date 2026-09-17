@@ -719,7 +719,8 @@ public:
     // VerifyTTComputeBlocks has already proved every remaining Var is an
     // enclosing static loop's scalar parameter. Form replaces it by an
     // integer constant; storage and arithmetic nodes still require FP dtypes.
-    if (!expr.as<IntImmNode>() && !expr.as<VarNode>())
+    if (!expr.as<IntImmNode>() && !expr.as<VarNode>() &&
+        !expr.dtype().is_bool())
       ValidateDType(expr.dtype());
     ExprVisitor::VisitExpr(expr);
   }
@@ -794,9 +795,9 @@ private:
       if (auto expr = object.as<PrimExpr>()) {
         if (!expr.value().as<IntImmNode>() && !expr.value().as<VarNode>()) {
           DataType dtype = expr.value().dtype();
-          supported_dtype &=
-              dtype.lanes() == 1 &&
-              (dtype == DataType::BFloat(16) || dtype == DataType::Float(32));
+          supported_dtype &= dtype.lanes() == 1 &&
+                             (dtype == DataType::BFloat(16) ||
+                              dtype == DataType::Float(32) || dtype.is_bool());
         }
       }
     });

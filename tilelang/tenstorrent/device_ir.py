@@ -12,15 +12,20 @@ Multicore v4 adds ``tt.pipe_transfer_table`` containing typed point deliveries
 and orders all Core/slot functions by global name in ``tt.kernel_order``.
 Schema v5 adds ``tt.accumulator_table`` and mandatory typed
 ``tt.compute_requirements`` on TRISC. Persistent fragments have one init, the
-complete static K update sequence, and one final materialization; v5 currently
-excludes pipelines and multicore execution. Schema v6 combines specialized
+complete static K update sequence, and one final materialization. Bounded
+pipeline metadata composes with this lifetime without packing partial K results.
+Schema v6 combines specialized
 Core/slot functions with persistent accumulators and static PipeNet occurrence
 epochs. Each accumulator belongs to the unique TRISC function containing its
 lifetime; fragment Buffer identities are local to that Core. Forwarded Tensor
 panels become ready for their local TRISC consumer only after all outgoing Pipe
 transfers complete. Earlier metadata constructors and defaults remain unchanged.
 Schema v7 adds immutable ``tt.compute_value_table`` definitions, ordinary fragment
-expressions, GEMM epilogues and explicit compute materialization on one Core.
+expressions, GEMM epilogues and explicit compute materialization. Values and
+fragment Buffer identities belong to exactly one TRISC function; topology v7
+also carries ``tt.pipe_transfer_table`` (possibly empty). Pipeline storage groups
+carry one generation per iteration, or one prologue/epilogue resource with the
+relation ``[-1, 0]``; singleton and iterative resources never share a group.
 """
 
 from __future__ import annotations

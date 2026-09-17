@@ -68,7 +68,8 @@ struct NormalizedRegion {
 };
 
 NormalizedRegion NormalizeRegion(const BufferRegion &region,
-                                 const std::string &endpoint) {
+                                 const std::string &endpoint,
+                                 arith::Analyzer *loop_analyzer = nullptr) {
   const Buffer &buffer = region->buffer;
   if (region->region.size() != buffer->shape.size()) {
     ThrowMalformed(endpoint + " region rank does not match buffer '" +
@@ -82,13 +83,36 @@ NormalizedRegion NormalizeRegion(const BufferRegion &region,
     int64_t shape = RequireStaticInteger(buffer->shape[axis],
                                          endpoint + " buffer shape axis " +
                                              std::to_string(axis));
-    int64_t minimum = RequireStaticInteger(
-        range->min, endpoint + " minimum axis " + std::to_string(axis));
+    PrimExpr minimum_expr =
+        loop_analyzer ? loop_analyzer->Simplify(range->min) : range->min;
     int64_t extent = RequireStaticInteger(
         range->extent, endpoint + " extent axis " + std::to_string(axis));
     if (shape <= 0 || extent <= 0) {
       ThrowMalformed(endpoint + " shape and region extents must be positive");
     }
+    if (!as_const_int(minimum_expr) && loop_analyzer) {
+      // Static pipeline binders will be substituted by formation. Prove the
+      // complete range now so delayed specialization cannot hide an invalid
+      // iteration or turn a dynamic/runtime index into an accepted transfer.
+      if (SideEffect(minimum_expr) > CallEffectKind::kPure ||
+          !loop_analyzer->CanProve(minimum_expr >= 0) ||
+          !loop_analyzer->CanProve(minimum_expr +
+                                       IntImm(minimum_expr.dtype(), extent) <=
+                                   IntImm(minimum_expr.dtype(), shape))) {
+        ThrowMalformed(endpoint +
+                       " pipeline region is out of bounds or "
+                       "unproven for buffer '" +
+                       std::string(buffer->name) + "' on axis " +
+                       std::to_string(axis));
+      }
+      normalized.push_back(Range::FromMinExtent(
+          minimum_expr, IntImm(range->extent.dtype(), extent)));
+      changed |= !minimum_expr.same_as(range->min) ||
+                 !is_const_int(range->extent, extent);
+      continue;
+    }
+    int64_t minimum = RequireStaticInteger(
+        minimum_expr, endpoint + " minimum axis " + std::to_string(axis));
     bool axis_changed = minimum < 0;
     changed |= !is_const_int(range->min, minimum) ||
                !is_const_int(range->extent, extent);
@@ -206,6 +230,28 @@ public:
       : expand_accumulator_loops_(expand_accumulator_loops) {}
 
   Stmt VisitStmt_(const ForNode *op) final {
+    if (op->annotations.count("num_stages")) {
+      int64_t extent = RequireStaticInteger(op->extent, "pipeline extent");
+      int64_t minimum = RequireStaticInteger(op->min, "pipeline minimum");
+      if (extent <= 0)
+        ThrowUnsupported("pipeline extent must be positive");
+      if (extent > 1024)
+        ThrowUnsupported("pipeline region proof requires extent <= 1024");
+      if (op->kind != ForKind::kSerial ||
+          (op->step.has_value() && !is_one(op->step.value())))
+        ThrowUnsupported("pipeline region proof requires a static serial "
+                         "unit-step loop");
+      loop_analyzer_.Bind(
+          op->loop_var,
+          Range::FromMinExtent(IntImm(op->loop_var.dtype(), minimum),
+                               IntImm(op->loop_var.dtype(), extent)));
+      auto saved_aliases = aliases_;
+      ++pipeline_depth_;
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      --pipeline_depth_;
+      aliases_ = std::move(saved_aliases);
+      return result;
+    }
     if (!expand_accumulator_loops_)
       return StmtExprMutator::VisitStmt_(op);
     // The single-Core path does not run topology specialization. Retain its
@@ -239,12 +285,33 @@ public:
                                   : SeqStmt(iterations, op->span);
   }
 
+  Stmt VisitStmt_(const BindNode *op) final {
+    if (pipeline_depth_ && op->var.dtype().is_int() &&
+        SideEffect(op->value) == CallEffectKind::kPure) {
+      aliases_[op->var] = VisitExpr(op->value);
+      return Evaluate(Integer(0), op->span);
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    auto found = aliases_.find(ffi::GetRef<Var>(op));
+    return found == aliases_.end() ? ffi::GetRef<Var>(op) : found->second;
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (!call.same_as(ffi::GetRef<Call>(op)))
+      call.CopyOnWrite()->span = op->span;
+    return call;
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call_node = op->value.as<CallNode>();
     if (call_node == nullptr) {
       return StmtExprMutator::VisitStmt_(op);
     }
-    Call call = ffi::GetRef<Call>(call_node);
+    Call call = Downcast<Call>(VisitExpr(ffi::GetRef<Call>(call_node)));
     if (call->op.same_as(Copy::Get())) {
       return NormalizeCopy(ffi::GetRef<Evaluate>(op), call);
     }
@@ -262,6 +329,10 @@ public:
 private:
   bool expand_accumulator_loops_;
   size_t expanded_iterations_{0};
+  int pipeline_depth_{0};
+  arith::Analyzer loop_analyzer_;
+  std::unordered_map<Var, PrimExpr, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      aliases_;
 
   static void ValidatePipeRegion(const Call &call, size_t argument_index,
                                  int access_mask, const std::string &endpoint) {
@@ -281,7 +352,7 @@ private:
     }
   }
 
-  static Stmt NormalizeCopy(const Evaluate &evaluate, const Call &call) {
+  Stmt NormalizeCopy(const Evaluate &evaluate, const Call &call) {
     if (call->args.size() < 2) {
       ThrowMalformed("T.copy requires source and destination BufferRegions");
     }
@@ -289,9 +360,11 @@ private:
     BufferRegion source(copy->src, copy->src_range);
     BufferRegion destination(copy->dst, copy->dst_range);
 
-    NormalizedRegion normalized_source = NormalizeRegion(source, "source");
+    arith::Analyzer *analyzer = pipeline_depth_ ? &loop_analyzer_ : nullptr;
+    NormalizedRegion normalized_source =
+        NormalizeRegion(source, "source", analyzer);
     NormalizedRegion normalized_destination =
-        NormalizeRegion(destination, "destination");
+        NormalizeRegion(destination, "destination", analyzer);
     ValidateMatchingExtents(normalized_source.region,
                             normalized_destination.region);
     ffi::String transfer_kind =
@@ -311,7 +384,7 @@ private:
       annotation_matches = true;
     }
     if (!normalized_source.changed && !normalized_destination.changed &&
-        annotation_matches) {
+        annotation_matches && call.same_as(evaluate->value)) {
       return evaluate;
     }
 

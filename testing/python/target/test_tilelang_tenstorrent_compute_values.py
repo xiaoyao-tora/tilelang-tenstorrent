@@ -49,6 +49,13 @@ def interpret_values(mod, tensors):
             return np.float32(expr.value)
         if isinstance(expr, tirx.Cast):
             return _round(expression(expr.value, maps), expr.dtype)
+        if isinstance(expr, tirx.Select):
+            return _round(
+                np.where(expression(expr.condition, maps), expression(expr.true_value, maps), expression(expr.false_value, maps)),
+                expr.dtype,
+            )
+        if isinstance(expr, tirx.Not):
+            return np.logical_not(expression(expr.a, maps))
         if isinstance(expr, tirx.Call):
             name = expr.op.name
             if name in ("tl.tt.dfb_load", "tl.tt.compute_value_load"):
@@ -75,10 +82,19 @@ def interpret_values(mod, tensors):
             tirx.Div: np.divide,
             tirx.Min: np.minimum,
             tirx.Max: np.maximum,
+            tirx.EQ: np.equal,
+            tirx.NE: np.not_equal,
+            tirx.LT: np.less,
+            tirx.LE: np.less_equal,
+            tirx.GT: np.greater,
+            tirx.GE: np.greater_equal,
+            tirx.And: np.logical_and,
+            tirx.Or: np.logical_or,
         }
         for cls, operation in binary.items():
             if isinstance(expr, cls):
-                return _round(operation(expression(expr.a, maps), expression(expr.b, maps)), expr.dtype)
+                result = operation(expression(expr.a, maps), expression(expr.b, maps))
+                return result if str(expr.dtype) == "bool" else _round(result, expr.dtype)
         raise AssertionError(f"Unexpected expression: {expr}")
 
     for _ in range(10000):

@@ -256,9 +256,9 @@ def test_kernel_order_and_core_slot_identity():
     rejected(mod, "duplicate Core/slot")
 
 
-def test_v4_cannot_claim_pipeline_storage_reuse():
+def test_topology_pipeline_requires_complete_storage_metadata():
     mod = resource_module()
-    rejected(mod.with_attr("tt.dfb_storage_groups", {}), "pipeline storage reuse is unsupported")
+    rejected(mod.with_attr("tt.dfb_storage_groups", {}), "missing required Module attr.*pipeline_stages")
 
 
 def test_original_record_order_is_enforced():
