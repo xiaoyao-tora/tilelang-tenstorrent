@@ -290,7 +290,9 @@ public:
                                              ComputeValueDescriptorNode);
 };
 
-/*! \brief Hard requirements merged across one actual compute kernel. */
+/*! \brief Hard requirements for one compute kernel or v8 precision region.
+ * V8 aggregate destination_width is region_scoped; its ordered per-region
+ * requirements are carried by tt.compute_region_requirements. */
 class ComputeRequirementsNode : public ffi::Object {
 public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =

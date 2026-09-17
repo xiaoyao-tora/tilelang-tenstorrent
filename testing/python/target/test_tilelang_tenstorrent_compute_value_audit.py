@@ -5,7 +5,7 @@ import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform
-from tilelang.tenstorrent.device_ir import AccumulatorDescriptor
+from tilelang.tenstorrent.device_ir import AccumulatorDescriptor, ComputeValueDescriptor
 from tvm import tirx
 
 from testing.python.target.test_tilelang_tenstorrent_compute_value_verifier import device
@@ -141,7 +141,8 @@ def test_copy_kind_cannot_hide_an_unrelated_expression():
     check_rejected(corrupt, "expression|unused|copy")
 
 
-def test_raw_dfb_to_fragment_reentry_retains_accumulator_output_contract():
+@pytest.mark.parametrize("explicit_provenance", [True, False])
+def test_raw_dfb_to_fragment_reentry_retains_accumulator_output_contract(explicit_provenance):
     @T.prim_func
     def main(A: T.Tensor((32, 32), "bfloat16"), B: T.Tensor((32, 32), "bfloat16"), C: T.Tensor((32, 32), "bfloat16")):
         with T.Kernel(1, 1, threads=1):
@@ -159,9 +160,22 @@ def test_raw_dfb_to_fragment_reentry_retains_accumulator_output_contract():
             T.copy(reloaded, C)
 
     mod = lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
-    # The body must prove provenance even when the reloaded descriptor has
-    # no explicit accumulator ID. DFB materialization cannot erase that proof.
-    assert any(int(value.accumulator_id) == -1 for value in mod.attrs["tt.compute_value_table"])
+    values = list(mod.attrs["tt.compute_value_table"])
+    (accumulator,) = mod.attrs["tt.accumulator_table"]
+    reloaded = [value for value in values if str(value.buffer.name) == "reloaded"]
+    assert reloaded and all(int(value.accumulator_id) == int(accumulator.accumulator_id) for value in reloaded)
+    if not explicit_provenance:
+        # Formation now preserves a precise singleton root through DFBs. Raw
+        # Device IR may omit the optional ID, but the body must still establish
+        # the same output contract independently of that descriptor hint.
+        values = [
+            ComputeValueDescriptor(value.value_id, value.buffer, value.version, value.previous_value_id, -1, value.source_span)
+            if str(value.buffer.name) == "reloaded"
+            else value
+            for value in values
+        ]
+        mod = mod.with_attr("tt.compute_value_table", values)
+        transform.VerifyTenstorrentDeviceIR()(mod)
     corrupt = forge_fp32_output(mod)
     with pytest.raises(ValueError, match="GEMM final output dtype"):
         corrupt = transform.InferTenstorrentComputeRequirements()(clear_requirements(corrupt))

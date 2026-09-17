@@ -967,6 +967,25 @@ void VerifyTileGrid(const ffi::Array<PrimExpr> &shape,
   }
 }
 
+// Tensor coordinates retain their ABI rank. Local DFBs may omit only leading
+// singleton slice axes, never interior axes or nontrivial batch dimensions.
+ffi::Array<PrimExpr> LocalTransferShape(const ffi::Array<PrimExpr> &shape,
+                                        const DFBDescriptor &dfb) {
+  size_t rank = dfb->block_shape_in_tiles.size();
+  Check(shape.size() >= rank, "Tensor transfer rank is smaller than DFB rank");
+  size_t leading = shape.size() - rank;
+  ffi::Array<PrimExpr> local;
+  for (size_t axis = 0; axis < shape.size(); ++axis) {
+    if (axis < leading)
+      Check(RequireStaticInteger(shape[axis], "Tensor leading slice extent") ==
+                1,
+            "Tensor transfer may remove only leading singleton slice axes");
+    else
+      local.push_back(shape[axis]);
+  }
+  return local;
+}
+
 void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
   Check(!call->args.empty(), "dfb_compute must have an output DFB");
   std::vector<DFBDescriptor> operands;
@@ -1224,6 +1243,8 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
       for (size_t i = 0; i < input.size(); ++i)
         if (static_cast<int64_t>(i) != axis)
           expected.push_back(input[i]);
+        else if (shape.size() == input.size())
+          expected.push_back(Integer(1));
       Check(ffi::StructuralEqual()(expected, shape),
             "reduction output logical shape mismatch");
     }
@@ -1246,21 +1267,45 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
   Check(
       scalar_expression || !call->annotations.count("tt.expression"),
       "non-elementwise Device operation must not carry an ignored expression");
-  DFBTable proof = dfbs;
+  Check(!call->args.empty(), "compute value missing output ID");
+  // Proof descriptors cover this operation only. Materializing the entire
+  // module's value table here makes verification quadratic in unrolled loops.
+  DFBTable proof;
+  std::set<int64_t> dfb_inputs;
+  for (size_t i = local_output ? 1 : 0; i < call->args.size(); ++i) {
+    int64_t id = RequireStaticInteger(call->args[i], "compute DFB operand");
+    Check(dfbs.count(id), "dfb_compute references missing DFB");
+    proof.emplace(id, dfbs.at(id));
+    if (i)
+      dfb_inputs.insert(id);
+  }
+  std::set<int64_t> required_values;
+  if (local_output)
+    required_values.insert(
+        RequireStaticInteger(call->args[0], "compute output ID"));
+  auto declared_inputs = call->annotations.Get("tt.value_inputs");
+  if (declared_inputs.has_value()) {
+    auto inputs = declared_inputs.value().as<ffi::Array<Integer>>();
+    Check(inputs.has_value(), "invalid tt.value_inputs");
+    for (const Integer &id : inputs.value())
+      required_values.insert(id->value);
+  }
   int64_t next = 0;
   for (const auto &[id, ignored] : proof) {
     Check(id < std::numeric_limits<int64_t>::max() -
-                   static_cast<int64_t>(values.size()) - 2,
+                   static_cast<int64_t>(required_values.size()) - 2,
           "DFB ID overflows compute value verification");
     next = std::max(next, id + 1);
   }
   std::map<int64_t, int64_t> virtual_ids;
   CoreDomain domain(CoreCoord(0, 0), CoreCoord(1, 1));
-  for (const auto &[id, value] : values) {
+  for (int64_t id : required_values) {
+    Check(values.count(id), "compute value references missing descriptor");
+    const auto &value = values.at(id);
     ffi::Array<PrimExpr> grid;
     for (const PrimExpr &extent : value->buffer->shape)
       grid.push_back(
-          Integer(RequireStaticInteger(extent, "value extent") / 32));
+          Integer((RequireStaticInteger(extent, "value extent") + 31) / 32));
     virtual_ids[id] = next;
     proof.emplace(next,
                   DFBDescriptor(next, "compute proof", value->buffer->dtype,
@@ -1269,7 +1314,6 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
                                 Integer(1), value->source_span));
     ++next;
   }
-  Check(!call->args.empty(), "compute value missing output ID");
   ffi::Array<PrimExpr> args = call->args;
   if (local_output) {
     int64_t id = RequireStaticInteger(args[0], "compute output ID");
@@ -1325,9 +1369,17 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
     public:
       RewriteLoads(const ComputeValueTable &values,
                    const std::map<int64_t, int64_t> &ids,
-                   const std::set<int64_t> &declared)
-          : values_(values), ids_(ids), declared_(declared) {}
+                   const std::set<int64_t> &declared,
+                   const std::set<int64_t> &dfb_inputs)
+          : values_(values), ids_(ids), declared_(declared),
+            dfb_inputs_(dfb_inputs) {}
       PrimExpr VisitExpr_(const CallNode *op) final {
+        if (op->op.same_as(dfb_load())) {
+          Check(op->args.size() == 1 &&
+                    dfb_inputs_.count(RequireStaticInteger(
+                        op->args[0], "dfb_load resource ID")),
+                "dfb_load references an undeclared input DFB");
+        }
         if (!op->op.same_as(compute_value_load()))
           return ExprMutator::VisitExpr_(op);
         Check(op->args.size() == 1 && op->annotations.empty(),
@@ -1343,7 +1395,8 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
       const ComputeValueTable &values_;
       const std::map<int64_t, int64_t> &ids_;
       const std::set<int64_t> &declared_;
-    } rewrite(values, virtual_ids, declared);
+      const std::set<int64_t> &dfb_inputs_;
+    } rewrite(values, virtual_ids, declared, dfb_inputs);
     auto expr = expression.value().as<PrimExpr>();
     Check(expr.has_value(), "invalid compute value expression");
     attrs.Set("tt.expression", rewrite(expr.value()));
@@ -1355,7 +1408,10 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
 class ComputeValueVerifier {
 public:
   explicit ComputeValueVerifier(const IRModule &mod) {
-    if (RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr)->value != 7)
+    int64_t version =
+        RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr)->value;
+    precision_regions_ = version == 8;
+    if (version != 7 && version != 8)
       return;
     enabled_ = true;
     auto entries = RequireModuleAttr<ffi::Array<ComputeValueDescriptor>>(
@@ -1376,8 +1432,9 @@ public:
             "compute value requires a rank-2 BF16/FP32 fragment");
       for (const PrimExpr &extent : entry->buffer->shape) {
         int64_t n = RequireStaticInteger(extent, "compute value shape");
-        Check(n > 0 && n % 32 == 0,
-              "compute value shape must be positive and tile-aligned");
+        Check(n > 0 && (n == 1 || n % 32 == 0),
+              "compute value shape must be positive and tile-aligned or "
+              "singleton");
       }
       auto old = previous.find(entry->buffer->data);
       Check(old == previous.end()
@@ -1460,7 +1517,22 @@ public:
               "compute value predecessor crosses Core ownership");
     }
   }
-  void BindFunction(const PrimFunc &function) { function_ = function; }
+  void BindFunction(const PrimFunc &function) {
+    function_ = function;
+    precision_epoch_ = 0;
+  }
+  void Precision(const Call &call) {
+    Check(
+        precision_regions_ && call->args.size() == 1 &&
+            call->annotations.empty() &&
+            function_->GetAttr<ffi::String>(kKernelSlotAttr).value_or("") ==
+                "trisc",
+        "compute_precision requires v8 TRISC and one mode without annotations");
+    int64_t mode =
+        RequireStaticInteger(call->args[0], "compute precision mode");
+    Check(mode == 0 || mode == 1, "compute precision mode must be 0 or 1");
+    ++precision_epoch_;
+  }
   void CheckOwner(int64_t id) const {
     Check(owners_.count(id) && owners_.at(id).same_as(function_),
           "compute value " + std::to_string(id) +
@@ -1472,6 +1544,9 @@ public:
     Check(values_.count(id) && defined_.count(id),
           "compute value use is not dominated by its definition");
     CheckOwner(id);
+    Check(!precision_regions_ || value_epochs_.at(id) == precision_epoch_,
+          "compute value crosses precision region without exact-dtype DFB "
+          "snapshot");
     return values_.at(id);
   }
   std::set<int64_t> Expression(const Call &call, const DFBTable &dfbs) {
@@ -1557,6 +1632,20 @@ public:
             for (const Integer &input :
                  Downcast<ffi::Array<Integer>>(inputs.value()))
               reads_previous |= input->value == entry->previous_value_id;
+          // Reentry is an identity load of the exact preceding version's
+          // completed snapshot, never an untyped relabeling across DST modes.
+          if (precision_regions_ && call->args.size() == 2) {
+            int64_t source = RequireStaticInteger(call->args[1], "reentry DFB");
+            auto expression = call->annotations.Get("tt.expression");
+            const auto *load = expression.has_value()
+                                   ? expression.value().as<CallNode>()
+                                   : nullptr;
+            reads_previous |=
+                stored_values_.count(source) &&
+                stored_values_.at(source) == entry->previous_value_id && load &&
+                load->op.same_as(dfb_load()) && load->args.size() == 1 &&
+                RequireStaticInteger(load->args[0], "reentry DFB") == source;
+          }
           Check(
               reads_previous,
               "accumulator elementwise update must read its previous version");
@@ -1574,9 +1663,12 @@ public:
   }
   void Define(int64_t id) {
     CheckOwner(id);
+    Check(!precision_regions_ || precision_epoch_ > 0,
+          "v8 computation requires an explicit precision region");
     Check(values_.count(id) && defined_.insert(id).second,
           "compute value definition missing or duplicated");
     const auto &entry = values_.at(id);
+    value_epochs_[id] = precision_epoch_;
     Check(entry->previous_value_id == -1 ||
               defined_.count(entry->previous_value_id),
           "compute value predecessor is not defined");
@@ -1648,6 +1740,7 @@ public:
           "compute value materialization must preserve dtype");
     VerifyTileGrid(value->buffer->shape, dfbs.at(id)->block_shape_in_tiles,
                    "compute value store");
+    stored_values_[id] = value->value_id;
     for (const auto &[root, count] : value_k_.at(value->value_id)) {
       Check(count == accumulators_.at(root)->full_k_tiles,
             "GEMM materialization precedes complete K reduction");
@@ -1678,6 +1771,10 @@ public:
 
 private:
   bool enabled_{false};
+  bool precision_regions_{false};
+  int64_t precision_epoch_{0};
+  std::map<int64_t, int64_t> value_epochs_;
+  std::map<int64_t, int64_t> stored_values_;
   PrimFunc function_;
   std::map<int64_t, PrimFunc> owners_;
   std::map<int64_t, PrimFunc> accumulator_owners_;
@@ -2026,6 +2123,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
             "Phase 4 backing offset must be zero");
       Check(dfb->element_dtype == tensor->dtype &&
                 (accumulators || value_program ||
+                 dfb->block_shape_in_tiles.size() <
+                     tensor->tile_grid_shape.size() ||
                  ffi::StructuralEqual()(dfb->block_shape_in_tiles,
                                         tensor->tile_grid_shape)),
             "DFB Tensor backing metadata mismatch");
@@ -2097,7 +2196,10 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
           Check(producers.emplace(id, event).second,
                 "DFB generation published more than once");
         };
-        if (call->op.same_as(dfb_reserve()) || call->op.same_as(dfb_wait())) {
+        if (call->op.same_as(compute_precision())) {
+          values.Precision(call);
+        } else if (call->op.same_as(dfb_reserve()) ||
+                   call->op.same_as(dfb_wait())) {
           Check(call->args.size() == 2 &&
                     RequireStaticInteger(call->args[1], "transaction count") ==
                         1,
@@ -2220,7 +2322,9 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
           for (size_t axis = 0; axis < tensor->shape.size(); ++axis) {
             const PrimExpr &start = call->args[2 + 2 * axis];
             const PrimExpr &extent = call->args[3 + 2 * axis];
-            if (accumulators || value_program) {
+            if (accumulators || value_program ||
+                tensor->shape.size() >
+                    dfbs.at(id)->block_shape_in_tiles.size()) {
               arith::Analyzer analyzer;
               int64_t begin = RequireStaticInteger(start, "transfer start");
               int64_t size = RequireStaticInteger(extent, "transfer extent");
@@ -2237,6 +2341,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
             }
             transfer_shape.push_back(extent);
           }
+          transfer_shape = LocalTransferShape(transfer_shape, dfbs.at(id));
           VerifyTileGrid(transfer_shape, dfbs.at(id)->block_shape_in_tiles,
                          "Tensor transfer");
           auto dfb = dfbs.at(id);
@@ -2347,6 +2452,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
       ffi::Array<PrimExpr> shape;
       for (size_t axis = 3; axis < call->args.size(); axis += 2)
         shape.push_back(call->args[axis]);
+      shape = LocalTransferShape(shape, dfbs.at(id));
       Check(logical_shapes.count(id) &&
                 ffi::StructuralEqual()(logical_shapes.at(id), shape),
             "export logical shape disagrees with its producer");
@@ -2696,9 +2802,12 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
           Check(producers.emplace(id, event).second,
                 "DFB generation published more than once");
         };
-        if (call->op.same_as(dfb_reserve()) || call->op.same_as(dfb_wait()) ||
-            call->op.same_as(dfb_release()) ||
-            call->op.same_as(dfb_copy_wait())) {
+        if (call->op.same_as(compute_precision())) {
+          values.Precision(call);
+        } else if (call->op.same_as(dfb_reserve()) ||
+                   call->op.same_as(dfb_wait()) ||
+                   call->op.same_as(dfb_release()) ||
+                   call->op.same_as(dfb_copy_wait())) {
           Check(call->args.size() == 2 &&
                     RequireStaticInteger(call->args[1], "transaction count") ==
                         1,
@@ -2833,6 +2942,7 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
             bounds.push_back(call->args[2 + 2 * axis]);
             bounds.push_back(call->args[3 + 2 * axis]);
           }
+          shape = LocalTransferShape(shape, dfbs.at(id));
           VerifyTileGrid(shape, dfbs.at(id)->block_shape_in_tiles,
                          "transfer DFB");
           const auto backing = dfbs.at(id)->tensor_backing;
@@ -3091,6 +3201,8 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
       ffi::Array<PrimExpr> shape;
       for (size_t i = 3; i < call->args.size(); i += 2)
         shape.push_back(call->args[i]);
+      shape = LocalTransferShape(
+          shape, dfbs.at(RequireStaticInteger(call->args[0], "export DFB ID")));
       Check(ffi::StructuralEqual()(
                 shape_of(RequireStaticInteger(call->args[0], "export DFB ID")),
                 shape),
@@ -3112,9 +3224,9 @@ IRModule VerifyModule(IRModule mod) {
   Integer version = RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr);
   Check(version->value == kDeviceIRVersion || version->value == 2 ||
             version->value == 3 || version->value == 4 || version->value == 5 ||
-            version->value == 6 || version->value == 7,
+            version->value == 6 || version->value == 7 || version->value == 8,
         "unsupported tt.device_ir_version " + std::to_string(version->value) +
-            "; expected 1, 2, 3, 4, 5, 6, or 7");
+            "; expected 1, 2, 3, 4, 5, 6, 7, or 8");
 
   for (const char *key :
        {kDFBStorageGroupsAttr, kPipelineRelationsAttr, kPipelineStagesAttr,
@@ -3123,7 +3235,7 @@ IRModule VerifyModule(IRModule mod) {
           std::string(key) +
               " pipeline metadata requires Device IR schema v3 or newer");
 
-  Check(version->value == 5 || version->value == 6 || version->value == 7 ||
+  Check(version->value == 5 || version->value == 6 || version->value >= 7 ||
             !mod->attrs->dict.count(kAccumulatorTableAttr),
         "tt.accumulator_table requires Device IR schema v5 or v6");
   if (version->value == 5 ||
@@ -3133,14 +3245,14 @@ IRModule VerifyModule(IRModule mod) {
                .empty(),
           "schema v5 requires a nonempty accumulator table");
   }
-  Check(version->value == 7 || !mod->attrs->dict.count(kComputeValueTableAttr),
+  Check(version->value >= 7 || !mod->attrs->dict.count(kComputeValueTableAttr),
         "tt.compute_value_table requires Device IR v7");
-  Check(version->value == 4 || version->value == 6 || version->value == 7 ||
+  Check(version->value == 4 || version->value == 6 || version->value >= 7 ||
             !mod->attrs->dict.count(kPipeTransferTableAttr),
         "tt.pipe_transfer_table requires Device IR schema v4, v6 or v7");
   const bool multicore =
       version->value == 4 || version->value == 6 ||
-      (version->value == 7 && mod->attrs->dict.count(kPipeTransferTableAttr));
+      (version->value >= 7 && mod->attrs->dict.count(kPipeTransferTableAttr));
 
   ffi::String target_arch =
       RequireModuleAttr<ffi::String>(mod, kTargetArchAttr);
@@ -3176,7 +3288,7 @@ IRModule VerifyModule(IRModule mod) {
   DFBTable dfb_table = VerifyDFBTable(dfbs, tensor_table, launch_grid, general);
   VerifyPipeTable(pipes, dfb_table, launch_grid);
   if (!multicore && !mod->attrs->dict.count(kPipelineStagesAttr) &&
-      (version->value < 3 || version->value == 5 || version->value == 7))
+      (version->value < 3 || version->value == 5 || version->value >= 7))
     VerifyLegacyL1Budget(mod, dfb_table);
   if (multicore) {
     VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr, true,
@@ -3210,8 +3322,20 @@ IRModule VerifyModule(IRModule mod) {
         func->GetAttr<ffi::String>(kKernelSlotAttr).value() == "trisc";
     Check(compute || !requirements.has_value(),
           "data movement kernel must not carry tt.compute_requirements");
+    auto region_requirements = func->GetAttr<ffi::Array<ComputeRequirements>>(
+        "tt.compute_region_requirements");
+    Check((version->value == 8 && compute) || !region_requirements.has_value(),
+          "compute region requirements require v8 TRISC");
+    if (version->value == 8 && compute) {
+      Check(region_requirements.has_value(),
+            "v8 missing compute region requirements");
+      Check(
+          ffi::StructuralEqual()(region_requirements.value(),
+                                 DeriveRegionComputeRequirements(mod, func)),
+          "compute region requirements disagree with actual Device operations");
+    }
     if (compute && (version->value == 5 || version->value == 6 ||
-                    version->value == 7 || requirements.has_value())) {
+                    version->value >= 7 || requirements.has_value())) {
       Check(requirements.has_value(),
             "schema v5 compute kernel missing tt.compute_requirements");
       ComputeRequirements expected = DeriveComputeRequirements(mod, func);

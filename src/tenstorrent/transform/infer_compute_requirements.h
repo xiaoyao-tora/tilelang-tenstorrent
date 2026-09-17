@@ -11,6 +11,9 @@ namespace tenstorrent {
  * lifetimes. */
 TVM_DLL ComputeRequirements
 DeriveComputeRequirements(const IRModule &mod, const tirx::PrimFunc &func);
+TVM_DLL ffi::Array<ComputeRequirements>
+DeriveRegionComputeRequirements(const IRModule &mod,
+                                const tirx::PrimFunc &func);
 TVM_DLL tvm::transform::Pass InferTenstorrentComputeRequirements();
 } // namespace tenstorrent
 } // namespace tl

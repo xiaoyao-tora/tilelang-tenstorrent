@@ -41,6 +41,19 @@ ffi::String StringAnnotation(const Call &call, const char *key) {
 ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
                                               const tirx::PrimFunc &func) {
   if (mod->GetAttr<Integer>(kDeviceIRVersionAttr).value_or(Integer(0))->value ==
+      8) {
+    auto regions = DeriveRegionComputeRequirements(mod, func);
+    ffi::Array<AccumulatorDescriptor> accumulators;
+    std::set<int64_t> seen;
+    for (const auto &region : regions)
+      for (const auto &accumulator : region->accumulators)
+        if (seen.insert(accumulator->accumulator_id).second)
+          accumulators.push_back(accumulator);
+    return ComputeRequirements(regions.empty() ? "unconstrained"
+                                               : "region_scoped",
+                               "allowed", accumulators);
+  }
+  if (mod->GetAttr<Integer>(kDeviceIRVersionAttr).value_or(Integer(0))->value ==
       7) {
     auto values = mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
         kComputeValueTableAttr);
@@ -327,6 +340,128 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
   return ComputeRequirements(width, full, used);
 }
 
+ffi::Array<ComputeRequirements>
+DeriveRegionComputeRequirements(const IRModule &mod, const PrimFunc &func) {
+  Check(
+      mod->GetAttr<Integer>(kDeviceIRVersionAttr).value_or(Integer(0))->value ==
+          8,
+      "precision regions require Device IR v8");
+  ffi::Array<ComputeRequirements> result;
+  if (func->GetAttr<ffi::String>(kKernelSlotAttr).value_or("") != "trisc")
+    return result;
+  std::map<int64_t, ComputeValueDescriptor> values;
+  for (const auto &value :
+       mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(kComputeValueTableAttr)
+           .value_or(ffi::Array<ComputeValueDescriptor>()))
+    Check(value.defined() && values.emplace(value->value_id, value).second,
+          "invalid or duplicate compute value descriptor");
+  std::map<int64_t, AccumulatorDescriptor> accumulators;
+  for (const auto &entry :
+       mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr)
+           .value_or(ffi::Array<AccumulatorDescriptor>()))
+    Check(entry.defined() &&
+              accumulators.emplace(entry->accumulator_id, entry).second,
+          "invalid or duplicate accumulator descriptor");
+  std::map<int64_t, DFBDescriptor> dfbs;
+  for (const auto &dfb : mod->GetAttr<ffi::Array<DFBDescriptor>>(kDFBTableAttr)
+                             .value_or(ffi::Array<DFBDescriptor>()))
+    Check(dfb.defined() && dfbs.emplace(dfb->dfb_id, dfb).second,
+          "invalid or duplicate DFB descriptor");
+  ffi::Array<Stmt> body;
+  if (const auto *sequence = func->body.as<SeqStmtNode>())
+    body = sequence->seq;
+  else
+    body.push_back(func->body);
+  int64_t mode = -1;
+  ffi::Array<Stmt> segment;
+  ffi::Array<ComputeValueDescriptor> region_values;
+  ffi::Array<AccumulatorDescriptor> region_accumulators;
+  std::set<int64_t> used_accumulators;
+  auto flush = [&]() {
+    if (mode < 0)
+      return;
+    Check(!segment.empty(), "empty compute precision region");
+    IRModule logical = WithAttr(mod, kDeviceIRVersionAttr, Integer(7));
+    logical = WithAttr(logical, kComputeValueTableAttr, region_values);
+    logical = WithAttr(logical, kAccumulatorTableAttr, region_accumulators);
+    PrimFunc region = func;
+    region.CopyOnWrite()->body = SeqStmt(segment);
+    auto requirements = DeriveComputeRequirements(logical, region);
+    ffi::String width = mode == 0 ? "bits16_required" : "bits32_required";
+    Check(requirements->destination_width == "unconstrained" ||
+              requirements->destination_width == width,
+          "compute precision region mode conflicts with actual hard "
+          "destination width");
+    result.push_back(ComputeRequirements(width, requirements->matmul_full_fp32,
+                                         requirements->accumulators));
+    segment.clear();
+    region_values.clear();
+    region_accumulators.clear();
+    used_accumulators.clear();
+  };
+  for (const Stmt &statement : body) {
+    const auto *evaluate = statement.as<EvaluateNode>();
+    Check(evaluate != nullptr,
+          "precision regions require scheduled Device operations");
+    const auto *node = evaluate->value.as<CallNode>();
+    if (!node) {
+      Check(is_zero(evaluate->value),
+            "precision region has a non-operation statement");
+      continue;
+    }
+    Call call = ffi::GetRef<Call>(node);
+    if (call->op.same_as(compute_precision())) {
+      Check(call->args.size() == 1 && call->annotations.empty(),
+            "compute_precision requires one mode without annotations");
+      flush();
+      mode = IntegerValue(call->args[0]);
+      Check(mode == 0 || mode == 1, "compute precision mode must be 0 or 1");
+      continue;
+    }
+    bool definition = call->op.same_as(compute_value()) ||
+                      call->op.same_as(compute_value_gemm());
+    bool computation = definition || call->op.same_as(dfb_compute()) ||
+                       call->op.same_as(compute_value_store());
+    Check(mode >= 0 || !computation,
+          "v8 computation requires an explicit precision region");
+    if (mode < 0)
+      continue;
+    if (call->op.same_as(dfb_compute())) {
+      for (const PrimExpr &operand : call->args) {
+        int64_t id = IntegerValue(operand);
+        Check(dfbs.count(id), "dfb_compute references missing DFB");
+        Check(
+            mode == 1 || dfbs.at(id)->element_dtype != DataType::Float(32),
+            "compute precision region mode conflicts with FP32 DFB arithmetic");
+      }
+    }
+    if (call->op.same_as(compute_value_store())) {
+      Check(call->args.size() == 2 && values.count(IntegerValue(call->args[0])),
+            "compute value store references missing value");
+      Check(mode == 1 ||
+                values.at(IntegerValue(call->args[0]))->buffer->dtype !=
+                    DataType::Float(32),
+            "compute precision region mode conflicts with FP32 value store");
+    }
+    segment.push_back(statement);
+    if (definition) {
+      Check(!call->args.empty(), "compute value definition missing ID");
+      int64_t id = IntegerValue(call->args[0]);
+      Check(values.count(id), "compute value references missing descriptor");
+      region_values.push_back(values.at(id));
+      if (call->op.same_as(compute_value_gemm())) {
+        int64_t accumulator = values.at(id)->accumulator_id;
+        Check(accumulators.count(accumulator),
+              "value GEMM references missing accumulator");
+        if (used_accumulators.insert(accumulator).second)
+          region_accumulators.push_back(accumulators.at(accumulator));
+      }
+    }
+  }
+  flush();
+  return result;
+}
+
 tvm::transform::Pass InferTenstorrentComputeRequirements() {
   auto pass_func = [](IRModule mod, tvm::transform::PassContext context) {
     IRModule result = mod;
@@ -347,6 +482,21 @@ tvm::transform::Pass InferTenstorrentComputeRequirements() {
           "existing tt.compute_requirements conflicts with Device operations");
       result->Update(global,
                      WithAttr(func, kComputeRequirementsAttr, requirements));
+      if (mod->GetAttr<Integer>(kDeviceIRVersionAttr)
+              .value_or(Integer(0))
+              ->value == 8) {
+        auto regions = DeriveRegionComputeRequirements(mod, func);
+        auto old_regions = func->GetAttr<ffi::Array<ComputeRequirements>>(
+            "tt.compute_region_requirements");
+        Check(!old_regions.has_value() ||
+                  ffi::StructuralEqual()(old_regions.value(), regions),
+              "existing compute precision regions conflict with Device "
+              "operations");
+        result->Update(
+            global,
+            WithAttr(WithAttr(func, kComputeRequirementsAttr, requirements),
+                     "tt.compute_region_requirements", regions));
+      }
     }
     return result;
   };

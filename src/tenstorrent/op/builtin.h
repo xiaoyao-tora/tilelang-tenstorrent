@@ -59,6 +59,7 @@ TVM_DLL const Op &tile_compute();
 TVM_DLL const Op &dfb_compute();
 TVM_DLL const Op &dfb_load();
 // Schema v7 immutable compute-local definitions, references and stores.
+TVM_DLL const Op &compute_precision();
 TVM_DLL const Op &compute_value();
 TVM_DLL const Op &compute_value_load();
 TVM_DLL const Op &compute_value_store();

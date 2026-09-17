@@ -29,28 +29,39 @@ def interpret(mod, inputs, seed=0):
     value_info = {int(value.value_id): value for value in mod.attrs.get("tt.compute_value_table", [])}
     dfb_info = {int(dfb.dfb_id): dfb for dfb in mod.attrs["tt.dfb_table"]}
     streams = [list(_calls(func.body)) for func in mod.functions.values()]
+    explicit_release = any(call.op.name == "tl.tt.dfb_release" for stream in streams for call in stream)
     cursors = [0] * len(streams)
+    value_owners = {
+        int(call.args[0]): index
+        for index, stream in enumerate(streams)
+        for call in stream
+        if call.op.name in ("tl.tt.compute_value", "tl.tt.compute_value_gemm")
+    }
+    precision = {}
     asynchronous = {int(call.args[0]) for stream in streams for call in stream if call.op.name == "tl.tt.dfb_copy_wait"}
 
-    def expression(expr):
+    def expression(expr, maps):
         if isinstance(expr, (tirx.IntImm, tirx.FloatImm)):
             return np.float32(expr.value)
         if isinstance(expr, tirx.Cast):
-            return _round(expression(expr.value), expr.dtype)
+            return _round(expression(expr.value, maps), expr.dtype)
         if isinstance(expr, tirx.Call):
-            identifier = int(expr.args[0])
-            if expr.op.name == "tl.tt.dfb_load":
-                return dfbs[identifier]
-            if expr.op.name == "tl.tt.compute_value_load":
-                return values[identifier]
+            if expr.op.name in ("tl.tt.dfb_load", "tl.tt.compute_value_load"):
+                identifier = int(expr.args[0])
+                source = dfbs[identifier] if expr.op.name == "tl.tt.dfb_load" else values[identifier]
+                axes = maps[(expr.op.name, identifier)]
+                return source[tuple(slice(0, 1) if axis == -1 else slice(None) for axis in axes)]
+            if expr.op.name == "tirx.exp2":
+                return _round(np.exp2(expression(expr.args[0], maps)), expr.dtype)
             raise AssertionError(expr.op.name)
-        binary = {tirx.Add: np.add, tirx.Sub: np.subtract, tirx.Mul: np.multiply, tirx.Max: np.maximum}
-        return _round(binary[type(expr)](expression(expr.a), expression(expr.b)), expr.dtype)
+        binary = {tirx.Add: np.add, tirx.Sub: np.subtract, tirx.Mul: np.multiply, tirx.Div: np.divide, tirx.Max: np.maximum}
+        return _round(binary[type(expr)](expression(expr.a, maps), expression(expr.b, maps)), expr.dtype)
 
     for _ in range(10000):
         if all(cursor == len(stream) for cursor, stream in zip(cursors, streams)):
             assert not pending, "Copies remain incomplete"
-            assert not occupied, "DFB reservations remain live"
+            if explicit_release:
+                assert not occupied, "DFB reservations remain live"
             return tensors, values
         advanced = False
         for index in random.permutation(len(streams)):
@@ -59,6 +70,14 @@ def interpret(mod, inputs, seed=0):
                 continue
             call = stream[cursors[index]]
             name, args = call.op.name, list(map(int, call.args))
+            if name == "tl.tt.compute_precision":
+                assert args[0] in (0, 1)
+                precision[index] = args[0]
+                # Compute-local values cannot survive a destination precision
+                # transition. Only explicit DFB snapshots can reload them.
+                for identifier in list(values):
+                    if value_owners[identifier] == index:
+                        del values[identifier]
             if name == "tl.tt.dfb_wait" and args[0] not in dfbs:
                 continue
             if name == "tl.tt.dfb_pipe_recv" and args[0] not in deliveries:
@@ -72,6 +91,10 @@ def interpret(mod, inputs, seed=0):
             elif name == "tl.tt.tensor_to_dfb_nd":
                 region = tuple(slice(args[i], args[i] + args[i + 1]) for i in range(2, len(args), 2))
                 value = tensors[args[0]][region].copy()
+                local_rank = len(dfb_info[args[1]].block_shape_in_tiles)
+                while value.ndim > local_rank:
+                    assert value.shape[0] == 1
+                    value = value[0]
                 if args[1] in asynchronous:
                     pending[args[1]] = ("load", value)
                 else:
@@ -95,16 +118,27 @@ def interpret(mod, inputs, seed=0):
             elif name in ("tl.tt.compute_value", "tl.tt.dfb_compute"):
                 attrs = call.annotations
                 kind = str(attrs["tt.compute_kind"].value)
+                domain = tuple(map(int, attrs["tt.logical_domain"]))
                 if kind == "transpose":
                     result = dfbs[args[1]].swapaxes(-1, -2)
                 elif kind == "reduce":
                     reducer = {"sum": np.sum, "max": np.max, "min": np.min}[str(attrs["tt.reduce_kind"].value)]
-                    result = reducer(dfbs[args[1]], axis=int(attrs["tt.reduce_axis"]))
+                    result = reducer(dfbs[args[1]], axis=int(attrs["tt.reduce_axis"]), keepdims=len(domain) == dfbs[args[1]].ndim)
                 elif kind == "copy":
                     result = dfbs[args[1]]
                 else:
-                    result = expression(attrs["tt.expression"])
-                result = np.broadcast_to(result, tuple(map(int, attrs["tt.logical_domain"]))).copy()
+                    maps = {
+                        ("tl.tt.dfb_load", identifier): tuple(map(int, axes))
+                        for identifier, axes in zip(args[1:], attrs.get("tt.access_maps", []))
+                    }
+                    maps.update(
+                        {
+                            ("tl.tt.compute_value_load", int(identifier)): tuple(map(int, axes))
+                            for identifier, axes in zip(attrs.get("tt.value_inputs", []), attrs.get("tt.value_access_maps", []))
+                        }
+                    )
+                    result = expression(attrs["tt.expression"], maps)
+                result = np.broadcast_to(result, domain).copy()
                 if name == "tl.tt.compute_value":
                     assert args[0] not in values
                     values[args[0]] = _round(result, value_info[args[0]].buffer.dtype)
@@ -112,6 +146,8 @@ def interpret(mod, inputs, seed=0):
                     dfbs[args[0]] = _round(result, dfb_info[args[0]].element_dtype)
             elif name == "tl.tt.compute_value_gemm":
                 output, lhs, rhs, old, ta, tb = args
+                if index in precision:
+                    assert precision[index] == (1 if value_info[output].buffer.dtype == "float32" else 0)
                 a, b = dfbs[lhs], dfbs[rhs]
                 result = (a.T if ta else a) @ (b.T if tb else b)
                 if old >= 0:
@@ -134,7 +170,13 @@ def interpret(mod, inputs, seed=0):
                 occupied.remove(args[0])
                 del dfbs[args[0]]
             else:
-                assert name in ("tl.tt.dfb_reserve", "tl.tt.dfb_wait", "tl.tt.dfb_copy_wait", "tl.tt.dfb_pipe_wait"), name
+                assert name in (
+                    "tl.tt.dfb_reserve",
+                    "tl.tt.dfb_wait",
+                    "tl.tt.dfb_copy_wait",
+                    "tl.tt.dfb_pipe_wait",
+                    "tl.tt.compute_precision",
+                ), name
             cursors[index] += 1
             advanced = True
         assert advanced, "Device streams deadlocked"

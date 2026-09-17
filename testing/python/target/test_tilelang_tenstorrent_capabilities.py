@@ -7,6 +7,7 @@ import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir
 from tilelang.tenstorrent.capabilities import CapabilityStatus, gemm_capability, lower_capability
+from testing.python.target.test_tilelang_tenstorrent_attention_regions import tensor_slice_program
 from testing.python.target.test_tilelang_tenstorrent_branch_merge import branch_program
 from testing.python.target.test_tilelang_tenstorrent_compute_values import gemm_fragment_operand, value_chain
 from testing.python.target.test_tilelang_tenstorrent_phase4_compute import (
@@ -67,6 +68,31 @@ def reduction_fragment_output():
     return main
 
 
+def keepdims_reduction(dtype="float32", reduction_kind="sum"):
+    @T.prim_func
+    def main(A: T.Tensor((32, 32), dtype), C: T.Tensor((32, 32), dtype)):
+        with T.Kernel(1, 1, threads=1):
+            a = T.alloc_shared((32, 32), dtype, annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 1})
+            f = T.alloc_fragment((32, 32), dtype)
+            row = T.alloc_fragment((32, 1), dtype)
+            column = T.alloc_shared((32, 32), dtype, annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 1})
+            output = T.alloc_shared((32, 32), dtype, annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 1})
+            T.copy(A, a)
+            T.copy(a, f)
+            if reduction_kind == "sum":
+                T.reduce_sum(f, row, dim=1)
+            elif reduction_kind == "max":
+                T.reduce_max(f, row, dim=1)
+            else:
+                T.reduce_min(f, row, dim=1)
+            T.copy(row, column[:, 0:1])
+            for i, j in T.Tiles(output):
+                output[i, j] = column[i, 0]
+            T.copy(output, C)
+
+    return main
+
+
 def shared_pipe_pipeline():
     net = T.comm.PipeNet([T.comm.Pipe((0, 0), (1, 0))])
 
@@ -104,6 +130,7 @@ def multicore_shared_pipeline():
 @pytest.mark.parametrize(
     "operation,factory,query",
     [
+        ("copy", tensor_slice_program, {}),
         ("elementwise", elementwise_program, {}),
         ("elementwise", lambda: batch_elementwise, {"rank": 3}),
         ("fill", lambda: fill_program, {}),
@@ -247,7 +274,8 @@ def test_deferred_combinations_are_not_reported_as_device_lower(operation, query
         ("gemm", {"input_dtype": "bfloat16", "output_dtype": "bfloat16", "accumulation_dtype": "float32"}, "must equal"),
         ("gemm", {"update_count": 0}, "at least one update"),
         ("transpose", {"transpose_axes": "arbitrary"}, "final two axes"),
-        ("reduce", {"keepdims": True}, "exactly one axis"),
+        ("reduce", {"keepdims": True}, "row fragment output"),
+        ("reduce", {"keepdims": True, "rank": 3}, "rank-2 input"),
         ("reduce", {"reduction_kind": "prod"}, "sum/max/min"),
         ("reduce", {"accumulation_dtype": "bfloat16"}, "float32 accumulation"),
         ("pipe", {"input_value_kind": "fragment", "multicore": True}, "shared DFBs"),
@@ -282,3 +310,22 @@ def test_legacy_gemm_query_keeps_lower_separate_from_validation(version, multico
     assert not capability.ttl_mapping
     assert not capability.compile_only_validated
     assert not capability.hardware_validated
+
+
+@pytest.mark.parametrize("arch", ["wormhole_b0", "blackhole"])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("reduction_kind", ["sum", "max", "min"])
+def test_keepdims_capability_matches_fragment_reduction_lower(arch, dtype, reduction_kind):
+    capability = lower_capability(
+        "reduce",
+        arch=arch,
+        input_dtype=dtype,
+        input_value_kind="fragment",
+        output_value_kind="fragment",
+        reduction_kind=reduction_kind,
+        keepdims=True,
+    )
+    assert capability.status == CapabilityStatus.SUPPORTED
+    target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
+    mod = lower_tenstorrent_ir(tvm.IRModule({"main": keepdims_reduction(dtype, reduction_kind)}), target)
+    assert int(mod.attrs["tt.device_ir_version"]) == capability.device_ir_version == 7

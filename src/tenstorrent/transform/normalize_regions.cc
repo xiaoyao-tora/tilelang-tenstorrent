@@ -161,16 +161,38 @@ ffi::String ClassifyTransfer(const Buffer &source, const Buffer &destination) {
 
 void ValidateMatchingExtents(const BufferRegion &source,
                              const BufferRegion &destination) {
-  if (source->region.size() != destination->region.size()) {
-    ThrowMalformed("source and destination region ranks differ");
+  size_t source_offset = 0;
+  size_t destination_offset = 0;
+  if (source->region.size() > destination->region.size() &&
+      IsGlobalBuffer(source->buffer) && !IsGlobalBuffer(destination->buffer)) {
+    source_offset = source->region.size() - destination->region.size();
+  } else if (destination->region.size() > source->region.size() &&
+             IsGlobalBuffer(destination->buffer) &&
+             !IsGlobalBuffer(source->buffer)) {
+    destination_offset = destination->region.size() - source->region.size();
+  } else if (source->region.size() != destination->region.size()) {
+    ThrowMalformed("source and destination region ranks differ; only leading "
+                   "singleton Tensor slice axes may be removed");
   }
-  for (size_t axis = 0; axis < source->region.size(); ++axis) {
+  // Selecting a batch/head coordinate retains the public Tensor's rank and
+  // strides. Only the local payload omits these leading singleton axes; this
+  // is not a general reshape, squeeze, or element-count based copy.
+  for (size_t axis = 0; axis < source_offset; ++axis) {
+    if (!is_one(source->region[axis]->extent))
+      ThrowMalformed("source leading Tensor slice axes must have extent one");
+  }
+  for (size_t axis = 0; axis < destination_offset; ++axis) {
+    if (!is_one(destination->region[axis]->extent))
+      ThrowMalformed(
+          "destination leading Tensor slice axes must have extent one");
+  }
+  for (size_t axis = 0; axis < source->region.size() - source_offset; ++axis) {
     int64_t source_extent =
-        RequireStaticInteger(source->region[axis]->extent,
+        RequireStaticInteger(source->region[axis + source_offset]->extent,
                              "source extent axis " + std::to_string(axis));
-    int64_t destination_extent =
-        RequireStaticInteger(destination->region[axis]->extent,
-                             "destination extent axis " + std::to_string(axis));
+    int64_t destination_extent = RequireStaticInteger(
+        destination->region[axis + destination_offset]->extent,
+        "destination extent axis " + std::to_string(axis));
     if (source_extent != destination_extent) {
       ThrowMalformed("source and destination extents differ on axis " +
                      std::to_string(axis));
@@ -252,8 +274,6 @@ public:
       aliases_ = std::move(saved_aliases);
       return result;
     }
-    if (!expand_accumulator_loops_)
-      return StmtExprMutator::VisitStmt_(op);
     // The single-Core path does not run topology specialization. Retain its
     // canonical launch prefix while resolving coordinates and scalar aliases.
     if (op->annotations.count("tt.logical_core_axis") && is_one(op->extent)) {
@@ -262,6 +282,8 @@ public:
       loop.CopyOnWrite()->body = VisitStmt(substitute(op->body));
       return loop;
     }
+    if (!expand_accumulator_loops_)
+      return StmtExprMutator::VisitStmt_(op);
     if (!op->annotations.empty())
       return StmtExprMutator::VisitStmt_(op);
     int64_t extent =

@@ -3,6 +3,8 @@
 本次补齐工作计划 `tilelang_tenstorrent_lower_codegen_work_plan_02.md` 中值版本、
 materialization、控制流、流水和多 Core 组合的 Lower 缺口。成功边界是经过独立
 verifier 检查的 Device IR；不新增 TTL Codegen、运行时或硬件能力。
+后续 Flash Attention 扩展的高阶 Tensor 切片、keepdims 和 v8 精度区域合同见
+[Flash Attention Lower](tenstorrent_flash_attention_lower.md)。
 
 ## 已补齐的路径
 
@@ -23,7 +25,7 @@ Device If ABI，也不支持任意分支内多次写入的值合并。
 
 ## 组合协议与 verifier
 
-不新增 Device IR 版本。旧程序继续使用原有版本；v7 保留 compute-value schema，
+本节所述组合保持原版本。旧程序继续使用原有版本；v7 保留 compute-value schema，
 通过已有拓扑表和流水属性表达组合。流水 metadata 可用于 v3–v7，v1/v2 携带这些
 属性会被拒绝。多 Core verifier 按实际 PrimFunc/Core 检查值的定义、使用及精度，
 禁止跨 Core 直接引用值或借用 DFB。

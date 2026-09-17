@@ -121,10 +121,13 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
         metadata->tensor_backing.has_value())
       ThrowUnsupported("compute fragment requires rank-2 geometry without DFB "
                        "storage metadata");
-    for (size_t axis = 0; axis < rank; ++axis)
-      if (RequireStaticExtent(buffer->shape[axis], buffer_id, axis) % 32 != 0)
+    for (size_t axis = 0; axis < rank; ++axis) {
+      int64_t extent =
+          RequireStaticExtent(buffer->shape[axis], buffer_id, axis);
+      if (extent != 1 && extent % 32 != 0)
         ThrowUnsupported(
             "compute fragment shape requires a padding/mask contract");
+    }
     // Infer compute geometry only; no DFB capacity or backing is synthesized.
   }
 
@@ -157,14 +160,18 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
     // Batch axes are not tiled. A rank-one reduction result occupies logical
     // row zero of a padded 32xN physical value; the row axis is implicit.
     const int64_t tile_extent = axis + 2 >= rank ? 32 : 1;
-    if (element_extent % tile_extent != 0) {
+    // A keepdims reduction carries only its logical singleton row/column;
+    // padding is never made available as a fragment element.
+    bool singleton_fragment = kind == "compute_fragment" && element_extent == 1;
+    if (!singleton_fragment && element_extent % tile_extent != 0) {
       ThrowUnsupported("buffer '" + buffer_id + "' shape axis " +
                        std::to_string(axis) + " (" +
                        std::to_string(element_extent) +
                        ") requires a padding/mask contract");
     }
-    tile_grid_shape.push_back(IntImm(metadata->buffer->shape[axis].dtype(),
-                                     element_extent / tile_extent));
+    tile_grid_shape.push_back(
+        IntImm(metadata->buffer->shape[axis].dtype(),
+               (element_extent + tile_extent - 1) / tile_extent));
   }
   if (metadata->tile_grid_shape.empty()) {
     *changed = true;

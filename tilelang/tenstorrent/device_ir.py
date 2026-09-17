@@ -1,4 +1,4 @@
-"""Typed construction helpers shared by Tenstorrent Device IR v1/v2/v3/v4/v5/v6/v7.
+"""Typed construction helpers shared by Tenstorrent Device IR v1 through v8.
 
 ``TTBufferMetadata`` is a normalization-stage object.  It is attached as an
 array under :data:`BUFFER_METADATA_TABLE_ATTR` before program formation and
@@ -26,6 +26,13 @@ fragment Buffer identities belong to exactly one TRISC function; topology v7
 also carries ``tt.pipe_transfer_table`` (possibly empty). Pipeline storage groups
 carry one generation per iteration, or one prologue/epilogue resource with the
 relation ``[-1, 0]``; singleton and iterative resources never share a group.
+
+Schema v8 adds explicit ``compute_precision(0|1)`` regions for 16/32-bit DST.
+TRISC ``tt.compute_region_requirements`` carries one typed requirement per
+region. Aggregate ``tt.compute_requirements.destination_width`` is
+``region_scoped``; it must not be interpreted as one physical kernel setting.
+Values cross boundaries only through completed exact-dtype DFB snapshots and
+new identity definitions. Earlier codegen consumers must reject version 8.
 """
 
 from __future__ import annotations
@@ -48,6 +55,7 @@ TENSOR_TABLE_ATTR = "tt.tensor_table"
 ACCUMULATOR_TABLE_ATTR = "tt.accumulator_table"
 COMPUTE_VALUE_TABLE_ATTR = "tt.compute_value_table"
 COMPUTE_REQUIREMENTS_ATTR = "tt.compute_requirements"
+COMPUTE_REGION_REQUIREMENTS_ATTR = "tt.compute_region_requirements"
 DFB_TABLE_ATTR = "tt.dfb_table"
 PIPE_TABLE_ATTR = "tt.pipe_table"
 PIPE_TRANSFER_TABLE_ATTR = "tt.pipe_transfer_table"
@@ -437,6 +445,7 @@ __all__ = (
     "ComputeRequirements",
     "ACCUMULATOR_TABLE_ATTR",
     "COMPUTE_REQUIREMENTS_ATTR",
+    "COMPUTE_REGION_REQUIREMENTS_ATTR",
     "BUFFER_METADATA_TABLE_ATTR",
     "CoreCoord",
     "CoreDomain",

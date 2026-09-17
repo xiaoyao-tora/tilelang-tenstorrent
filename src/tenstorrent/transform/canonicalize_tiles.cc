@@ -3,6 +3,9 @@
  * \brief Capture Tiles and Parallel elementwise semantics before logical loop
  * binders disappear.
  */
+#include "../../op/copy.h"
+#include "../../op/region.h"
+#include "../../op/utils.h"
 #include "attr.h"
 
 #include <tvm/arith/analyzer.h>
@@ -312,7 +315,9 @@ private:
       int64_t padding = axis + 2 < domain.size() ? 1 : 32;
       int64_t expected =
           axes[axis]->value < 0 ? padding : Static(domain[axis], "domain");
-      Require(Static(buffer->shape[axis], "buffer shape") == expected,
+      int64_t actual = Static(buffer->shape[axis], "buffer shape");
+      Require(actual == expected || (value_kind == "compute_fragment" &&
+                                     axes[axis]->value < 0 && actual == 1),
               "buffer '" + std::string(buffer->name) +
                   "' shape does not match identity or compact padded broadcast "
                   "shape");
@@ -526,7 +531,8 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
       logical.push_back(extent);
       physical_tiles.push_back(
           make_const(access.buffer->shape[axis].dtype(),
-                     Static(access.buffer->shape[axis], "shape") /
+                     (Static(access.buffer->shape[axis], "shape") +
+                      (axis + 2 < plan.domain.size() ? 0 : 31)) /
                          (axis + 2 < plan.domain.size() ? 1 : 32)));
       if (access.axes[axis]->value < 0)
         broadcast_axes.push_back(Integer(axis));
@@ -582,6 +588,103 @@ Stmt MergeComputeBranch(const IfThenElse &branch,
                         const AllocationCollector &allocation,
                         const Array<Var> &scalar_parameters);
 
+bool IsRowPaddingCopy(const Copy &copy) {
+  arith::Analyzer analyzer;
+  if (copy->src.scope() != "local.fragment" ||
+      (copy->dst.scope() != "shared" && copy->dst.scope() != "shared.dyn") ||
+      copy->src->shape.size() != 2 || copy->dst->shape.size() != 2 ||
+      copy->src_range.size() != 2 || copy->dst_range.size() != 2 ||
+      copy->src->dtype != copy->dst->dtype || !is_one(copy->src->shape[1]) ||
+      !is_const_int(copy->dst->shape[1], 32) ||
+      !analyzer.CanProveEqual(copy->src->shape[0], copy->dst->shape[0]))
+    return false;
+  for (size_t axis = 0; axis < 2; ++axis) {
+    if (!is_zero(copy->src_range[axis]->min) ||
+        !is_zero(copy->dst_range[axis]->min) ||
+        !analyzer.CanProveEqual(copy->src_range[axis]->extent,
+                                copy->src->shape[axis]) ||
+        !analyzer.CanProveEqual(copy->dst_range[axis]->extent,
+                                copy->src->shape[axis]))
+      return false;
+  }
+  return true;
+}
+
+// Extending a column-zero store into physical padding is legal only when every
+// use observes column zero. Analyze the entire function, including uses before
+// the copy and across loop iterations, so initialized padding cannot escape.
+class RowPaddingUseVerifier : public StmtExprVisitor {
+public:
+  explicit RowPaddingUseVerifier(Buffer buffer) : buffer_(std::move(buffer)) {}
+  bool Verify(const Stmt &body) {
+    VisitStmt(body);
+    return valid_;
+  }
+  void VisitExpr(const PrimExpr &expr) final {
+    if (const auto *region = expr.as<BufferRegionNode>()) {
+      if (region->buffer->data.same_as(buffer_->data))
+        valid_ = false;
+    }
+    StmtExprVisitor::VisitExpr(expr);
+  }
+  void VisitExpr_(const VarNode *op) final {
+    if (ffi::GetRef<Var>(op).same_as(buffer_->data))
+      valid_ = false;
+  }
+  void VisitExpr_(const BufferLoadNode *op) final {
+    if (op->buffer->data.same_as(buffer_->data)) {
+      if (!op->buffer.same_as(buffer_) || op->indices.size() != 2 ||
+          !is_zero(op->indices[1]))
+        valid_ = false;
+    }
+    for (const PrimExpr &index : op->indices)
+      VisitExpr(index);
+  }
+  void VisitStmt_(const BufferStoreNode *op) final {
+    if (op->buffer->data.same_as(buffer_->data))
+      valid_ = false;
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitStmt_(const SBlockNode *op) final {
+    for (const MatchBufferRegion &match : op->match_buffers) {
+      if (match->source->buffer->data.same_as(buffer_->data))
+        valid_ = false;
+    }
+    // Captured templates replace logical indices with zero. Their read
+    // descriptors retain the accessed region and must govern repeat passes.
+    if (op->annotations.count(kTTComputeKind)) {
+      for (const BufferRegion &region : op->reads) {
+        if (region->buffer->data.same_as(buffer_->data) &&
+            (!region->buffer.same_as(buffer_) || region->region.size() != 2 ||
+             !is_zero(region->region[1]->min) ||
+             !is_one(region->region[1]->extent)))
+          valid_ = false;
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(RegionOp::Get())) {
+      BufferRegion region = NormalizeToBufferRegion(ffi::GetRef<Call>(op));
+      if (region->buffer->data.same_as(buffer_->data))
+        valid_ = false;
+    }
+    if (op->op.same_as(Copy::Get()) && op->args.size() == 2 &&
+        op->annotations.empty()) {
+      Copy copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(op)));
+      if (copy->dst.same_as(buffer_) && IsRowPaddingCopy(copy)) {
+        VisitExpr(op->args[0]);
+        return;
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+private:
+  Buffer buffer_;
+  bool valid_{true};
+};
+
 class Canonicalizer : public StmtMutator {
 public:
   explicit Canonicalizer(const PrimFunc &func) : func_(func) {
@@ -616,6 +719,32 @@ public:
   Stmt VisitStmt_(const IfThenElseNode *op) final {
     IfThenElse branch = Downcast<IfThenElse>(StmtMutator::VisitStmt_(op));
     return MergeComputeBranch(branch, allocation_, scalar_parameters_);
+  }
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!call || !call->op.same_as(Copy::Get()) || call->args.size() != 2 ||
+        !call->annotations.empty())
+      return ffi::GetRef<Stmt>(op);
+    Copy copy = Downcast<Copy>(ParseOperator(ffi::GetRef<Call>(call)));
+    if (!IsRowPaddingCopy(copy) ||
+        !RowPaddingUseVerifier(copy->dst).Verify(func_->body))
+      return ffi::GetRef<Stmt>(op);
+    auto target = func_->GetAttr<Target>(tvm::attr::kTarget);
+    Require(target.has_value() && target.value()->kind->name == "tenstorrent",
+            "canonicalization requires a bound Tenstorrent target");
+    Var row("tt_row", copy->dst->shape[0].dtype());
+    Var column("tt_column", copy->dst->shape[1].dtype());
+    Stmt body = BufferStore(
+        copy->dst, BufferLoad(copy->src, {row, make_zero(column.dtype())}),
+        {row, column}, std::nullopt, op->span);
+    body =
+        For(column, make_zero(column.dtype()), copy->dst->shape[1],
+            ForKind::kParallel, body, std::nullopt, {}, std::nullopt, op->span);
+    body =
+        For(row, make_zero(row.dtype()), copy->dst->shape[0],
+            ForKind::kParallel, body, std::nullopt, {}, std::nullopt, op->span);
+    ScopeAnalyzer analyzer(allocation_, false, scalar_parameters_);
+    return ApplyPlan(analyzer.Analyze(Downcast<For>(body), false));
   }
 
 private:

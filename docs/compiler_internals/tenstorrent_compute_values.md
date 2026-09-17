@@ -4,10 +4,13 @@ The v7 protocol extends structured `T.Tiles` lowering to ordinary
 fragments and GEMM epilogues. It preserves immutable values independently of
 DFB storage and keeps the existing v1–v6 protocols for their original programs.
 The complete pass sequence remains in `tilelang/tenstorrent/pipeline.py`.
+Device IR v8 extends this contract with explicit precision regions and exact
+DFB snapshots between them; see [Flash Attention Lower](tenstorrent_flash_attention_lower.md).
 
 ## Supported frontend contract
 
-- Static rank-2, tile-aligned BF16/FP32 buffers and 32×32 compute tiles.
+- Static rank-2 BF16/FP32 local buffers and 32×32 compute tiles, including
+  keepdims row fragments with a singleton final axis.
 - Shared or fragment inputs and outputs, including mixed inputs, explicit
   casts and padded row/column/scalar broadcast.
 - Original Buffer identity, old/new versions, multiple consumers and bounded

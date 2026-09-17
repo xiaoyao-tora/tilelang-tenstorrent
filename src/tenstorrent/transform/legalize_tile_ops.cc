@@ -161,7 +161,9 @@ void ValidateRegion(const BufferRegion &region, const std::string &owner,
   for (size_t axis = 0; axis < buffer->shape.size(); ++axis) {
     const auto *extent = buffer->shape[axis].as<IntImmNode>();
     Require(extent && extent->value > 0 &&
-                (axis + 2 < buffer->shape.size() || extent->value % 32 == 0),
+                (axis + 2 < buffer->shape.size() || extent->value % 32 == 0 ||
+                 (allow_fragment && buffer.scope() == "local.fragment" &&
+                  extent->value == 1)),
             owner + " requires static positive batch dimensions and "
                     "tile-aligned final axes");
     Require(is_zero(region->region[axis]->min) &&
@@ -205,6 +207,7 @@ class GemmAccumulatorVerifier : public StmtExprVisitor {
     int64_t core_y{-1};
     ffi::Array<Annotations> elementwise_updates;
     int initialization_depth{-1};
+    bool final_update{false};
   };
 
   class Collector : public StmtExprVisitor {
@@ -215,7 +218,10 @@ class GemmAccumulatorVerifier : public StmtExprVisitor {
       int64_t core_y;
     };
     std::vector<Fragment> fragments;
+    std::vector<Call> calls;
     void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(Gemm::Get()) || op->op.same_as(Fill::Get()))
+        calls.push_back(ffi::GetRef<Call>(op));
       if (op->op.same_as(Gemm::Get())) {
         Gemm gemm = Downcast<Gemm>(ParseOperator(ffi::GetRef<Call>(op)));
         if (gemm->c_.scope() == "local.fragment") {
@@ -256,6 +262,26 @@ public:
       return func;
     }
     GemmAccumulatorVerifier verifier;
+    // Determine whether a syntactic GEMM has another update before the next
+    // explicit initialization. Loop-depth checks below still prohibit treating
+    // an update inside a K loop as the complete reduction.
+    std::unordered_map<Var, bool, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+        pending_update;
+    for (auto it = collector.calls.rbegin(); it != collector.calls.rend();
+         ++it) {
+      const Call &call = *it;
+      if (call->op.same_as(Fill::Get())) {
+        Fill fill = Downcast<Fill>(ParseOperator(call));
+        pending_update.erase(fill->dst->data);
+      } else {
+        Gemm gemm = Downcast<Gemm>(ParseOperator(call));
+        bool final = !pending_update[gemm->c_->data];
+        auto [entry, inserted] = verifier.final_updates_.emplace(call, final);
+        if (!inserted)
+          entry->second &= final;
+        pending_update[gemm->c_->data] = !is_one(gemm->clearAccum_);
+      }
+    }
     auto metadata =
         func->GetAttr<ffi::Array<TTBufferMetadata>>(kBufferMetadataTableAttr);
     for (const Collector::Fragment &fragment : collector.fragments) {
@@ -432,7 +458,7 @@ private:
                     is_const_int(gemm->c_->shape[1], gemm->n_),
                 "GEMM accumulator M/N/K disagree with full operand shapes");
 
-        Require(!lifetime->materialized,
+        Require(!lifetime->materialized || is_one(gemm->clearAccum_),
                 "GEMM update after final materialization would lose its "
                 "complete K reduction lifetime");
         Require(gemm->a_->dtype == gemm->b_->dtype,
@@ -452,6 +478,7 @@ private:
                 "GEMM accumulator input dtype changed during K updates");
         lifetime->input_dtype = gemm->a_->dtype;
         lifetime->updated = true;
+        lifetime->final_update = final_updates_.at(call);
         return;
       }
     } else if (call->op.same_as(Fill::Get())) {
@@ -472,6 +499,17 @@ private:
         return;
       }
       provenance_.erase(fill->dst);
+    } else if (call->op.same_as(ReduceOp::Get())) {
+      ReduceOp reduce = Downcast<ReduceOp>(ParseOperator(call));
+      Require(!Find(reduce->dst),
+              "Reduction must not overwrite a live GEMM accumulator");
+      // A reduction consumes an exact-dtype snapshot of the completed GEMM.
+      // Subsequent values are ordinary compute results; Device def-use still
+      // retains their numerical provenance and borrowed storage dependencies.
+      for (size_t origin : Origins(reduce->src))
+        Materialize(origin, reduce->src);
+      provenance_.erase(reduce->dst);
+      return;
     } else if (call->op.same_as(Copy::Get())) {
       Copy copy = Downcast<Copy>(ParseOperator(call));
       Require(!Find(copy->dst),
@@ -565,6 +603,7 @@ private:
                   merged.input_dtype == then_value.input_dtype,
               "GEMM accumulator branch merge has incompatible input dtypes");
       merged.updated &= then_value.updated;
+      merged.final_update &= then_value.final_update;
       merged.materialized &= then_value.materialized;
       if (merged.materialized)
         Require(merged.output_dtype == then_value.output_dtype,
@@ -617,6 +656,26 @@ private:
       }
       if (!origins.empty()) {
         if (store->buffer.scope() == "local.fragment") {
+          if (!output) {
+            // A distinct value may consume a completed GEMM without keeping
+            // that GEMM's mutable accumulator alive until the derived value
+            // is exported. The boundary is exact-dtype and at
+            // the GEMM initialization depth, never inside its K update loop.
+            for (auto it = origins.begin(); it != origins.end();) {
+              const Lifetime &origin = lifetimes_[*it];
+              if (origin.final_update &&
+                  origin.initialization_depth == loop_depth_ &&
+                  origin.buffer->dtype == store->buffer->dtype &&
+                  IsSupportedAccumulatorDTypeTriple(origin.input_dtype,
+                                                    origin.buffer->dtype,
+                                                    store->buffer->dtype)) {
+                Materialize(*it, store->buffer);
+                it = origins.erase(it);
+              } else {
+                ++it;
+              }
+            }
+          }
           if (!output)
             provenance_[store->buffer] = origins;
         } else {
@@ -681,6 +740,8 @@ private:
   std::unordered_map<Buffer, std::vector<size_t>, ffi::ObjectPtrHash,
                      ffi::ObjectPtrEqual>
       provenance_;
+  std::unordered_map<Call, bool, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      final_updates_;
   int64_t core_x_{-1}, core_y_{-1};
   int loop_depth_{0};
   int conditional_depth_{0};
@@ -985,12 +1046,18 @@ private:
       Require(rank >= 2 && reduce->dim >= 0 &&
                   static_cast<size_t>(reduce->dim) < rank,
               "Reduction requires a valid axis on a rank >= 2 input");
-      Require(reduce->dst->shape.size() + 1 == rank,
+      bool keepdims = reduce->dst->shape.size() == rank;
+      Require(keepdims || reduce->dst->shape.size() + 1 == rank,
               "Reduction output must remove exactly the selected axis (no "
-              "keepdims)");
+              "extra dimensions)");
       for (size_t src_axis = 0, dst_axis = 0; src_axis < rank; ++src_axis) {
-        if (static_cast<int>(src_axis) == reduce->dim)
+        if (static_cast<int>(src_axis) == reduce->dim) {
+          if (keepdims) {
+            Require(is_one(reduce->dst->shape[dst_axis++]),
+                    "Reduction keepdims axis must have extent one");
+          }
           continue;
+        }
         Require(ffi::StructuralEqual()(reduce->src->shape[src_axis],
                                        reduce->dst->shape[dst_axis++]),
                 "Reduction output shape does not match the non-reduced axes");

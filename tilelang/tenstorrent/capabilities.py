@@ -61,7 +61,11 @@ def lower_capability(
 ):
     """Query the implemented Device Lower envelope without compiling or probing.
 
-    ``rank`` describes the input (output for Fill); Reduction removes one axis.
+    ``rank`` describes the local input (output for Fill); Tensor copies may
+    additionally have leading extent-one slice axes, which remain in the Tensor
+    ABI and do not contribute to this local rank. Reduction removes one axis,
+    except ``keepdims=True`` supports rank-2 row reductions into a ``[B, 1]``
+    fragment with physical tile padding.
     ``static_tile_aligned`` assumes positive static extents, 32-divisible final
     dimensions, and matching operation-specific shapes. Elementwise means the
     canonical arithmetic/unary expression subset accepted by legalization.
@@ -114,7 +118,7 @@ def lower_capability(
     accumulator = output_value_kind == "accumulator" or (operation == "gemm" and output_value_kind == "fragment")
     fragment = input_value_kind != "shared" or (output_value_kind == "fragment" and not accumulator)
     input_fragment = input_value_kind != "shared"
-    output_rank = rank - 1 if operation == "reduce" else rank
+    output_rank = rank - 1 if operation == "reduce" and not keepdims else rank
     if (input_fragment and rank != 2) or ((output_value_kind == "fragment" or accumulator) and output_rank != 2):
         return reject("Compute fragments and GEMM accumulators require rank-2 geometry")
     if accumulator and operation != "gemm":
@@ -139,8 +143,10 @@ def lower_capability(
     if operation == "transpose" and (rank < 2 or transpose_axes != "last_two" or input_dtype != output_dtype):
         return reject("Transpose requires equal dtypes, rank >= 2, and exchange of the final two axes")
     if operation == "reduce":
-        if rank < 2 or keepdims or reduction_kind not in ("sum", "max", "min"):
-            return reject("Reduction requires rank >= 2, sum/max/min, and removal of exactly one axis")
+        if rank < 2 or reduction_kind not in ("sum", "max", "min"):
+            return reject("Reduction requires rank >= 2, sum/max/min, and reduction of exactly one axis")
+        if keepdims and (rank != 2 or output_value_kind != "fragment"):
+            return reject("Keepdims Reduction requires rank-2 input and a row fragment output")
         if input_dtype != output_dtype and output_dtype != "float32":
             return reject("Reduction output must use input dtype or float32")
         expected_accumulation = "float32" if reduction_kind == "sum" else output_dtype

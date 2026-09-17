@@ -82,8 +82,10 @@ Device verifier. It derives typed `tt.compute_requirements` per compute function
 
 The final verifier independently checks lexical lifetime, full K tile count,
 operation operands, dtype/shape, slot ownership and the stored requirements.
-Forged or stale requirements are rejected, not repaired. A 16/32-bit conflict
-in one compute kernel is an error; no implicit widening or narrowing occurs.
+Forged or stale requirements are rejected, not repaired. In v1–v7, a 16/32-bit
+conflict in one compute kernel is an error; no implicit widening or narrowing
+occurs. v8 supports explicit regions with independent requirements and exact
+DFB snapshots at boundaries; see [Flash Attention Lower](tenstorrent_flash_attention_lower.md).
 Merely allocating an FP32 fragment does not imply a GEMM precision requirement.
 
 Versions 5 and 6 require this attribute. Older Device modules remain readable;

@@ -719,13 +719,33 @@ public:
         metadata_(IndexBufferMetadata(metadata)),
         tensor_reads_(frontend->params.size(), false),
         tensor_writes_(frontend->params.size(), false) {
+    bool bf16_gemm = false, fp32_compute = false;
     PostOrderVisit(frontend->body, [&](const ffi::ObjectRef &object) {
       auto call = object.as<Call>();
       if (!call.has_value() || !call.value()->op.same_as(tile_compute()))
         return;
+      if (call.value()->args.empty())
+        ThrowMalformed("tile_compute has no output region");
+      BufferRegion compute_output =
+          NormalizeToAccessRegion(call.value()->args[0], kAccessWrite).region;
+      fp32_compute |= compute_output->buffer->dtype == DataType::Float(32);
       auto kind = call.value()->annotations.Get("tt.compute_kind");
       if (kind.has_value()) {
         auto name = Downcast<StringImm>(kind.value())->value;
+        if (name == "gemm_update") {
+          BufferRegion output =
+              NormalizeToAccessRegion(call.value()->args[0], kAccessWrite)
+                  .region;
+          bf16_gemm |= output->buffer->dtype == DataType::BFloat(16);
+        }
+        auto expression = call.value()->annotations.Get("tt.expression");
+        if (expression.has_value())
+          PostOrderVisit(Downcast<PrimExpr>(expression.value()),
+                         [&](const ffi::ObjectRef &item) {
+                           if (auto value = item.as<PrimExpr>())
+                             fp32_compute |=
+                                 value.value().dtype() == DataType::Float(32);
+                         });
         if (name == "accumulator_init" || name == "gemm_update" ||
             name == "accumulator_materialize")
           return;
@@ -735,9 +755,12 @@ public:
         compute_value_mode_ |= region->buffer.scope() == "local.fragment";
       }
     });
+    precision_regions_ = bf16_gemm && fp32_compute;
+    compute_value_mode_ |= precision_regions_;
   }
 
   bool HasComputeValues() const { return compute_value_mode_; }
+  bool HasPrecisionRegions() const { return precision_regions_; }
   ffi::Array<ComputeValueDescriptor> ComputeValues() const { return values_; }
   void FinalizeComputeValues() {
     if (!compute_value_mode_ || IsPipeline())
@@ -1233,11 +1256,13 @@ private:
 
   void AddReleases(ffi::Array<Stmt> *body, const ffi::String &slot) {
     std::unordered_map<int64_t, size_t> last_use;
-    std::unordered_map<int64_t, std::unordered_set<int64_t>> borrowed_sources;
+    // Propagate final uses backwards through the immutable value DAG. Storing
+    // every transitive borrowed DFB set would grow quadratically for online
+    // reductions whose result depends on all preceding serial iterations.
+    std::unordered_map<int64_t, std::vector<int64_t>> borrowed_sources;
+    std::unordered_map<int64_t, std::vector<int64_t>> value_parents;
+    std::unordered_map<int64_t, size_t> last_value_use;
     if (compute_value_mode_) {
-      // TTL tensor SSA may borrow an acquired DFB (identity is the simplest
-      // example). Keep every transitive source live through the final consumer
-      // until the downstream compiler proves an earlier materialization point.
       for (const Stmt &statement : compute_) {
         const CallNode *call =
             statement.as<EvaluateNode>()->value.as<CallNode>();
@@ -1246,25 +1271,21 @@ private:
           continue;
         int64_t output = *as_const_int(call->args[0]);
         auto &sources = borrowed_sources[output];
+        auto &parents = value_parents[output];
         if (call->op.same_as(compute_value_gemm())) {
-          sources.insert(*as_const_int(call->args[1]));
-          sources.insert(*as_const_int(call->args[2]));
+          sources.push_back(*as_const_int(call->args[1]));
+          sources.push_back(*as_const_int(call->args[2]));
           int64_t old = *as_const_int(call->args[3]);
-          if (old >= 0) {
-            const auto &previous = borrowed_sources[old];
-            sources.insert(previous.begin(), previous.end());
-          }
+          if (old >= 0)
+            parents.push_back(old);
         } else {
           for (size_t arg = 1; arg < call->args.size(); ++arg)
-            sources.insert(*as_const_int(call->args[arg]));
+            sources.push_back(*as_const_int(call->args[arg]));
           auto inputs = call->annotations.Get("tt.value_inputs");
-          if (inputs.has_value()) {
+          if (inputs.has_value())
             for (const Integer &input :
-                 Downcast<ffi::Array<Integer>>(inputs.value())) {
-              const auto &previous = borrowed_sources[input->value];
-              sources.insert(previous.begin(), previous.end());
-            }
-          }
+                 Downcast<ffi::Array<Integer>>(inputs.value()))
+              parents.push_back(input->value);
         }
       }
     }
@@ -1272,11 +1293,7 @@ private:
       const auto *call =
           (*body)[index].as<EvaluateNode>()->value.as<CallNode>();
       if (compute_value_mode_) {
-        auto use_value = [&](int64_t value) {
-          for (int64_t source : borrowed_sources[value])
-            if (resources_[source].consumer == slot)
-              last_use[source] = index;
-        };
+        auto use_value = [&](int64_t value) { last_value_use[value] = index; };
         if (call->op.same_as(compute_value()) ||
             call->op.same_as(compute_value_gemm()))
           use_value(*as_const_int(call->args[0]));
@@ -1314,6 +1331,20 @@ private:
         if (resources_[id].consumer == slot)
           last_use[id] = index;
       }
+    }
+    // Value IDs are assigned in definition order, so every parent precedes
+    // its children. One reverse pass is sufficient, including branched DAGs.
+    for (int64_t value = static_cast<int64_t>(values_.size()) - 1; value >= 0;
+         --value) {
+      auto found = last_value_use.find(value);
+      if (found == last_value_use.end())
+        continue;
+      size_t use = found->second;
+      for (int64_t source : borrowed_sources[value])
+        if (resources_[source].consumer == slot)
+          last_use[source] = std::max(last_use[source], use);
+      for (int64_t parent : value_parents[value])
+        last_value_use[parent] = std::max(last_value_use[parent], use);
     }
     std::vector<std::vector<int64_t>> releases(body->size());
     // Resource order makes releases deterministic, independent of hash order.
@@ -1457,8 +1488,9 @@ private:
                                  std::nullopt, span);
     ffi::Array<PrimExpr> grid;
     for (const PrimExpr &extent : buffer->shape)
-      grid.push_back(Integer(RequirePositiveStaticInteger(
-                                 extent, "compute materialization extent") /
+      grid.push_back(Integer((RequirePositiveStaticInteger(
+                                  extent, "compute materialization extent") +
+                              31) /
                              32));
     int64_t id = resources_.size();
     TTBufferMetadata metadata(
@@ -1480,6 +1512,7 @@ private:
     compute_.push_back(MakeDeviceCall(tenstorrent::compute_value_store(),
                                       {Integer(value), Integer(id)}, span));
     materialized_values_[value] = id;
+    dfb_roots_[id] = value_roots_[value];
     return id;
   }
 
@@ -1594,9 +1627,77 @@ private:
                                       call->span));
   }
 
+  void EnsurePrecision(const Call &call, const ffi::String &kind) {
+    if (!precision_regions_)
+      return;
+    if (IsPipeline())
+      ThrowUnsupported(
+          "precision regions require statically serialized transactions");
+    int mode = precision_mode_ < 0 ? 0 : precision_mode_;
+    BufferRegion output =
+        NormalizeToAccessRegion(call->args[0], kAccessWrite).region;
+    bool fp32 = output->buffer->dtype == DataType::Float(32);
+    auto expression = call->annotations.Get("tt.expression");
+    if (expression.has_value())
+      PostOrderVisit(Downcast<PrimExpr>(expression.value()),
+                     [&](const ffi::ObjectRef &item) {
+                       if (auto value = item.as<PrimExpr>())
+                         fp32 |= value.value().dtype() == DataType::Float(32);
+                     });
+    if (kind == "accumulator_init" || kind == "gemm_update")
+      mode = output->buffer->dtype == DataType::Float(32) ? 1 : 0;
+    else if (fp32)
+      mode = 1;
+    if (mode == precision_mode_)
+      return;
+    std::vector<int64_t> crossing;
+    if (precision_mode_ >= 0) {
+      for (const auto &[buffer, value] : current_values_)
+        crossing.push_back(value);
+      std::sort(crossing.begin(), crossing.end());
+    }
+    std::vector<int64_t> storage;
+    for (int64_t value : crossing)
+      storage.push_back(MaterializeValue(value, call->span));
+    compute_.push_back(
+        MakeDeviceCall(compute_precision(), {Integer(mode)}, call->span));
+    precision_mode_ = mode;
+    // A new precision region may not refer to an earlier compute SSA value.
+    // Re-enter through exact-dtype DFB snapshots with new immutable versions.
+    for (size_t i = 0; i < crossing.size(); ++i) {
+      int64_t old = crossing[i], dfb = storage[i];
+      const Buffer buffer = values_[old]->buffer;
+      int64_t value =
+          DefineValue(buffer, values_[old]->accumulator_id, call->span);
+      value_roots_[value] = value_roots_[old];
+      ffi::Map<ffi::String, ffi::ObjectRef> attrs{
+          {"tt.compute_kind", StringImm("elementwise")},
+          {"tt.compute_dtype",
+           StringImm(buffer->dtype == DataType::Float(32) ? "float32"
+                                                          : "bfloat16")},
+          {"tt.compute_tile_shape",
+           ffi::Array<PrimExpr>{Integer(32), Integer(32)}},
+          {"tt.logical_domain", buffer->shape},
+          {"tt.expression",
+           Call(buffer->dtype, dfb_load(), {Integer(dfb)}, {}, call->span)},
+          {"tt.access_maps",
+           ffi::Array<ffi::Array<Integer>>{IdentityMap(buffer->shape.size())}},
+          {"tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>{buffer->shape}},
+          {"tt.value_inputs", ffi::Array<Integer>()},
+          {"tt.value_access_maps", ffi::Array<ffi::Array<Integer>>()},
+          {"tt.value_input_shapes", ffi::Array<ffi::Array<PrimExpr>>()}};
+      Wait(&compute_, dfb, call->span);
+      compute_.push_back(
+          Evaluate(Call(DataType::Void(), compute_value(),
+                        {Integer(value), Integer(dfb)}, attrs, call->span),
+                   call->span));
+    }
+  }
+
   void PlanValueCompute(const Call &call) {
     ffi::String kind =
         Downcast<StringImm>(call->annotations.at("tt.compute_kind"))->value;
+    EnsurePrecision(call, kind);
     if (kind == "accumulator_init" || kind == "gemm_update" ||
         kind == "accumulator_materialize") {
       PlanValueAccumulator(call, kind);
@@ -1615,6 +1716,27 @@ private:
     ffi::Array<PrimExpr> domain;
     for (const Range &range : output->region)
       domain.push_back(range->extent);
+    // Tensor coordinates retain the public ABI, while computation uses the
+    // local operand shape after dropping only proven leading unit axes.
+    if (global && call->args.size() == 2) {
+      BufferRegion input =
+          NormalizeToAccessRegion(call->args[1], kAccessRead).region;
+      if (domain.size() > input->region.size()) {
+        size_t offset = domain.size() - input->region.size();
+        arith::Analyzer analyzer;
+        for (size_t axis = 0; axis < offset; ++axis)
+          if (!analyzer.CanProveEqual(domain[axis], Integer(1)))
+            ThrowUnsupported("Tensor export may only omit leading unit axes");
+        ffi::Array<PrimExpr> local_domain;
+        for (size_t axis = offset; axis < domain.size(); ++axis) {
+          if (!analyzer.CanProveEqual(domain[axis],
+                                      input->region[axis - offset]->extent))
+            ThrowUnsupported("Tensor export requires matching local extents");
+          local_domain.push_back(domain[axis]);
+        }
+        domain = std::move(local_domain);
+      }
+    }
     ffi::Array<PrimExpr> dfb_args;
     ffi::Array<Integer> value_inputs;
     ffi::Array<ffi::Array<Integer>> dfb_maps, value_maps;
@@ -1648,6 +1770,8 @@ private:
         dfb_args.push_back(Integer(id));
         dfb_maps.push_back(map);
         dfb_shapes.push_back(input->buffer->shape);
+        const auto &input_roots = dfb_roots_[id];
+        roots.insert(input_roots.begin(), input_roots.end());
         Wait(&compute_, id, call->span);
       }
     }
@@ -1683,6 +1807,7 @@ private:
         // Re-enter the value domain through an exact-dtype identity load; the
         // borrowed DFB stays live through every transitive value consumer.
         int64_t storage = MakeValueStorage(output->buffer, call->span);
+        dfb_roots_[storage] = roots;
         resources_[storage].consumer = "trisc";
         Reserve(&compute_, storage, call->span);
         ffi::Array<PrimExpr> operation_args{Integer(storage)};
@@ -1742,6 +1867,7 @@ private:
     } else {
       output_id = Write(output->buffer, "trisc");
     }
+    dfb_roots_[output_id] = roots;
     Reserve(&compute_, output_id, call->span);
     ffi::Array<PrimExpr> args{Integer(output_id)};
     for (const PrimExpr &arg : dfb_args)
@@ -1792,12 +1918,16 @@ private:
       for (const Stmt &stmt : body) {
         const CallNode *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
         if (call->op.same_as(compute_value()) ||
-            call->op.same_as(compute_value_gemm())) {
+            call->op.same_as(compute_value_gemm()) ||
+            call->op.same_as(compute_precision())) {
           result.push_back(stmt);
           continue;
         }
         size_t arg = call->op.same_as(tensor_to_dfb_nd()) ||
-                             call->op.same_as(compute_value_store())
+                             call->op.same_as(compute_value_store()) ||
+                             call->op.same_as(dfb_pipe_send()) ||
+                             call->op.same_as(dfb_pipe_recv()) ||
+                             call->op.same_as(dfb_pipe_wait())
                          ? 1
                          : 0;
         if (live.count(*as_const_int(call->args[arg])))
@@ -1972,25 +2102,48 @@ private:
     BufferRegion destination(copy->dst, copy->dst_range);
     bool has_accumulator =
         frontend_->attrs->dict.count("tt.gemm_accumulator_requirements");
-    if ((!transfers_ && !has_accumulator && !IsPipeline()) ||
+    bool rank_mapped_tensor =
+        source->region.size() != destination->region.size() &&
+        (copy->src.scope() == "global" || copy->dst.scope() == "global");
+    if ((!transfers_ && !has_accumulator && !IsPipeline() &&
+         !rank_mapped_tensor) ||
         copy->src.scope() == "shared" || copy->src.scope() == "shared.dyn")
       FullRegion(source);
-    if ((!transfers_ && !has_accumulator && !IsPipeline()) ||
+    if ((!transfers_ && !has_accumulator && !IsPipeline() &&
+         !rank_mapped_tensor) ||
         copy->dst.scope() == "shared" || copy->dst.scope() == "shared.dyn")
       FullRegion(destination);
     const TTBufferMetadata &src =
         RequireMetadata(metadata_, copy->src, "copy source");
     const TTBufferMetadata &dst =
         RequireMetadata(metadata_, copy->dst, "copy destination");
-    if (copy->src->dtype != copy->dst->dtype ||
-        source->region.size() != destination->region.size())
-      ThrowUnsupported("copy requires matching region ranks and dtypes");
-    for (size_t axis = 0; axis < source->region.size(); ++axis) {
-      arith::Analyzer analyzer;
-      if (!analyzer.CanProveEqual(source->region[axis]->extent,
-                                  destination->region[axis]->extent))
-        ThrowUnsupported("copy requires matching region extents");
-    }
+    if (copy->src->dtype != copy->dst->dtype)
+      ThrowUnsupported("copy requires matching dtypes");
+    arith::Analyzer analyzer;
+    size_t source_offset = 0, destination_offset = 0;
+    if (source->region.size() > destination->region.size() &&
+        src->kind == "tensor")
+      source_offset = source->region.size() - destination->region.size();
+    else if (destination->region.size() > source->region.size() &&
+             dst->kind == "tensor")
+      destination_offset = destination->region.size() - source->region.size();
+    if (source->region.size() - source_offset !=
+        destination->region.size() - destination_offset)
+      ThrowUnsupported(
+          "copy rank difference requires leading Tensor unit axes");
+    for (size_t axis = 0; axis < source_offset; ++axis)
+      if (!analyzer.CanProveEqual(source->region[axis]->extent, Integer(1)))
+        ThrowUnsupported("copy may only omit leading Tensor unit axes");
+    for (size_t axis = 0; axis < destination_offset; ++axis)
+      if (!analyzer.CanProveEqual(destination->region[axis]->extent,
+                                  Integer(1)))
+        ThrowUnsupported("copy may only omit leading Tensor unit axes");
+    for (size_t axis = source_offset; axis < source->region.size(); ++axis)
+      if (!analyzer.CanProveEqual(
+              source->region[axis]->extent,
+              destination->region[axis - source_offset + destination_offset]
+                  ->extent))
+        ThrowUnsupported("copy requires matching trailing region extents");
     if (src->kind == "tensor" && dst->kind == "logical_dfb_candidate") {
       int64_t tensor = src->global_arg_index.value()->value;
       tensor_reads_[tensor] = true;
@@ -2011,6 +2164,9 @@ private:
       return;
     }
     if (src->kind == "logical_dfb_candidate" && dst->kind == "tensor") {
+      EnsurePrecision(Call(DataType::Void(), tile_compute(),
+                           {source->ToPrimExpr()}, {}, call->span),
+                      "copy");
       int64_t tensor = dst->global_arg_index.value()->value;
       tensor_writes_[tensor] = true;
       // A separate immutable export snapshot keeps every resource single-slot
@@ -2082,6 +2238,9 @@ private:
         // every send completion; no TRISC copy or second payload is needed.
         id = input;
       } else {
+        EnsurePrecision(Call(DataType::Void(), tile_compute(),
+                             {region->ToPrimExpr()}, {}, call->span),
+                        "copy");
         id = Write(region->buffer, "trisc", std::nullopt, false);
         resources_[id].consumer = "brisc";
         Wait(&compute_, input, call->span);
@@ -2142,8 +2301,11 @@ private:
   }
 
   bool compute_value_mode_{false};
+  bool precision_regions_{false};
+  int precision_mode_{-1};
   ffi::Array<ComputeValueDescriptor> values_;
   std::vector<std::unordered_set<int64_t>> value_roots_;
+  std::unordered_map<int64_t, std::unordered_set<int64_t>> dfb_roots_;
   std::unordered_map<Var, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       current_values_;
   std::unordered_map<int64_t, int64_t> materialized_values_;
@@ -2390,6 +2552,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   ffi::Map<ffi::String, Integer> storage_groups;
   ffi::Map<ffi::String, ffi::Array<Integer>> pipeline_relations;
   bool producer_forwarding = false;
+  bool precision_regions = false;
   for (size_t index = 0; index < cores.size(); ++index) {
     int64_t x = index / gy, y = index % gy;
     const auto *realize = cores[index].as<SBlockRealizeNode>();
@@ -2424,6 +2587,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       ThrowUnsupported("all active Core bodies must retain their pipeline");
     }
     producer_forwarding |= planner.HasProducerForwarding();
+    precision_regions |= planner.HasPrecisionRegions();
     CoreDomain domain(CoreCoord(x, y), CoreCoord(x + 1, y + 1));
     for (const DFBDescriptor &dfb : planner.Descriptors(domain)) {
       dfbs.push_back(DFBDescriptor(
@@ -2600,7 +2764,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       [](const PipeEndpoint &endpoint) { return endpoint.occurrence != 0; });
   ffi::Map<ffi::String, ffi::Any> attrs{
       {kDeviceIRVersionAttr,
-       Integer(!compute_values.empty() ? 7
+       Integer(precision_regions         ? 8
+               : !compute_values.empty() ? 7
                : !accumulators.empty() || repeated_transfers ||
                        producer_forwarding
                    ? 6
@@ -2732,6 +2897,7 @@ IRModule FormProgram(const IRModule &input) {
   ffi::Map<ffi::String, Integer> storage_groups;
   ffi::Map<ffi::String, ffi::Array<Integer>> pipeline_relations;
   int64_t pipeline_stages = 0, pipeline_extent = 0;
+  bool precision_regions = false;
   ffi::String pipeline_wait_policy;
   Stmt idle = Evaluate(IntImm(DataType::Int(32), 0), frontend->span);
   if (general_compute) {
@@ -2761,6 +2927,7 @@ IRModule FormProgram(const IRModule &input) {
     dfbs = planner.Descriptors(domain);
     accumulators = planner.Accumulators();
     compute_values = planner.ComputeValues();
+    precision_regions = planner.HasPrecisionRegions();
     Stmt compute_body = planner.ComputeBody();
     Stmt transfer_body = planner.TransferBody();
     if (independent_loop.has_value()) {
@@ -2826,9 +2993,10 @@ IRModule FormProgram(const IRModule &input) {
   functions.Set(GlobalVar(operation + "_brisc"), std::move(brisc));
 
   ffi::Map<ffi::String, ffi::Any> attrs = {
-      {kDeviceIRVersionAttr, Integer(!compute_values.empty() ? 7
-                                     : !accumulators.empty() ? 5
-                                     : pipeline_extent       ? 3
+      {kDeviceIRVersionAttr, Integer(precision_regions         ? 8
+                                     : !compute_values.empty() ? 7
+                                     : !accumulators.empty()   ? 5
+                                     : pipeline_extent         ? 3
                                      : general_compute ? 2
                                                        : kDeviceIRVersion)},
       {kTargetArchAttr, target_arch.value()},
