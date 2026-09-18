@@ -794,6 +794,9 @@ public:
   // Phase 5 materializes bounded windows. A value remains an immutable
   // generation, while the same lexical write site shares one capacity pool.
   void PlanPipeline(const For &loop) {
+    if (precision_regions_)
+      ThrowUnsupported(
+          "precision regions require statically serialized transactions");
     if (IsPipeline())
       ThrowUnsupported("one bounded T.Pipelined loop per Core is supported");
     pipeline_resource_begin_ = resources_.size();
@@ -1077,13 +1080,32 @@ public:
   }
 
   void Plan(const Stmt &stmt) {
+    if (!precision_regions_) {
+      PlanImpl(stmt);
+      return;
+    }
+    // Use the same static specialization as planning, including loop-carried
+    // reads and constant branches. Do not preserve dead fragment generations
+    // merely because they were the most recent definition of their buffer.
+    std::vector<Call> calls;
+    collected_calls_ = &calls;
+    PlanImpl(stmt);
+    collected_calls_ = nullptr;
+    PrepareFragmentAccesses(calls);
+    for (call_index_ = 0; call_index_ < calls.size(); ++call_index_)
+      PlanCall(calls[call_index_]);
+    fragment_accesses_.clear();
+    unknown_accesses_.clear();
+  }
+
+  void PlanImpl(const Stmt &stmt) {
     if (++statement_count_ > 65536) {
       ThrowUnsupported(
           "static control-flow expansion exceeds 65536 statements");
     }
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
       for (const Stmt &child : seq->seq)
-        Plan(child);
+        PlanImpl(child);
       return;
     }
     if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
@@ -1098,7 +1120,7 @@ public:
         ThrowMalformed(
             "unconsumed compute block; run LegalizeTenstorrentTileOps");
       }
-      Plan(realize->block->body);
+      PlanImpl(realize->block->body);
       return;
     }
     if (const auto *loop = stmt.as<ForNode>()) {
@@ -1123,7 +1145,7 @@ public:
       for (int64_t i = 0; i < extent; ++i) {
         StaticIterationSubstituter substitute(
             loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + i));
-        Plan(substitute(loop->body));
+        PlanImpl(substitute(loop->body));
       }
       return;
     }
@@ -1136,9 +1158,9 @@ public:
             "cross-slot transaction schedule");
       }
       if (is_one(condition))
-        Plan(branch->then_case);
+        PlanImpl(branch->then_case);
       else if (branch->else_case.has_value())
-        Plan(branch->else_case.value());
+        PlanImpl(branch->else_case.value());
       return;
     }
     const auto *evaluate = stmt.as<EvaluateNode>();
@@ -1151,6 +1173,14 @@ public:
     if (!node)
       ThrowUnsupported("non-call Evaluate in compute dataflow");
     Call call = ffi::GetRef<Call>(node);
+    if (collected_calls_) {
+      collected_calls_->push_back(call);
+      return;
+    }
+    PlanCall(call);
+  }
+
+  void PlanCall(Call call) {
     if ((IsPipeline() || transfers_) && !call->span.defined())
       call.CopyOnWrite()->span =
           RequireSourceSpan(call->span, frontend_->span, "pipeline operation");
@@ -1236,6 +1266,105 @@ public:
   Stmt TransferBody() const { return Body(transfer_); }
 
 private:
+  struct FragmentAccess {
+    size_t index;
+    bool read;
+  };
+
+  void PrepareFragmentAccesses(const std::vector<Call> &calls) {
+    arith::Analyzer analyzer;
+    for (size_t index = 0; index < calls.size(); ++index) {
+      const Call &call = calls[index];
+      std::unordered_map<Var, bool, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+          accesses;
+      auto access = [&](const BufferRegion &region, bool read) {
+        const Buffer &buffer = region->buffer;
+        if (buffer.scope() != "local.fragment")
+          return;
+        // A partial write cannot kill the untouched portion of a value.
+        if (!read) {
+          if (region->region.size() != buffer->shape.size()) {
+            read = true;
+          } else {
+            for (size_t axis = 0; axis < buffer->shape.size(); ++axis)
+              read |= !analyzer.CanProveEqual(region->region[axis]->min,
+                                              Integer(0)) ||
+                      !analyzer.CanProveEqual(region->region[axis]->extent,
+                                              buffer->shape[axis]);
+          }
+        }
+        accesses[buffer->data] |= read;
+      };
+      if (call->op.same_as(tile_compute())) {
+        auto kind_attr = call->annotations.Get("tt.compute_kind");
+        ffi::String kind = kind_attr.has_value()
+                               ? Downcast<StringImm>(kind_attr.value())->value
+                               : ffi::String("");
+        for (size_t arg = 0; arg < call->args.size(); ++arg) {
+          bool read = kind == "accumulator_materialize" ? arg == 0
+                      : kind == "gemm_update"           ? true
+                                                        : arg != 0;
+          access(NormalizeToAccessRegion(call->args[arg],
+                                         read ? kAccessRead : kAccessWrite)
+                     .region,
+                 read);
+        }
+        auto expression = call->annotations.Get("tt.expression");
+        if (expression.has_value())
+          PostOrderVisit(Downcast<PrimExpr>(expression.value()),
+                         [&](const ffi::ObjectRef &object) {
+                           if (const auto *load = object.as<BufferLoadNode>())
+                             if (load->buffer.scope() == "local.fragment")
+                               accesses[load->buffer->data] = true;
+                         });
+      } else if (call->op.same_as(Copy::Get())) {
+        Copy copy = Downcast<Copy>(ParseOperator(call));
+        access(BufferRegion(copy->src, copy->src_range), true);
+        access(BufferRegion(copy->dst, copy->dst_range), false);
+      } else if (call->op.same_as(tile_add())) {
+        for (size_t arg = 0; arg < 3; ++arg) {
+          bool read = arg != 2;
+          access(NormalizeToAccessRegion(call->args[arg],
+                                         read ? kAccessRead : kAccessWrite)
+                     .region,
+                 read);
+        }
+      } else if (call->op.same_as(pipe_send()) ||
+                 call->op.same_as(pipe_recv())) {
+        // Pipe transactions touch only their explicit shared DFB operand;
+        // they do not keep unrelated compute-local fragments alive.
+        bool send = call->op.same_as(pipe_send());
+        access(NormalizeToAccessRegion(call->args[send ? 0 : 1],
+                                       send ? kAccessRead : kAccessWrite)
+                   .region,
+               send);
+      } else {
+        // Unknown operations may observe any live fragment. Keep their values
+        // until that operation has executed rather than infer missing effects.
+        unknown_accesses_.push_back(index);
+      }
+      for (const auto &[buffer, read] : accesses)
+        fragment_accesses_[buffer].push_back({index, read});
+    }
+  }
+
+  bool FragmentIsLive(const Var &buffer) const {
+    auto unknown = std::lower_bound(unknown_accesses_.begin(),
+                                    unknown_accesses_.end(), call_index_);
+    auto found = fragment_accesses_.find(buffer);
+    if (found == fragment_accesses_.end())
+      return unknown != unknown_accesses_.end();
+    const auto &accesses = found->second;
+    auto next =
+        std::lower_bound(accesses.begin(), accesses.end(), call_index_,
+                         [](const FragmentAccess &access, size_t index) {
+                           return access.index < index;
+                         });
+    return (unknown != unknown_accesses_.end() &&
+            (next == accesses.end() || *unknown <= next->index)) ||
+           (next != accesses.end() && next->read);
+  }
+
   PrimExpr Capacity(const ResourceVersion &resource) const {
     PrimExpr count = resource.metadata->dfb_block_count.value();
     if (!IsPipeline() || resource.iteration < 0)
@@ -1653,7 +1782,8 @@ private:
     std::vector<int64_t> crossing;
     if (precision_mode_ >= 0) {
       for (const auto &[buffer, value] : current_values_)
-        crossing.push_back(value);
+        if (FragmentIsLive(buffer))
+          crossing.push_back(value);
       std::sort(crossing.begin(), crossing.end());
     }
     std::vector<int64_t> storage;
@@ -2300,6 +2430,12 @@ private:
     }
   }
 
+  std::vector<Call> *collected_calls_{nullptr};
+  size_t call_index_{0};
+  std::unordered_map<Var, std::vector<FragmentAccess>, ffi::ObjectPtrHash,
+                     ffi::ObjectPtrEqual>
+      fragment_accesses_;
+  std::vector<size_t> unknown_accesses_;
   bool compute_value_mode_{false};
   bool precision_regions_{false};
   int precision_mode_{-1};

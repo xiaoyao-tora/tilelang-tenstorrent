@@ -25,7 +25,9 @@ def lower(config, arch="wormhole_b0"):
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
     mod = lower_tenstorrent_ir(source, target)
     assert "tt.ir_stage" not in mod.attrs
-    assert int(mod.attrs["tt.device_ir_version"]) == (7 if config.get("input_dtype") == "float32" else 8)
+    expected_version = 7 if config.get("input_dtype") == "float32" else 8
+    version = int(mod.attrs["tt.device_ir_version"])
+    assert (int(mod.attrs["tt.compact_original_version"]) if version == 9 else version) == expected_version
     assert len(mod.functions) == 3 * config.get("core_q", 8) * config.get("core_bh", 4)
     restored = ir.load_json(ir.save_json(mod))
     ir.assert_structural_equal(mod, restored)

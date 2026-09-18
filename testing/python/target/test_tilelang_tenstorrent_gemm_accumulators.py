@@ -320,7 +320,8 @@ def test_device_ir_rechecks_bfloat16_precision_contract(key, value, message):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
-def test_one_compute_kernel_rejects_conflicting_accumulator_precision():
+@pytest.mark.parametrize("keep_fp32_live", [False, True])
+def test_compute_kernel_scopes_accumulator_precision_to_live_values(keep_fp32_live):
     @T.prim_func
     def mixed(
         A: T.Tensor((32, 32), "bfloat16"),
@@ -336,16 +337,24 @@ def test_one_compute_kernel_rejects_conflicting_accumulator_precision():
             T.copy(A, a)
             T.copy(B, b)
             T.gemm(a, b, c, clear_accum=True)
-            T.copy(c, C)
+            if not keep_fp32_live:
+                T.copy(c, C)
             T.gemm(a, b, d, clear_accum=True)
+            if keep_fp32_live:
+                T.copy(c, C)
             T.copy(d, D)
 
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
     # Frontend proves individual lifetimes; the actual formed kernel owns the merge.
     assert len(verify(mixed)["main"].attrs["tt.gemm_accumulator_requirements"]) == 2
-    with pytest.raises((ValueError, NotImplementedError, tvm.error.TVMError), match="conflicting.*destination"):
-        TenstorrentPassPipelineBody(tvm.IRModule({"main": mixed}), TARGET)
+    if keep_fp32_live:
+        with pytest.raises((ValueError, NotImplementedError, tvm.error.TVMError), match="precision.*conflicts|conflicting.*destination"):
+            TenstorrentPassPipelineBody(tvm.IRModule({"main": mixed}), TARGET)
+    else:
+        mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": mixed}), TARGET)
+        assert int(mod.attrs["tt.device_ir_version"]) == 8
+        transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 @pytest.mark.parametrize("transpose_a,transpose_b", [(False, False), (True, False), (False, True), (True, True)])

@@ -8,6 +8,7 @@
  * \brief Read-only verifier for the Tenstorrent Device TIR v1/v2 schemas.
  */
 #include "verify_device_ir.h"
+#include "compact_device_program.h"
 #include "infer_compute_requirements.h"
 
 #include <tvm/arith/analyzer.h>
@@ -3350,7 +3351,9 @@ IRModule VerifyModule(IRModule mod) {
 
 tvm::transform::Pass VerifyTenstorrentDeviceIR() {
   auto pass_func = [](IRModule mod, tvm::transform::PassContext context) {
-    return VerifyModule(std::move(mod));
+    IRModule expanded = ExpandDeviceProgram(mod);
+    VerifyModule(expanded);
+    return mod;
   };
   return tvm::transform::CreateModulePass(
       pass_func, 0, "tl.tenstorrent.VerifyTenstorrentDeviceIR", {});

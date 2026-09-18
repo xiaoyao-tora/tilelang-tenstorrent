@@ -13,6 +13,8 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include "../op/builtin.h"
+#include "compact_device_program.h"
+#include "device_metadata_interner.h"
 
 namespace tvm {
 namespace tl {
@@ -385,7 +387,7 @@ DeriveRegionComputeRequirements(const IRModule &mod, const PrimFunc &func) {
     logical = WithAttr(logical, kComputeValueTableAttr, region_values);
     logical = WithAttr(logical, kAccumulatorTableAttr, region_accumulators);
     PrimFunc region = func;
-    region.CopyOnWrite()->body = SeqStmt(segment);
+    region.CopyOnWrite()->body = SeqStmt::Flatten(segment);
     auto requirements = DeriveComputeRequirements(logical, region);
     ffi::String width = mode == 0 ? "bits16_required" : "bits32_required";
     Check(requirements->destination_width == "unconstrained" ||
@@ -464,6 +466,10 @@ DeriveRegionComputeRequirements(const IRModule &mod, const PrimFunc &func) {
 
 tvm::transform::Pass InferTenstorrentComputeRequirements() {
   auto pass_func = [](IRModule mod, tvm::transform::PassContext context) {
+    bool was_compact = mod->GetAttr<Integer>(kDeviceIRVersionAttr)
+                           .value_or(Integer(0))
+                           ->value == 9;
+    mod = ExpandDeviceProgram(mod);
     IRModule result = mod;
     result.CopyOnWrite();
     for (const auto &[global, base] : mod->functions) {
@@ -498,7 +504,8 @@ tvm::transform::Pass InferTenstorrentComputeRequirements() {
                      "tt.compute_region_requirements", regions));
       }
     }
-    return result;
+    return CompactDeviceProgram(DeviceMetadataInterner::Rewrite(result),
+                                was_compact);
   };
   return tvm::transform::CreateModulePass(
       pass_func, 0, "tl.tenstorrent.InferTenstorrentComputeRequirements", {});

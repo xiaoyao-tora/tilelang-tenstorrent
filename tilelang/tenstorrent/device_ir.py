@@ -1,4 +1,4 @@
-"""Typed construction helpers shared by Tenstorrent Device IR v1 through v8.
+"""Typed construction helpers shared by Tenstorrent Device IR v1 through v9.
 
 ``TTBufferMetadata`` is a normalization-stage object.  It is attached as an
 array under :data:`BUFFER_METADATA_TABLE_ATTR` before program formation and
@@ -33,6 +33,11 @@ region. Aggregate ``tt.compute_requirements.destination_width`` is
 ``region_scoped``; it must not be interpreted as one physical kernel setting.
 Values cross boundaries only through completed exact-dtype DFB snapshots and
 new identity definitions. Earlier codegen consumers must reject version 8.
+
+Schema v9 represents repeated v7/v8 schedules using serial loops and typed
+descriptor families. ``expand_device_ir`` losslessly restores the original
+schema; the existing Device verifier checks that expanded schedule and returns
+the compact input. Older consumers must explicitly expand or reject version 9.
 """
 
 from __future__ import annotations
@@ -72,6 +77,45 @@ PIPELINE_RELATIONS_ATTR = "tt.pipeline_relations"
 PIPELINE_STAGES_ATTR = "tt.pipeline_stages"
 PIPELINE_EXTENT_ATTR = "tt.pipeline_extent"
 L1_CAPACITY_BYTES_ATTR = "tt.l1_capacity_bytes"
+COMPACT_ORIGINAL_VERSION_ATTR = "tt.compact_original_version"
+COMPACT_DFB_FAMILIES_ATTR = "tt.compact_dfb_families"
+COMPACT_VALUE_FAMILIES_ATTR = "tt.compact_value_families"
+
+
+@tvm_ffi.register_object("tl.tenstorrent.DeviceIRIntColumn")
+class DeviceIRIntColumn(Node):
+    """Exact affine, periodic, or explicit integer column for a resource family."""
+
+    def __init__(self, start: int, step: int, count: int, values=(), period: int = 0):
+        self.__init_handle_by_constructor__(_ffi_api.DeviceIRIntColumn, start, step, count, list(values), period)
+
+
+@tvm_ffi.register_object("tl.tenstorrent.DeviceIRDescriptorFamily")
+class DeviceIRDescriptorFamily(Node):
+    """Distinct resource rows sharing one immutable descriptor prototype."""
+
+    def __init__(self, prototype, positions: DeviceIRIntColumn, fields, source_parts=()):
+        self.__init_handle_by_constructor__(_ffi_api.DeviceIRDescriptorFamily, prototype, positions, fields, list(source_parts))
+
+
+def compact_device_ir(mod: IRModule, *, force: bool = False) -> IRModule:
+    """Use the existing Lower representation helper without creating a pass.
+
+    The default path only compacts large v7/v8 static schedules. ``force`` is
+    useful for inspecting and testing small schedules. Validate the returned
+    module with ``VerifyTenstorrentDeviceIR`` before consuming untrusted IR.
+    """
+    return _ffi_api.CompactDeviceIR(mod, force)
+
+
+def expand_device_ir(mod: IRModule) -> IRModule:
+    """Losslessly expand v9 into v7/v8, with bounded allocation and arithmetic.
+
+    This representation helper does not replace semantic Device verification.
+    Noncompact modules pass through unchanged; compact metadata in an older
+    schema is rejected.
+    """
+    return _ffi_api.ExpandDeviceIR(mod)
 
 
 def is_supported_accumulator_dtype_triple(input_dtype, accumulation_dtype, output_dtype) -> bool:

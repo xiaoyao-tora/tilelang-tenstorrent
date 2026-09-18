@@ -11,6 +11,7 @@
 #define TVM_TL_TENSTORRENT_IR_DEVICE_IR_H_
 
 #include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/map.h>
 #include <tvm/ffi/object.h>
 #include <tvm/ffi/optional.h>
 #include <tvm/ir/expr.h>
@@ -41,6 +42,10 @@ constexpr const char *kDFBTableAttr = "tt.dfb_table";
 constexpr const char *kPipeTableAttr = "tt.pipe_table";
 constexpr const char *kPipeTransferTableAttr = "tt.pipe_transfer_table";
 constexpr const char *kKernelOrderAttr = "tt.kernel_order";
+constexpr const char *kCompactOriginalVersionAttr =
+    "tt.compact_original_version";
+constexpr const char *kCompactDFBFamiliesAttr = "tt.compact_dfb_families";
+constexpr const char *kCompactValueFamiliesAttr = "tt.compact_value_families";
 
 // Schema v3 retains immutable DFB descriptors and adds explicit storage reuse.
 // Keys are canonical decimal DFB IDs, with stable value-based string equality.
@@ -312,6 +317,58 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ComputeRequirements,
                                              ffi::ObjectRef,
                                              ComputeRequirementsNode);
+};
+
+/*! \brief A lossless integer column used by v9 descriptor families.
+ * Empty values denotes start + step * i. Nonempty values with period == 0
+ * stores each row explicitly. A positive period denotes
+ * values[i % period] + step * (i / period), with start == 0.
+ */
+class DeviceIRIntColumnNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t start, step, count, period;
+  ffi::Array<int64_t> values;
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.DeviceIRIntColumn",
+                                    DeviceIRIntColumnNode, ffi::Object);
+};
+class DeviceIRIntColumn : public ffi::ObjectRef {
+public:
+  TVM_DLL DeviceIRIntColumn(int64_t start, int64_t step, int64_t count,
+                            ffi::Array<int64_t> values, int64_t period = 0);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DeviceIRIntColumn, ffi::ObjectRef,
+                                             DeviceIRIntColumnNode);
+};
+
+/*! \brief v9 representation of distinct resources sharing immutable fields.
+ * Positions preserve the original table order; fields encode the varying
+ * integers. Source parts delimit the integer columns in DFB source identities.
+ * Expansion reconstructs one descriptor per position, never shared lifetimes.
+ */
+class DeviceIRDescriptorFamilyNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  ffi::ObjectRef prototype;
+  DeviceIRIntColumn positions;
+  ffi::Map<ffi::String, DeviceIRIntColumn> fields;
+  ffi::Array<ffi::String> source_parts;
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.DeviceIRDescriptorFamily",
+                                    DeviceIRDescriptorFamilyNode, ffi::Object);
+};
+class DeviceIRDescriptorFamily : public ffi::ObjectRef {
+public:
+  TVM_DLL
+  DeviceIRDescriptorFamily(ffi::ObjectRef prototype,
+                           DeviceIRIntColumn positions,
+                           ffi::Map<ffi::String, DeviceIRIntColumn> fields,
+                           ffi::Array<ffi::String> source_parts = {});
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DeviceIRDescriptorFamily,
+                                             ffi::ObjectRef,
+                                             DeviceIRDescriptorFamilyNode);
 };
 
 class PipeDescriptorNode : public ffi::Object {

@@ -10,12 +10,54 @@
 #include "device_ir.h"
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/script/printer/ir_docsifier.h>
 
 #include <utility>
 
 namespace tvm {
 namespace tl {
 namespace tenstorrent {
+namespace {
+
+template <typename Descriptor> void RegisterMetadataPrinter() {
+  using namespace script::printer;
+  IRDocsifier::vtable().set_dispatch<Descriptor>(
+      "",
+      [](Descriptor object, ffi::reflection::AccessPath,
+         IRDocsifier docsifier) -> ExprDoc {
+        if (auto reference = docsifier->GetVarDoc(object))
+          return reference.value();
+        if (docsifier->frames.empty())
+          return docsifier->AddMetadata(object);
+
+        // The generic AddMetadata scans every previous object of this type.
+        // Static Device programs have hundreds of thousands of descriptors.
+        // Reuse the docsifier's identity map and root-frame lifetime to retain
+        // the same first-use ordering and complete metadata in linear time.
+        ffi::String key = object->GetTypeKey();
+        auto &entries = docsifier->metadata[key];
+        int64_t index = entries.size();
+        entries.push_back(object);
+        auto reference = [key, index]() -> ExprDoc {
+          return IdDoc("metadata")[{LiteralDoc::Str(key, std::nullopt)}]
+                                  [{LiteralDoc::Int(index, std::nullopt)}];
+        };
+        docsifier->Define(object, docsifier->frames[0], reference);
+        return reference();
+      });
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  RegisterMetadataPrinter<DFBDescriptor>();
+  RegisterMetadataPrinter<AccumulatorDescriptor>();
+  RegisterMetadataPrinter<ComputeValueDescriptor>();
+  RegisterMetadataPrinter<ComputeRequirements>();
+  RegisterMetadataPrinter<PipeTransferDescriptor>();
+  RegisterMetadataPrinter<DeviceIRDescriptorFamily>();
+  RegisterMetadataPrinter<DeviceIRIntColumn>();
+}
+
+} // namespace
 
 bool IsSupportedAccumulatorDTypeTriple(DataType input, DataType accumulation,
                                        DataType output) {
