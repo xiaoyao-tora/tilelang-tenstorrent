@@ -7,3 +7,6 @@
 [submodule "3rdparty/composable_kernel"]
 	path = 3rdparty/composable_kernel
 	url = https://github.com/ROCm/composable_kernel
+[submodule "3rdparty/tt-lang"]
+	path = 3rdparty/tt-lang
+	url = https://github.com/tenstorrent/tt-lang.git
