@@ -17,6 +17,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `cutedsl` | NVIDIA CUTLASS/CuTe DSL backend. Requires `nvidia-cutlass-dsl`. |
 | `hip` | AMD GPUs via ROCm. Use a config dict for options such as `{"kind": "hip", "mcpu": "gfx90a"}`. |
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
+| `tenstorrent` | Tenstorrent devices. Requires an explicit `arch` of `wormhole_b0` or `blackhole`; registration only, with TTL codegen not implemented yet. |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
 | `webgpu` | Browser / WebGPU runtimes. |
 | `c` | Emit plain C source for inspection or custom toolchains. |
@@ -41,12 +42,40 @@ same input forms:
 target = "auto"                                      # detect CUDA, HIP, or Metal
 target = "cuda"                                      # bare TVM target kind
 target = {"kind": "cuda", "arch": "sm_90"}           # target config dict
+target = {"kind": "tenstorrent", "arch": "wormhole_b0"}  # explicit Tenstorrent architecture
 target = tvm.target.Target({"kind": "cuda"})         # already-built TVM Target
 ```
 
 Use the bare string form for simple cases. Use a config dictionary when you need target attributes such as CUDA
 `arch`, CUDA `code`, HIP `mcpu`, or LLVM CPU options. Dictionary keys must be valid attributes for that target kind;
 invalid attributes are rejected when TVM constructs the target.
+
+Tenstorrent targets accept only the `tenstorrent` target key and require an explicit `arch` of `wormhole_b0` or
+`blackhole`. They are not included in `auto` detection. The backend route and `ttnn` execution contract are
+registered, but compiling a kernel currently fails explicitly because TTL source generation is not implemented.
+
+Tenstorrent's language facade exposes inter-Core communication topology under `T.comm`:
+
+```python
+from tilelang.tenstorrent import language as T
+
+net = T.comm.PipeNet([
+    T.comm.Pipe(
+        src=(0, 0),
+        dst=T.comm.CoreRange(begin=(1, 0), end=(4, 1)),
+    ),
+])
+
+for pipe in T.comm.foreach_src(net):
+    T.copy(send_block, pipe)
+
+for pipe in T.comm.foreach_dst(net):
+    T.copy(pipe, recv_block)
+```
+
+`T.comm` describes communication endpoints, edges, topology, and selected `PipeRef` values. `T.copy` remains the
+data-movement primitive. The internal target-specific IR names remain under `tl.tt.*`. This namespace is unrelated
+to `T.comm_reducer`, where `comm` means commutative rather than communication.
 
 ## Default target
 

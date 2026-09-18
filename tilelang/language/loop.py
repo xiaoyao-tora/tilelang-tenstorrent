@@ -1,7 +1,10 @@
 """Loop related language interfaces in TileLang."""
 
 from __future__ import annotations
+
+from collections.abc import Iterable
 from typing import Any
+
 from tvm import tirx
 from tvm.tirx import IntImm
 import tvm.tirx.script.builder as tb_tir
@@ -85,6 +88,33 @@ def Parallel(
     if prefer_async is not None:
         merged_annotations["parallel_prefer_async"] = prefer_async
     return _ffi_api.Parallel(extents, merged_annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+
+def Tiles(
+    domain: tirx.Buffer | Iterable[int | tirx.PrimExpr],
+    parallel: bool = True,
+) -> frame.ForFrame:
+    """Construct a logical elementwise region for tiled execution."""
+    if not isinstance(parallel, bool):
+        raise TypeError("parallel must be a bool")
+
+    if isinstance(domain, tirx.Buffer):
+        extents = tuple(domain.shape)
+    elif isinstance(domain, Iterable):
+        extents = tuple(domain)
+    else:
+        raise TypeError("domain must be a tirx.Buffer or an iterable of extents")
+
+    if not extents:
+        raise ValueError("Tiles domain must be non-empty")
+    if len(extents) != 2:
+        raise ValueError("Tiles domain must have rank 2 in Phase 1")
+
+    annotations = {
+        "tl.tt.tiles_parallel": tirx.IntImm("int32", int(parallel)),
+        "tl.tt.tiles_stage": tirx.IntImm("int32", 0),
+    }
+    return _ffi_api.Tiles(extents, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
 def Persistent(

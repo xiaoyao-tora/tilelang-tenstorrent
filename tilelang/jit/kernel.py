@@ -66,7 +66,7 @@ class JITKernel(Generic[_P, _T]):
         self,
         func: PrimFunc = None,
         out_idx: list[int] | int = None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "ttnn"] = "tvm_ffi",
         target: TargetLike = "auto",
         target_host: TargetLike | None = None,
         verbose: bool = False,
@@ -84,7 +84,7 @@ class JITKernel(Generic[_P, _T]):
             The TileLang TIR function to compile and wrap.
         out_idx : Union[List[int], int], optional
             Index(es) of the output tensors to return (default: None).
-        execution_backend : Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
+        execution_backend : Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "ttnn"], optional
             Execution backend to use for kernel execution.
         target : str, dict, or tvm.target.Target, optional
             Compilation target (default: "auto"). Use a dict for target attributes,
@@ -158,7 +158,7 @@ class JITKernel(Generic[_P, _T]):
         target: TargetLike,
         target_host: TargetLike | None,
         out_idx: list[int] | int,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"],
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "ttnn"],
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | None = None,
         backend_context: BackendContext | None = None,
