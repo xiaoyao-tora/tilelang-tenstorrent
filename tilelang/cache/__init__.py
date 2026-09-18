@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 from tvm.target import Target as TVMTarget
 from tvm.tirx import PrimFunc
 from tilelang.jit import JITKernel
@@ -13,9 +13,7 @@ from tilelang.jit.adapter.cython.kernel_cache import CythonKernelCache
 from tilelang.jit.adapter.nvrtc.kernel_cache import NVRTCKernelCache
 from tilelang.jit.adapter.torch.kernel_cache import TorchKernelCache
 from tilelang.jit.adapter.kernel_cache import TVMFFIKernelCache
-
-if TYPE_CHECKING:
-    from .kernel_cache import KernelCache
+from .kernel_cache import KernelCache
 
 TargetLike = str | dict[str, object] | TVMTarget
 
@@ -26,13 +24,16 @@ _dispatch_map: dict[str, KernelCache] = {
     "nvrtc": NVRTCKernelCache(),
     "cutedsl": CuTeDSLKernelCache(),
     "torch": TorchKernelCache(),
+    # Registration-only route: compilation fails at Tenstorrent TTL codegen
+    # before an adapter or persistent cache artifact can be created.
+    "ttnn": KernelCache(),
 }
 
 
 def _resolve_cache_dispatch(
     target: TargetLike | None,
     target_host: TargetLike | None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "ttnn"] | None,
     verbose: bool | None,
 ):
     if target is None:
@@ -70,7 +71,7 @@ def cached(
     *args,
     target: TargetLike | None = None,
     target_host: TargetLike | None = None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "ttnn"] | None = None,
     verbose: bool | None = None,
     pass_configs: dict | None = None,
     compile_flags: list[str] | str | None = None,

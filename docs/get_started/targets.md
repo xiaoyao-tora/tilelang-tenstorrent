@@ -17,6 +17,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `cutedsl` | NVIDIA CUTLASS/CuTe DSL backend. Requires `nvidia-cutlass-dsl`. |
 | `hip` | AMD GPUs via ROCm. Use a config dict for options such as `{"kind": "hip", "mcpu": "gfx90a"}`. |
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
+| `tenstorrent` | Tenstorrent devices. Requires `wormhole_b0` or `blackhole`; supports verified single-Core BF16/FP32 Device Lower for multi-tile compute, broadcast, Fill, Typecast, Transpose, GEMM and Reduction. Restricted source-only TTL mapping is available; execution remains unsupported. |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
 | `webgpu` | Browser / WebGPU runtimes. |
 | `c` | Emit plain C source for inspection or custom toolchains. |
@@ -41,12 +42,54 @@ same input forms:
 target = "auto"                                      # detect CUDA, HIP, or Metal
 target = "cuda"                                      # bare TVM target kind
 target = {"kind": "cuda", "arch": "sm_90"}           # target config dict
+target = {"kind": "tenstorrent", "arch": "wormhole_b0"}  # explicit Tenstorrent architecture
 target = tvm.target.Target({"kind": "cuda"})         # already-built TVM Target
 ```
 
 Use the bare string form for simple cases. Use a config dictionary when you need target attributes such as CUDA
 `arch`, CUDA `code`, HIP `mcpu`, or LLVM CPU options. Dictionary keys must be valid attributes for that target kind;
 invalid attributes are rejected when TVM constructs the target.
+
+Tenstorrent targets accept only the `tenstorrent` target key and require an explicit `arch` of `wormhole_b0` or
+`blackhole`. They are not included in `auto` detection. The backend route and `ttnn` execution contract are
+registered. The frozen contract is documented in `docs/compiler_internals/tenstorrent_phase0_contract.md`; the
+implemented Phase 1 subset is documented in `docs/compiler_internals/tenstorrent_phase1_device_ir.md`, and the
+Add device extension in `docs/compiler_internals/tenstorrent_phase2_add_lower.md`. Both `T.Tiles` and supported
+`T.Parallel` maps share [structured compute capture](../compiler_internals/tenstorrent_structured_compute.md),
+followed by complete [Phase 4 Device Lower](../compiler_internals/tenstorrent_phase4_lower.md).
+Multi-tile expressions, broadcast, Fill, Typecast, Transpose, rank-2 shared-output GEMM with BF16/FP32 accumulation,
+Reduction, logical batch dimensions, and bounded control flow reach verified three-slot Device IR.
+Full lowering diagnoses unsupported input; it never returns `tt.ir_stage="structured"` as success.
+Capture-only clients invoke the capture and compute verifier passes directly.
+GEMM fragments have a separate [frontend precision and lifetime contract](../developer_guide/tenstorrent_frontend.md).
+`VerifyTTGemmAccumulators` validates that contract. Single-Core
+[Device IR v7](../compiler_internals/tenstorrent_compute_values.md) supports immutable
+fragment values, mixed shared/fragment elementwise computation, old/new versions,
+GEMM epilogues and exact-dtype materialization. Source-only TTL mapping covers a
+restricted subset; FP32/full-K GEMM schedules and hardware execution remain unavailable.
+
+Tenstorrent's language facade exposes inter-Core communication topology under `T.comm`:
+
+```python
+from tilelang.tenstorrent import language as T
+
+net = T.comm.PipeNet([
+    T.comm.Pipe(
+        src=(0, 0),
+        dst=T.comm.CoreRange(begin=(1, 0), end=(4, 1)),
+    ),
+])
+
+for pipe in T.comm.foreach_src(net):
+    T.copy(send_block, pipe)
+
+for pipe in T.comm.foreach_dst(net):
+    T.copy(pipe, recv_block)
+```
+
+`T.comm` describes communication endpoints, edges, topology, and selected `PipeRef` values. `T.copy` remains the
+data-movement primitive. The internal target-specific IR names remain under `tl.tt.*`. This namespace is unrelated
+to `T.comm_reducer`, where `comm` means commutative rather than communication.
 
 ## Default target
 

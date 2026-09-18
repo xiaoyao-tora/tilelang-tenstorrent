@@ -1,0 +1,17 @@
+# from tvm.script import tirx as T
+
+@T.prim_func
+def row_column_gemm_x2_y2_trisc():
+    T.func_attr({"calling_conv": 2, "target": T.target({"arch": "wormhole_b0", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][0], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][0], "tt.tensor_arg_indices": []})
+    T.tt.dfb_wait(20, 1)
+    T.tt.dfb_wait(21, 1)
+    T.tt.dfb_reserve(22, 1)
+    T.tt.dfb_compute(22, 20, 21, tt.compute_kind="gemm", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.transpose_a=0, tt.transpose_b=0, tt.clear=1, tt.accum_dtype="float32", tt.input_shapes=[[32, 32], [32, 32]], tt.access_maps=[[0, 1], [0, 1]])
+    T.tt.dfb_release(20, 1)
+    T.tt.dfb_release(21, 1)
+    T.tt.dfb_wait(22, 1)
+    T.tt.dfb_reserve(23, 1)
+    T.tt.dfb_compute(23, 22, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+    T.tt.dfb_release(22, 1)
+
+# Metadata omitted. Use show_meta=True in script() method to show it.

@@ -16,6 +16,20 @@ def get_pass_context():
     return PassContext.current()
 
 
+def CanonicalizeTTElementwise():
+    """Capture Tenstorrent Tiles and supported Parallel elementwise scopes."""
+    from tilelang.tenstorrent.transform import CanonicalizeTTElementwise as create_pass
+
+    return create_pass()
+
+
+def VerifyTTComputeBlocks():
+    """Verify Tenstorrent structured compute effects, geometry, and templates."""
+    from tilelang.tenstorrent.transform import VerifyTTComputeBlocks as create_pass
+
+    return create_pass()
+
+
 def ClusterPlanning():
     """ClusterPlanning
 
