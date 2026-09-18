@@ -1,0 +1,11 @@
+# from tvm.script import tirx as T
+
+@T.prim_func
+def row_column_gemm_x2_y0_trisc():
+    T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][0], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][0], "tt.tensor_arg_indices": []})
+    T.tt.dfb_wait(14, 1)
+    T.tt.dfb_reserve(15, 1)
+    T.tt.dfb_compute(15, 14, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+    T.tt.dfb_release(14, 1)
+
+# Metadata omitted. Use show_meta=True in script() method to show it.

@@ -92,8 +92,13 @@ requires = [
 ]
 build-backend = "scikit_build_core.build"
 
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
 [tool.scikit-build]
-wheel.py-api = "cp38"
+wheel.py-api = "cp310"
 cmake.version = ">=3.26.1"
 build-dir = "build"
 

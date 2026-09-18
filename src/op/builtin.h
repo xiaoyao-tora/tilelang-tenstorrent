@@ -30,6 +30,8 @@ static constexpr const char *kPipelineMbarPhaseExpr =
     "tl.pipeline_mbar_phase_expr";
 
 static constexpr const char *kLocalVarInit = "tl.local_var_init";
+static constexpr const char *kAllocBufferAnnotations =
+    "tl.alloc_buffer_annotations";
 static constexpr const char *kNonRestrictParams = "tl.non_restrict_params";
 static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
 

@@ -1,7 +1,9 @@
 """Loop related language interfaces in TileLang."""
 
 from __future__ import annotations
+
 from typing import Any
+
 from tvm import tirx
 from tvm.tirx import IntImm
 import tvm.tirx.script.builder as tb_tir
@@ -85,6 +87,57 @@ def Parallel(
     if prefer_async is not None:
         merged_annotations["parallel_prefer_async"] = prefer_async
     return _ffi_api.Parallel(extents, merged_annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+
+def Tiles(
+    *domain: tirx.Buffer | tuple[int | tirx.PrimExpr, ...] | list[int | tirx.PrimExpr] | int | tirx.PrimExpr,
+    parallel: bool = True,
+) -> frame.ForFrame:
+    """Construct a static rank-2 logical elementwise region.
+
+    Supply one Buffer, one tuple/list of extents, or two extents. A Buffer
+    contributes only its shape; the body determines the region's actual
+    inputs and output. Storage metadata is validated during canonicalization.
+    ``parallel`` is a keyword-only bool. Only ``True`` is currently supported;
+    ``False`` raises ``NotImplementedError`` before constructing any IR.
+    """
+    if not isinstance(parallel, bool):
+        raise TypeError("parallel must be a bool")
+    if not parallel:
+        raise NotImplementedError("Tiles currently requires parallel=True; parallel=False has no supported lowering")
+
+    if not domain:
+        raise ValueError("Tiles domain must be non-empty")
+    if len(domain) == 1 and isinstance(domain[0], tirx.Buffer):
+        extents = tuple(domain[0].shape)
+    elif len(domain) == 1 and isinstance(domain[0], (tuple, list)):
+        extents = tuple(domain[0])
+    else:
+        if any(isinstance(extent, (tirx.Buffer, tuple, list)) for extent in domain):
+            raise TypeError("Tiles domain must be one Buffer, one tuple/list, or two scalar integer extents")
+        extents = domain
+
+    if not extents:
+        raise ValueError("Tiles domain must be non-empty")
+    for axis, extent in enumerate(extents):
+        if isinstance(extent, bool) or not isinstance(extent, (int, tirx.PrimExpr)):
+            raise TypeError(f"Tiles domain extent {axis} must be a scalar integer")
+        if isinstance(extent, tirx.PrimExpr) and (
+            not (extent.dtype.startswith("int") or extent.dtype.startswith("uint")) or "x" in extent.dtype
+        ):
+            raise TypeError(f"Tiles domain extent {axis} must be a scalar integer")
+        if not isinstance(extent, (int, tirx.IntImm)):
+            raise ValueError(f"Tiles domain extent {axis} must be a compile-time constant")
+        if int(extent) <= 0:
+            raise ValueError(f"Tiles domain extent {axis} must be positive")
+    if len(extents) != 2:
+        raise ValueError("Tiles domain must have rank 2")
+
+    annotations = {
+        "tl.tt.tiles_parallel": tirx.IntImm("int32", int(parallel)),
+        "tl.tt.tiles_stage": tirx.IntImm("int32", 0),
+    }
+    return _ffi_api.Tiles(extents, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
 def Persistent(

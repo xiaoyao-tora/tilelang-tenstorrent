@@ -1,0 +1,39 @@
+# from tvm.script import ir as I
+# from tvm.script import tirx as T
+
+@I.ir_module
+class Module:
+    @T.prim_func
+    def row_column_gemm(A_handle: T.handle, B_handle: T.handle, C_handle: T.handle):
+        A = T.match_buffer(A_handle, (64, 32), strides=(32, 1))
+        B = T.match_buffer(B_handle, (32, 64), strides=(64, 1))
+        C = T.match_buffer(C_handle, (64, 64), strides=(64, 1))
+        # with T.sblock("root"):
+        for bx in T.thread_binding(3, thread="blockIdx.x"):
+            for by in T.thread_binding(3, thread="blockIdx.y"):
+                for tx in T.thread_binding(1, thread="threadIdx.x"):
+                    for ty in T.thread_binding(1, thread="threadIdx.y"):
+                        for tz in T.thread_binding(1, thread="threadIdx.z"):
+                            with T.sblock("tilelang_root"):
+                                T.reads()
+                                T.writes()
+                                a = T.sblock_alloc_buffer((32, 32), scope="shared.dyn")
+                                b = T.sblock_alloc_buffer((32, 32), scope="shared.dyn")
+                                c = T.sblock_alloc_buffer((32, 32), scope="shared.dyn")
+                                for p in T.serial(2, annotations={"tl.tt.foreach_src": "{\"id\":0,\"kind\":\"collective\",\"pipes\":[{\"dst\":{\"begin\":[1,1],\"end\":[3,2]},\"src\":[0,1]},{\"dst\":{\"begin\":[1,2],\"end\":[3,3]},\"src\":[0,2]}]}"}):
+                                    sx: T.int32 = T.tt.pipe_src(p, 0)
+                                    sy: T.int32 = T.tt.pipe_src(p, 1)
+                                    T.copy(T.region(A[(sy - 1) * 32, 0], 1, 32, 32), T.region(a[0, 0], 2, 32, 32))
+                                    T.tt.pipe_send(T.region(a[0, 0], 1, 32, 32), p)
+                                for p in T.serial(2, annotations={"tl.tt.foreach_src": "{\"id\":1,\"kind\":\"collective\",\"pipes\":[{\"dst\":{\"begin\":[1,1],\"end\":[2,3]},\"src\":[1,0]},{\"dst\":{\"begin\":[2,1],\"end\":[3,3]},\"src\":[2,0]}]}"}):
+                                    sx: T.int32 = T.tt.pipe_src(p, 0)
+                                    sy: T.int32 = T.tt.pipe_src(p, 1)
+                                    T.copy(T.region(B[0, (sx - 1) * 32], 1, 32, 32), T.region(b[0, 0], 2, 32, 32))
+                                    T.tt.pipe_send(T.region(b[0, 0], 1, 32, 32), p)
+                                for p in T.serial(2, annotations={"tl.tt.foreach_dst": "{\"id\":0,\"kind\":\"collective\",\"pipes\":[{\"dst\":{\"begin\":[1,1],\"end\":[3,2]},\"src\":[0,1]},{\"dst\":{\"begin\":[1,2],\"end\":[3,3]},\"src\":[0,2]}]}"}):
+                                    T.tt.pipe_recv(p, T.region(a[0, 0], 2, 32, 32))
+                                for p in T.serial(2, annotations={"tl.tt.foreach_dst": "{\"id\":1,\"kind\":\"collective\",\"pipes\":[{\"dst\":{\"begin\":[1,1],\"end\":[2,3]},\"src\":[1,0]},{\"dst\":{\"begin\":[2,1],\"end\":[3,3]},\"src\":[2,0]}]}"}):
+                                    T.tt.pipe_recv(p, T.region(b[0, 0], 2, 32, 32))
+                                if bx > 0 and by > 0:
+                                    T.gemm(T.region(a[0, 0], 1, 32, 32), T.region(b[0, 0], 1, 32, 32), T.region(c[0, 0], 3, 32, 32), T.bool(False), T.bool(False), 32, 32, 32, 0, T.bool(True), 32, 32, 0, 0, 1, 0, 0, 0, 0)
+                                    T.copy(T.region(c[0, 0], 1, 32, 32), T.region(C[(by - 1) * 32, (bx - 1) * 32], 2, 32, 32))

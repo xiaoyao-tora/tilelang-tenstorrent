@@ -87,12 +87,38 @@ private:
     HandleAnnotations(new_block->annotations, &pragma_attrs, /*is_block=*/true,
                       new_block->alloc_buffers);
 
+    // Per-buffer metadata describes the allocation, so it must outlive the
+    // enclosing opaque block. Match by data identity, never by buffer name.
+    Map<Var, Map<String, Any>> allocation_metadata;
+    if (auto annotation =
+            new_block->annotations.Get("tl.alloc_buffer_annotations")) {
+      auto entries = annotation.value().try_cast<Map<Var, Map<String, Any>>>();
+      if (!entries.has_value()) {
+        TVM_FFI_THROW(ValueError)
+            << "LowerOpaqueBlock: tl.alloc_buffer_annotations must be "
+               "Map<Var, Map<String, Any>>";
+      }
+      allocation_metadata = entries.value();
+      for (const auto &[data, metadata] : allocation_metadata) {
+        bool owned = false;
+        for (const Buffer &buffer : new_block->alloc_buffers) {
+          owned |= buffer->data.same_as(data);
+        }
+        if (!owned) {
+          TVM_FFI_THROW(ValueError)
+              << "LowerOpaqueBlock: allocation metadata references a buffer "
+                 "not allocated by the enclosing block";
+        }
+      }
+    }
+
     // Step 4. Handle allocations in reverse order
     for (size_t i = new_block->alloc_buffers.size(); i > 0; --i) {
       const Buffer &buffer = new_block->alloc_buffers[i - 1];
       Array<PrimExpr> allocation_shape = GetBufferAllocationShape(buffer);
       body = SeqStmt({DeclBuffer(buffer), std::move(body)});
-      Map<String, Any> allocate_annotations;
+      Map<String, Any> allocate_annotations =
+          allocation_metadata.Get(buffer->data).value_or(Map<String, Any>{});
       auto it = storage_align_.find(buffer->data);
       if (it != storage_align_.end()) {
         StorageAlignAnnotation allocate_aligns;
