@@ -7,7 +7,7 @@ from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import transform
 from tvm import ir, tirx
-from testing.python.target.test_tilelang_tenstorrent_compute_values import _calls
+from test_tilelang_tenstorrent_utils import _calls
 
 TARGET = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
 

@@ -8,7 +8,7 @@ from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform
 from tvm import ir, tirx
 
-from testing.python.target.test_tilelang_tenstorrent_lower_composition import interpret
+from test_tilelang_tenstorrent_utils import interpret
 
 TARGET = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
 METADATA = {"tt.tile_shape": (32, 32), "tt.dfb_block_count": 2}

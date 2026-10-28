@@ -25,11 +25,7 @@ from testing.python.target.test_tilelang_tenstorrent_phase2_device_ir import (
     _replace_slot_body,
     _slots,
 )
-from testing.python.target.test_tilelang_tenstorrent_compute_values import (
-    _calls,
-    _core_statements,
-    _with_core_statements,
-)
+from test_tilelang_tenstorrent_utils import _calls, _core_statements, _with_core_statements
 
 
 def lower(monkeypatch, program):

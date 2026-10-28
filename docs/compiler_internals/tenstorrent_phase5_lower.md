@@ -203,7 +203,9 @@ Device script/JSON 字节确定性断言。29 个 warning 是现有 Python typin
   溢出检查；v1/v2 显式预算也有回归。
 - Phase 5 semantics：47 项，独立 NumPy 模型运行最终 Device IR，使用有限容量存储、
   copy 延迟及不同 slot 调度，逐 iteration 检查导出值；覆盖流水与 serial 的数值
-  等价、dtype、stage/边界及显式容量大于窗口深度。
+  等价、dtype、stage/边界及显式容量大于窗口深度。共享模型位于
+  `testing/python/target/test_tilelang_tenstorrent_utils.py`，与测试构造及断言分离；
+  保留有限容量、异步 copy 和随机调度语义，不作为生产执行 backend。
 - 原有 373 项继续通过，包括 Phase 2 Add、Phase 4 compute/control/device/semantics、
   backend import 及语言 Tiles，保留 v1/v2 既有 Lower 行为。
 - 重复 Lower 的结构确定性、Device script/JSON 字节相等、JSON round-trip 后

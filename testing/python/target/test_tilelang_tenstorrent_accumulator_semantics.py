@@ -15,7 +15,7 @@ from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
 from tvm import ir, tirx
 
 from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import cast
-from testing.python.target.test_tilelang_tenstorrent_compute_values import _calls
+from test_tilelang_tenstorrent_utils import _calls
 
 
 def execute_accumulators(mod, inputs, *, inject_intermediate_bf16_pack=False):

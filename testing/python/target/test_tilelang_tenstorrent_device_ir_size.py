@@ -11,9 +11,8 @@ from tilelang import tvm
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform
 from tvm import tirx
 
-from testing.python.target.test_tilelang_tenstorrent_compute_values import _round
+from test_tilelang_tenstorrent_utils import _round, interpret
 from testing.python.target.test_tilelang_tenstorrent_flash_attention import kernel, online_reference
-from testing.python.target.test_tilelang_tenstorrent_lower_composition import interpret
 
 
 @pytest.fixture(scope="module")

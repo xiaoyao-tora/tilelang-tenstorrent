@@ -1,249 +1,23 @@
 """Numerical validation of immutable compute values without a TT device.
 
-This interpreter executes the Device streams and expression contract against
-NumPy. The expected results are independent whole-array frontend formulas.
+The shared CPU reference model executes Device streams against NumPy.
+The expected results are independent whole-array frontend formulas.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
+import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import lower_tenstorrent_ir
 from tvm import tirx
 
-TARGET = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
+import test_tilelang_tenstorrent_utils
+from test_tilelang_tenstorrent_utils import TARGET, _calls, _round, interpret, interpret_values
+
 METADATA = {"tt.tile_shape": (32, 32), "tt.dfb_block_count": 2}
-
-
-def _round(value, dtype):
-    value = np.asarray(value, dtype=np.float32)
-    if str(dtype) == "bfloat16":
-        bits = value.view(np.uint32)
-        bits = (bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)) & np.uint32(0xFFFF0000)
-        return bits.view(np.float32)
-    return value
-
-
-def _specialize_expr(expr, bindings, core):
-    expr = tirx.stmt_functor.substitute(expr, bindings)
-    if core is not None:
-
-        def rewrite(node):
-            if isinstance(node, tirx.Call) and node.op.name == "tl.tt.core_x":
-                return tirx.IntImm(node.dtype, core[0])
-            if isinstance(node, tirx.Call) and node.op.name == "tl.tt.core_y":
-                return tirx.IntImm(node.dtype, core[1])
-            return None
-
-        expr = tirx.stmt_functor.ir_transform(
-            tirx.Evaluate(expr), rewrite, None, ["tirx.Call"]
-        ).value
-    return tvm.arith.Analyzer().simplify(expr)
-
-
-def _specialize_call(call, bindings, core):
-    args = [_specialize_expr(arg, bindings, core) for arg in call.args]
-    annotations = {key: value for key, value in call.annotations.items()}
-    if "tt.value_inputs" in annotations:
-        annotations["tt.value_inputs"] = [
-            _specialize_expr(value, bindings, core)
-            for value in annotations["tt.value_inputs"]
-        ]
-    if "tt.expression" in annotations:
-        annotations["tt.expression"] = _specialize_expr(
-            annotations["tt.expression"], bindings, core
-        )
-    return tirx.Call(call.dtype, call.op, args, annotations, call.span)
-
-
-def _calls(body, bindings=None, core=None):
-    bindings = {} if bindings is None else bindings
-    if isinstance(body, tirx.SeqStmt):
-        for stmt in body.seq:
-            yield from _calls(stmt, bindings, core)
-    elif isinstance(body, tirx.Evaluate) and isinstance(body.value, tirx.Call):
-        yield _specialize_call(body.value, bindings, core)
-    elif isinstance(body, tirx.Evaluate) and int(body.value) == 0:
-        return
-    elif isinstance(body, tirx.IfThenElse):
-        yield from _calls(body.then_case, bindings, core)
-        if body.else_case is not None:
-            yield from _calls(body.else_case, bindings, core)
-    elif isinstance(body, tirx.SBlockRealize):
-        domain = body.block.annotations.get("tt.core_domain")
-        if domain is not None and core is None:
-            for x in range(int(domain.begin.x), int(domain.end.x)):
-                for y in range(int(domain.begin.y), int(domain.end.y)):
-                    yield from _calls(body.block.body, bindings, (x, y))
-        else:
-            yield from _calls(body.block.body, bindings, core)
-    elif isinstance(body, tirx.For):
-        minimum = int(body.min)
-        step = int(body.step) if body.step is not None else 1
-        for offset in range(int(body.extent)):
-            iteration = tirx.IntImm(body.loop_var.dtype, minimum + offset * step)
-            nested = dict(bindings)
-            nested[body.loop_var] = iteration
-            yield from _calls(body.body, nested, core)
-    else:
-        raise AssertionError(f"Unexpected Device statement: {body}")
-
-
-def _core_statements(func):
-    dispatch = func.body
-    if isinstance(dispatch, tirx.SeqStmt):
-        assert len(dispatch.seq) == 1
-        dispatch = dispatch.seq[0]
-    realize = dispatch.then_case if isinstance(dispatch, tirx.IfThenElse) else dispatch
-    assert isinstance(realize, tirx.SBlockRealize)
-    body = realize.block.body
-    return list(body.seq) if isinstance(body, tirx.SeqStmt) else [body]
-
-
-def _with_core_statements(func, statements):
-    dispatch = func.body
-    realize = dispatch.then_case if isinstance(dispatch, tirx.IfThenElse) else dispatch
-    assert isinstance(realize, tirx.SBlockRealize)
-    block = realize.block
-    body = tirx.SeqStmt(statements) if len(statements) != 1 else statements[0]
-    updated = tirx.SBlock(
-        block.iter_vars,
-        block.reads,
-        block.writes,
-        block.name_hint,
-        body,
-        init=block.init,
-        alloc_buffers=block.alloc_buffers,
-        match_buffers=block.match_buffers,
-        annotations=block.annotations,
-    )
-    realize = tirx.SBlockRealize(realize.iter_values, realize.predicate, updated)
-    if isinstance(dispatch, tirx.IfThenElse):
-        return func.with_body(tirx.IfThenElse(dispatch.condition, realize, dispatch.else_case))
-    return func.with_body(realize)
-
-
-def interpret_values(mod, tensors):
-    """Run streams with waits, preserving snapshots after input DFB release."""
-    mod = D.expand_current_device_tables(mod)
-    arrays = [np.array(value, copy=True) for value in tensors]
-    dfbs, values = {}, {}
-    descriptors = {int(value.value_id): value for value in mod.attrs["tt.compute_value_table"]}
-    dfb_descriptors = {int(dfb.dfb_id): dfb for dfb in mod.attrs["tt.dfb_table"]}
-    streams = [list(_calls(func.body)) for func in mod.functions.values()]
-    cursors = [0] * len(streams)
-
-    def expression(expr, maps):
-        if isinstance(expr, (tirx.FloatImm, tirx.IntImm)):
-            return np.float32(expr.value)
-        if isinstance(expr, tirx.Cast):
-            return _round(expression(expr.value, maps), expr.dtype)
-        if isinstance(expr, tirx.Select):
-            return _round(
-                np.where(expression(expr.condition, maps), expression(expr.true_value, maps), expression(expr.false_value, maps)),
-                expr.dtype,
-            )
-        if isinstance(expr, tirx.Not):
-            return np.logical_not(expression(expr.a, maps))
-        if isinstance(expr, tirx.Call):
-            name = expr.op.name
-            if name in ("tl.tt.dfb_load", "tl.tt.compute_value_load"):
-                identifier = int(expr.args[0])
-                source = dfbs[identifier] if name == "tl.tt.dfb_load" else values[identifier]
-                axes = maps[(name, identifier)]
-                source = source[tuple(slice(0, 1) if axis == -1 else slice(None) for axis in axes)]
-                return source
-            unary = {
-                "tirx.exp": np.exp,
-                "tirx.exp2": np.exp2,
-                "tirx.log": np.log,
-                "tirx.log2": np.log2,
-                "tirx.sqrt": np.sqrt,
-                "tirx.rsqrt": lambda value: 1 / np.sqrt(value),
-                "tirx.abs": np.abs,
-            }
-            assert name in unary, name
-            return _round(unary[name](expression(expr.args[0], maps)), expr.dtype)
-        binary = {
-            tirx.Add: np.add,
-            tirx.Sub: np.subtract,
-            tirx.Mul: np.multiply,
-            tirx.Div: np.divide,
-            tirx.Min: np.minimum,
-            tirx.Max: np.maximum,
-            tirx.EQ: np.equal,
-            tirx.NE: np.not_equal,
-            tirx.LT: np.less,
-            tirx.LE: np.less_equal,
-            tirx.GT: np.greater,
-            tirx.GE: np.greater_equal,
-            tirx.And: np.logical_and,
-            tirx.Or: np.logical_or,
-        }
-        for cls, operation in binary.items():
-            if isinstance(expr, cls):
-                result = operation(expression(expr.a, maps), expression(expr.b, maps))
-                return result if str(expr.dtype) == "bool" else _round(result, expr.dtype)
-        raise AssertionError(f"Unexpected expression: {expr}")
-
-    for _ in range(10000):
-        if all(cursor == len(stream) for cursor, stream in zip(cursors, streams)):
-            return arrays, values
-        advanced = False
-        for index, stream in enumerate(streams):
-            if cursors[index] == len(stream):
-                continue
-            call = stream[cursors[index]]
-            name, args = call.op.name, list(map(int, call.args))
-            if name == "tl.tt.dfb_wait" and args[0] not in dfbs:
-                continue
-            if name == "tl.tt.dfb_to_tensor_nd" and args[0] not in dfbs:
-                continue
-            if name == "tl.tt.tensor_to_dfb_nd":
-                region = tuple(slice(args[axis], args[axis] + args[axis + 1]) for axis in range(2, len(args), 2))
-                dfbs[args[1]] = arrays[args[0]][region].copy()
-            elif name == "tl.tt.dfb_to_tensor_nd":
-                region = tuple(slice(args[axis], args[axis] + args[axis + 1]) for axis in range(2, len(args), 2))
-                arrays[args[1]][region] = dfbs[args[0]]
-            elif name in ("tl.tt.compute_value", "tl.tt.dfb_compute"):
-                attrs = call.annotations
-                maps = {
-                    ("tl.tt.dfb_load", identifier): tuple(map(int, axes))
-                    for identifier, axes in zip(args[1:], attrs.get("tt.access_maps", []))
-                }
-                maps.update(
-                    {
-                        ("tl.tt.compute_value_load", int(identifier)): tuple(map(int, axes))
-                        for identifier, axes in zip(attrs.get("tt.value_inputs", []), attrs.get("tt.value_access_maps", []))
-                    }
-                )
-                kind = str(attrs["tt.compute_kind"].value)
-                result = dfbs[args[1]] if kind == "copy" else expression(attrs["tt.expression"], maps)
-                shape = tuple(map(int, attrs["tt.logical_domain"]))
-                result = np.broadcast_to(result, shape).copy()
-                if name == "tl.tt.compute_value":
-                    assert args[0] not in values, "An immutable value was redefined"
-                    values[args[0]] = _round(result, descriptors[args[0]].buffer.dtype)
-                else:
-                    dfbs[args[0]] = _round(result, dfb_descriptors[args[0]].element_dtype)
-            elif name == "tl.tt.compute_value_gemm":
-                output, lhs, rhs, old, ta, tb = args
-                a, b = dfbs[lhs], dfbs[rhs]
-                result = (a.T if ta else a) @ (b.T if tb else b)
-                if old >= 0:
-                    result = result + values[old]
-                assert output not in values
-                values[output] = _round(result, descriptors[output].buffer.dtype)
-            elif name == "tl.tt.compute_value_store":
-                dfbs[args[1]] = values[args[0]].copy()
-            elif name == "tl.tt.dfb_release":
-                del dfbs[args[0]]
-            else:
-                assert name in ("tl.tt.dfb_reserve", "tl.tt.dfb_wait", "tl.tt.dfb_copy_wait"), name
-            cursors[index] += 1
-            advanced = True
-        assert advanced, "Device streams deadlocked"
-    raise AssertionError("Device interpreter exceeded its instruction bound")
 
 
 def value_chain():
@@ -461,3 +235,91 @@ def test_two_accumulator_roots_combine_and_preserve_transitive_provenance():
     outputs, _ = interpret_values(mod, [a, b, np.zeros((32, 32), "float32")])
     full = a @ b
     np.testing.assert_array_equal(outputs[2], _round((full * 0.25 + full * 0.75) * 2 + full * 0.5, "bfloat16"))
+
+
+def _interpreter_expression_module(expr, output_dtype):
+    calls = [
+        tirx.Call(
+            "handle", tvm.ir.Op.get("tl.tt.compute_value"), [0],
+            {"tt.compute_kind": tirx.StringImm("elementwise"), "tt.expression": expr,
+             "tt.logical_domain": [1, 1]},
+        ),
+        tirx.Call("handle", tvm.ir.Op.get("tl.tt.compute_value_store"), [0, 0]),
+        tirx.Call("handle", tvm.ir.Op.get("tl.tt.dfb_to_tensor_nd"), [0, 0, 0, 1, 0, 1]),
+    ]
+    return SimpleNamespace(
+        attrs={
+            "tt.compute_value_table": [SimpleNamespace(
+                value_id=0, buffer=SimpleNamespace(dtype=expr.dtype))],
+            "tt.dfb_table": [SimpleNamespace(dfb_id=0, element_dtype=output_dtype)],
+        },
+        functions={"compute": SimpleNamespace(
+            body=tirx.SeqStmt([tirx.Evaluate(call) for call in calls]))},
+    )
+
+
+@pytest.mark.parametrize("dtype, inputs, expected", [
+    ("int32", [1.75, -1.75, 0.25, -0.25], [1, -1, 0, 0]),
+    ("int64", [2**40 + 1, -(2**40 + 1)], [2**40 + 1, -(2**40 + 1)]),
+    ("uint32", [0, 2**24 + 1], [0, 2**24 + 1]),
+    ("bool", [0, 1, -1], [False, True, True]),
+    ("float16", [1.0001], [1.0]),
+    ("float32", [1.0 + 2**-30], [1.0]),
+    ("float64", [1.0 + 2**-30], [1.0 + 2**-30]),
+])
+def test_interpreter_dtype_casts(dtype, inputs, expected):
+    actual = _round(inputs, dtype)
+    assert actual.dtype == np.dtype(dtype)
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("expr, expected", [
+    (tirx.Cast("int32", tirx.FloatImm("float32", 1.75)), 1),
+    (tirx.Cast("int32", tirx.FloatImm("float32", -1.75)), -1),
+    (tirx.Cast("bool", tirx.IntImm("int32", -1)), True),
+    (tirx.Cast("bool", tirx.IntImm("int32", 0)), False),
+    (tirx.IntImm("int64", 2**40 + 1), 2**40 + 1),
+    (tirx.FloatImm("float64", 1.0 + 2**-30), 1.0 + 2**-30),
+])
+@pytest.mark.parametrize("interpreter", [interpret_values, interpret])
+def test_interpreter_typed_expressions(monkeypatch, expr, expected, interpreter):
+    monkeypatch.setattr(D, "expand_current_device_tables", lambda mod: mod)
+    # Exercise interpreter Cast evaluation rather than TVM constant folding.
+    monkeypatch.setattr(test_tilelang_tenstorrent_utils, "_specialize_expr", lambda expr, *args: expr)
+    mod = _interpreter_expression_module(expr, expr.dtype)
+    arrays, values = interpreter(mod, [np.zeros((1, 1), dtype=str(expr.dtype))])
+    assert values[0].dtype == np.dtype(str(expr.dtype))
+    assert values[0][0, 0] == expected
+    assert arrays[0][0, 0] == expected
+
+
+@pytest.mark.parametrize("value, expression_dtype, output_dtype, expected", [
+    (1.00390625, "float32", "bfloat16", 1.0),
+    (1.01171875, "float32", "bfloat16", 1.015625),
+    (-1.00390625, "float32", "bfloat16", -1.0),
+    (1.75, "float32", "int32", 1),
+    (-1.75, "float32", "int32", -1),
+    (1.0001, "float64", "float16", 1.0),
+    (1.0 + 2**-30, "float64", "float64", 1.0 + 2**-30),
+])
+@pytest.mark.parametrize("interpreter", [interpret_values, interpret])
+def test_interpreter_explicit_cast_materializes_exact_dtype(
+    monkeypatch, value, expression_dtype, output_dtype, expected, interpreter,
+):
+    monkeypatch.setattr(D, "expand_current_device_tables", lambda mod: mod)
+    expression = tirx.Cast(output_dtype, tirx.FloatImm(expression_dtype, value))
+    mod = _interpreter_expression_module(expression, output_dtype)
+    tensor_dtype = "float32" if output_dtype == "bfloat16" else output_dtype
+    arrays, values = interpreter(mod, [np.zeros((1, 1), dtype=tensor_dtype)])
+    expected_storage_dtype = "float32" if output_dtype == "bfloat16" else output_dtype
+    assert values[0].dtype == np.dtype(expected_storage_dtype)
+    assert values[0][0, 0] == expected
+    assert arrays[0][0, 0] == expected
+
+
+@pytest.mark.parametrize("interpreter", [interpret_values, interpret])
+def test_interpreter_rejects_cross_dtype_compute_value_store(monkeypatch, interpreter):
+    monkeypatch.setattr(D, "expand_current_device_tables", lambda mod: mod)
+    mod = _interpreter_expression_module(tirx.FloatImm("float32", 1.5), "bfloat16")
+    with pytest.raises(AssertionError, match="compute_value_store must preserve dtype"):
+        interpreter(mod, [np.zeros((1, 1), dtype="float32")])

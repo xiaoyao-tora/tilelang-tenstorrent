@@ -9,7 +9,7 @@ from tilelang.tenstorrent.device_ir import ComputeValueDescriptor
 from tvm import ir, tirx
 
 from testing.python.target.test_tilelang_tenstorrent_frontend02 import TARGET, fragment_program, gemm_epilogue
-from testing.python.target.test_tilelang_tenstorrent_compute_values import _core_statements, _with_core_statements
+from test_tilelang_tenstorrent_utils import _core_statements, _with_core_statements
 
 
 def device(gemm=False):

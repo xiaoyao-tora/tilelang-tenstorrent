@@ -12,8 +12,7 @@ from tilelang import tvm
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
 from tvm import ir
 
-from testing.python.target.test_tilelang_tenstorrent_compute_values import _round
-from testing.python.target.test_tilelang_tenstorrent_lower_composition import interpret
+from test_tilelang_tenstorrent_utils import _round, interpret
 
 
 _SOURCE = Path(__file__).parent / "fixtures" / "tenstorrent_flash_attn_03.py"

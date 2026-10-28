@@ -8,7 +8,7 @@ from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
 from tvm import ir, tirx
-from testing.python.target.test_tilelang_tenstorrent_compute_values import _calls
+from test_tilelang_tenstorrent_utils import _calls
 
 
 def pipeline_shared(block_count=None):

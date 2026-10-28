@@ -9,10 +9,7 @@ from tilelang.tenstorrent import lower_tenstorrent_ir, transform
 from tvm import ir, tirx
 
 from testing.python.target.test_tilelang_tenstorrent_compute_value_verifier import check_rejected, rewrite_calls
-from testing.python.target.test_tilelang_tenstorrent_compute_values import (
-    _calls,
-    _with_core_statements,
-)
+from test_tilelang_tenstorrent_utils import _calls, _with_core_statements
 from testing.python.target.test_tilelang_tenstorrent_frontend02 import TARGET
 
 

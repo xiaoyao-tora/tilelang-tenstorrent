@@ -123,7 +123,7 @@ def run_device(mod, inputs):
     tensors = [cast(value, desc.dtype).copy() for value, desc in zip(inputs, mod.attrs["tt.tensor_table"])]
     values = {}
     streams = []
-    from testing.python.target.test_tilelang_tenstorrent_compute_values import _calls
+    from test_tilelang_tenstorrent_utils import _calls
 
     for func in mod.functions.values():
         streams.append(list(_calls(func.body)))

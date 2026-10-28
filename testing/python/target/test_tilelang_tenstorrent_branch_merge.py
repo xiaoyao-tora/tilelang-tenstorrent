@@ -7,7 +7,7 @@ from tilelang import tvm
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
 from tvm import ir, tirx
 
-from testing.python.target.test_tilelang_tenstorrent_compute_values import interpret_values
+from test_tilelang_tenstorrent_utils import interpret_values
 from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import run_device
 
 

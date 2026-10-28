@@ -12,8 +12,7 @@ from tilelang import tvm
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
 from tvm import ir
 
-from testing.python.target.test_tilelang_tenstorrent_compute_values import TARGET, _calls
-from testing.python.target.test_tilelang_tenstorrent_lower_composition import interpret
+from test_tilelang_tenstorrent_utils import TARGET, _calls, interpret
 
 
 def multicast_fragment_program(epochs):

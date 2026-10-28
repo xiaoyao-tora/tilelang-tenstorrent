@@ -11,11 +11,7 @@ from tvm import ir, tirx
 from testing.python.target.test_tilelang_tenstorrent_phase4_compute import shared, elementwise_program
 from testing.python.target.test_tilelang_tenstorrent_phase4_device import replace_compute_annotation
 from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import lower, run_device
-from testing.python.target.test_tilelang_tenstorrent_compute_values import (
-    _calls,
-    _core_statements,
-    _with_core_statements,
-)
+from test_tilelang_tenstorrent_utils import _calls, _core_statements, _with_core_statements
 from testing.python.target.test_tilelang_tenstorrent_phase2_device_ir import _replace_dfb, _replace_slot_body, _slots
 
 

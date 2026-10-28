@@ -17,11 +17,7 @@ from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import low
 
 
 from testing.python.target.test_tilelang_tenstorrent_phase5_pipeline import make_pipeline, lower_pipeline
-from testing.python.target.test_tilelang_tenstorrent_compute_values import (
-    _calls,
-    _core_statements,
-    _with_core_statements,
-)
+from test_tilelang_tenstorrent_utils import _calls, _core_statements, _with_core_statements
 
 
 def pipeline(stages=2, extent=3, capacity=None):

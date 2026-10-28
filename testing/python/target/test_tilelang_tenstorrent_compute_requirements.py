@@ -10,11 +10,7 @@ from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent.device_ir import AccumulatorDescriptor, ComputeRequirements
 from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from test_tilelang_tenstorrent_gemm_accumulators import TARGET, program
-from testing.python.target.test_tilelang_tenstorrent_compute_values import (
-    _calls,
-    _core_statements,
-    _with_core_statements,
-)
+from test_tilelang_tenstorrent_utils import _calls, _core_statements, _with_core_statements
 
 
 def lower(accum_dtype="float32"):
