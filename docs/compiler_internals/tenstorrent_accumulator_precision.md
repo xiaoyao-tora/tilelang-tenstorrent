@@ -121,7 +121,7 @@ completion, DST allocation and TTKernel lowering remain owned by TT-Lang.
 Hardware-independent tests cover schema serialization, deterministic lowering,
 full-K lifetime, conflicting requirements, structured return and a CPU numerical
 reference executing the generated Device stream. The shared CPU models in
-`testing/python/target/test_tilelang_tenstorrent_utils.py` model typed constants and
+`testing/python/tenstorrent/_support/reference.py` model typed constants and
 explicit casts while requiring exact-dtype compute-value materialization. The numerical
 reference distinguishes final BF16 materialization from erroneous
 intermediate BF16 pack/reload; it does not certify hardware arithmetic.

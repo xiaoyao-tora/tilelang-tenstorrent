@@ -196,8 +196,9 @@ Phase 6 的多 Core、PipeNet、跨 Core barrier 或通信。单 Core 资源依�
 
 - 原生 C++ 构建：完成全量构建基础上的修改对象重编译与 `libtilelang.dylib` 链接；
   最终六个修改的 C++ translation unit 均使用 CMake/Ninja 生成的原始命令编译成功。
-- 最终回归 **373 passed，29 warnings**。范围是全部
-  `testing/python/target/test_tilelang_tenstorrent*.py`、backend import 测试和语言 Tiles 测试。
+- 最终回归 **373 passed，29 warnings**。范围是全部专属 Tenstorrent 测试、
+  backend import 测试和语言 Tiles 测试；这些测试现在统一位于
+  `testing/python/tenstorrent/`。
   warning 为 Python 3.15 相关的现有 `typing._eval_type` 弃用提示。
 - 新增四组测试分别验证 compute 消费、Device 数据流/元数据、最终 Device 数值语义及
   结构化循环。数值语义组含 60 项，覆盖 Tiles/Parallel 等价、BF16 舍入、复合表达式、
@@ -214,9 +215,8 @@ TILELANG_CACHE_DIR=/tmp/tilelang-phase4-cache .venv/bin/python - <<'PY'
 import tilelang
 import pytest
 from pathlib import Path
-paths = sorted(str(p) for p in Path('testing/python/target').glob('test_tilelang_tenstorrent*.py'))
-paths += ['testing/python/backend/test_tilelang_tenstorrent_import.py',
-          'testing/python/language/test_tilelang_language_tiles.py']
+paths = sorted(str(p) for p in Path('testing/python/tenstorrent').rglob('test_tilelang_tenstorrent*.py'))
+paths += ['testing/python/language/test_tilelang_language_tiles.py']
 raise SystemExit(pytest.main(paths + ['-q', '--tb=short']))
 PY
 ```
