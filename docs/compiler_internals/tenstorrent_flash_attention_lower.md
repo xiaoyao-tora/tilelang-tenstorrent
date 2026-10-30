@@ -2,7 +2,8 @@
 
 本次以 `hyf-test/kernel/flash_attn_03.py` 原始 kernel 为验收输入，保留其
 4D Tensor ABI、BF16 存储类型、Python 浮点常量和在线 softmax 更新顺序。
-回归副本位于 `testing/python/target/fixtures/tenstorrent_flash_attn_03.py`。
+回归副本位于
+`testing/python/tenstorrent/legacy/fixtures/tenstorrent_flash_attn_03.py`。
 目标是工作计划 02 第 22.1 节的逻辑 Device TIR 输出；不扩展 Codegen。
 
 ## 前端与值生命周期

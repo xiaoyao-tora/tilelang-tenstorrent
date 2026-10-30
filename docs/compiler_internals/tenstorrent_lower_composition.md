@@ -75,10 +75,9 @@ TILELANG_CACHE_DIR=/tmp/tilelang-lower-plan02-cache .venv/bin/python - <<'PY'
 import tilelang
 import pytest
 from pathlib import Path
-paths = sorted(str(p) for p in Path('testing/python/target').glob('test_tilelang_tenstorrent*.py')
+paths = sorted(str(p) for p in Path('testing/python/tenstorrent').rglob('test_tilelang_tenstorrent*.py')
                if 'ttl_codegen' not in p.name)
-paths += ['testing/python/backend/test_tilelang_tenstorrent_import.py',
-          'testing/python/language/test_tilelang_language_tiles.py']
+paths += ['testing/python/language/test_tilelang_language_tiles.py']
 raise SystemExit(pytest.main(paths + ['-q', '--tb=short']))
 PY
 ```

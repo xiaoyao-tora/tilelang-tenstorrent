@@ -204,7 +204,7 @@ Device script/JSON 字节确定性断言。29 个 warning 是现有 Python typin
 - Phase 5 semantics：47 项，独立 NumPy 模型运行最终 Device IR，使用有限容量存储、
   copy 延迟及不同 slot 调度，逐 iteration 检查导出值；覆盖流水与 serial 的数值
   等价、dtype、stage/边界及显式容量大于窗口深度。共享模型位于
-  `testing/python/target/test_tilelang_tenstorrent_utils.py`，与测试构造及断言分离；
+  `testing/python/tenstorrent/_support/reference.py`，与测试构造及断言分离；
   保留有限容量、异步 copy 和随机调度语义，不作为生产执行 backend。
 - 原有 373 项继续通过，包括 Phase 2 Add、Phase 4 compute/control/device/semantics、
   backend import 及语言 Tiles，保留 v1/v2 既有 Lower 行为。
@@ -231,9 +231,8 @@ TILELANG_CACHE_DIR=/tmp/tilelang-phase5-cache .venv/bin/python - <<'PYTEST'
 import tilelang
 import pytest
 from pathlib import Path
-paths = sorted(str(p) for p in Path('testing/python/target').glob('test_tilelang_tenstorrent*.py'))
-paths += ['testing/python/backend/test_tilelang_tenstorrent_import.py',
-          'testing/python/language/test_tilelang_language_tiles.py']
+paths = sorted(str(p) for p in Path('testing/python/tenstorrent').rglob('test_tilelang_tenstorrent*.py'))
+paths += ['testing/python/language/test_tilelang_language_tiles.py']
 raise SystemExit(pytest.main(paths + ['-q', '--tb=short']))
 PYTEST
 ```

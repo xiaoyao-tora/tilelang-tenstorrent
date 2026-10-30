@@ -72,7 +72,8 @@ owns automatic DFB pops; explicit reserves/waits/publication preserve Lower's
 operation order.
 
 The legacy integration tests in
-`testing/python/target/test_tilelang_tenstorrent_ttl_codegen.py` remain skipped
+`testing/python/tenstorrent/codegen/test_tilelang_tenstorrent_ttl_codegen.py`
+remain skipped
 until they are migrated to the current typed-family contract. Active tests cover
 the pure preflight boundary without TT-Lang. Current Device TIRX export has
 parser/verifier round-trip coverage, but no current shared-grid TTL parser,

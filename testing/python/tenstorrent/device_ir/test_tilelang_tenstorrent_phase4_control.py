@@ -1,0 +1,130 @@
+"""Structured iteration, conditional normalization and verifier boundaries."""
+
+import numpy as np
+import pytest
+
+from tilelang import tvm
+from tilelang.tenstorrent import language as T
+from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
+from tvm import ir, tirx
+
+from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute import shared, elementwise_program
+from testing.python.tenstorrent.device_ir.test_tilelang_tenstorrent_phase4_device import replace_compute_annotation
+from testing.python.tenstorrent.semantics.test_tilelang_tenstorrent_phase4_semantics import lower, run_device
+from testing.python.tenstorrent._support.reference import _calls, _core_statements, _with_core_statements
+from testing.python.tenstorrent.legacy.test_tilelang_tenstorrent_phase2_device_ir import (
+    _replace_dfb,
+    _replace_slot_body,
+    _slots,
+)
+
+
+def core_loop(func):
+    statements = _core_statements(func)
+    assert len(statements) == 1 and isinstance(statements[0], tirx.For)
+    return statements[0]
+
+
+def replace_core_body(mod, slot, statements):
+    for global_var, func in mod.functions.items():
+        if str(func.attrs["tt.kernel_slot"]) == slot:
+            mod[global_var] = _with_core_statements(func, statements)
+            return
+    raise AssertionError(f"missing slot {slot}")
+
+
+@T.prim_func
+def repeated_inout(A: T.Tensor((64, 64), "float32")):
+    with T.Kernel(1, 1, threads=1):
+        a = shared((64, 64))
+        for _repeat in T.serial(2, 5):
+            T.copy(A, a)
+            for i, j in T.Parallel(64, 64):
+                a[i, j] = a[i, j] + T.float32(2)
+            T.copy(a, A)
+
+
+@T.prim_func
+def index_condition(A: T.Tensor((64, 64), "float32")):
+    with T.Kernel(1, 1, threads=1):
+        a = shared((64, 64))
+        for repeat in T.serial(3):
+            T.copy(A, a)
+            if repeat % 2 == 0:
+                for i, j in T.Parallel(64, 64):
+                    a[i, j] = a[i, j] + T.float32(2)
+            else:
+                for i, j in T.Parallel(64, 64):
+                    a[i, j] = a[i, j] * T.float32(3)
+            T.copy(a, A)
+
+
+def test_independent_iteration_stays_structured_and_preserves_tensor_inout():
+    mod = lower(repeated_inout)
+    slots = _slots(mod)
+    for slot in ("trisc", "ncrisc"):
+        loop = core_loop(slots[slot])
+        assert (int(loop.min), int(loop.extent)) == (2, 3)
+    assert not core_loop(slots["trisc"]).loop_var.same_as(
+        core_loop(slots["ncrisc"]).loop_var
+    )
+    assert all(int(d.transaction_count_or_loop_relation) == 3 for d in mod.attrs["tt.dfb_table"])
+    a = np.arange(4096, dtype=np.float32).reshape(64, 64)
+    np.testing.assert_array_equal(run_device(mod, [a])[0], a + 6)
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
+
+    target = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
+    assert TenstorrentPassPipelineBody(mod, target).same_as(mod)
+
+
+def test_index_dependent_conditions_normalize_without_semantic_loss():
+    from tilelang.tenstorrent import lower_tenstorrent_ir
+
+    target = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
+    mod = lower_tenstorrent_ir(tvm.IRModule({"main": index_condition}), target)
+    assert str(mod.attrs["tt.ir_stage"]) == "structured"
+    assert any(
+        "data-dependent control flow" in str(reason)
+        for reason in mod.attrs["tt.deferred_reasons"]
+    )
+
+
+@pytest.mark.parametrize("mutation", ["trip_count", "relation", "unwrapped", "step"])
+def test_structured_iteration_malformed_schedule_is_rejected(mutation):
+    mod = lower(repeated_inout)
+    func = _slots(mod)["ncrisc"]
+    loop = core_loop(func)
+    if mutation == "relation":
+        dfbs = list(mod.attrs["tt.dfb_table"])
+        dfbs[0] = _replace_dfb(dfbs[0], transaction_count_or_loop_relation=2)
+        mod = mod.with_attr("tt.dfb_table", dfbs)
+    elif mutation == "unwrapped":
+        replace_core_body(mod, "ncrisc", [loop.body])
+    else:
+        changed = tirx.For(
+            loop.loop_var,
+            loop.min,
+            4 if mutation == "trip_count" else loop.extent,
+            loop.kind,
+            loop.body,
+            step=2 if mutation == "step" else None,
+        )
+        replace_core_body(mod, "ncrisc", [changed])
+    before = ir.save_json(mod)
+    with pytest.raises(ValueError, match="loop|iteration|structured"):
+        VerifyTenstorrentDeviceIR()(mod)
+    assert ir.save_json(mod) == before
+
+
+def test_unsupported_device_expression_dtype_is_rejected():
+    mod = lower(elementwise_program())
+    call = next(
+        call
+        for call in _calls(_slots(mod)["trisc"].body)
+        if call.op.name == "tl.tt.dfb_compute"
+    )
+    expression = call.annotations["tt.expression"]
+    expression = tirx.Cast("float32", tirx.Cast("float16", expression))
+    replace_compute_annotation(mod, "tt.expression", expression)
+    with pytest.raises(ValueError, match="unsupported.*(dtype|expression)|expression.*unsupported"):
+        VerifyTenstorrentDeviceIR()(mod)

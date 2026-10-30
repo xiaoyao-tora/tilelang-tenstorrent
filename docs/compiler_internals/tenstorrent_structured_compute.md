@@ -183,12 +183,10 @@ from pathlib import Path
 import tilelang
 import pytest
 
-tests = sorted(str(p) for p in Path("testing/python/target").glob("test_tilelang_tenstorrent*.py"))
+tests = sorted(str(p) for p in Path("testing/python/tenstorrent").rglob("test_tilelang_tenstorrent*.py"))
 tests += [
-    "testing/python/backend",
     "testing/python/language/test_tilelang_language_tiles.py",
     "testing/python/language/test_tilelang_language_alloc_shared_metadata.py",
-    "testing/python/tenstorrent/test_tilelang_tenstorrent_topology.py",
     "testing/python/transform/test_tilelang_transform_lexical_alloc_scope.py",
 ]
 raise SystemExit(pytest.main(["-q", *tests]))
