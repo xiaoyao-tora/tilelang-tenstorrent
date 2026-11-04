@@ -154,18 +154,19 @@ def gemm_epilogue(mode="inplace"):
 
 @pytest.mark.parametrize("mode", ["inplace", "store"])
 def test_gemm_tiles_epilogue_preserves_precision_and_update_relation(mode):
-    result = transform.VerifyTTGemmAccumulators()(normalize(gemm_epilogue(mode)))
-    (requirement,) = result["main"].attrs["tt.gemm_accumulator_requirements"]
-    assert requirement["accum_dtype"].value == "float32"
-    assert requirement["output_dtype"].value == "bfloat16"
-    assert requirement["dest_precision_requirement"].value == "bits32_required"
-    (update,) = requirement["elementwise_updates"]
-    assert update["accumulator"].same_as(requirement["accumulator"])
-    assert update["relation"].value == "pointwise_old_to_new"
-    assert str(update["expression"].dtype) == "float32"
-    if mode == "store":
-        assert isinstance(blocks(result)[-1].body.value, tirx.Cast)
-        assert str(blocks(result)[-1].body.value.dtype) == "bfloat16"
+    result = transform.LegalizeTenstorrentTileOps()(normalize(gemm_epilogue(mode)))
+    calls = []
+    tirx.stmt_functor.post_order_visit(
+        result["main"].body,
+        lambda node: calls.append(node) if isinstance(node, tirx.Call) and node.op.name == "tl.tt.tile_compute" else None,
+    )
+    init = next(call for call in calls if call.annotations["tt.compute_kind"].value == "accumulator_init")
+    assert init.annotations["tt.accum_dtype"].value == "float32"
+    assert init.annotations["tt.output_dtype"].value == "bfloat16"
+    assert init.annotations["tt.dest_precision_requirement"].value == "bits32_required"
+    epilogue = next(call for call in calls if call.annotations["tt.compute_kind"].value == "elementwise")
+    assert str(epilogue.annotations["tt.expression"].dtype) == "float32"
+    assert "tt.gemm_accumulator_requirements" not in result["main"].attrs
     device = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": gemm_epilogue(mode)}), TARGET))
     assert str(device.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in device.attrs
@@ -173,7 +174,7 @@ def test_gemm_tiles_epilogue_preserves_precision_and_update_relation(mode):
 
 
 def test_gemm_unrelated_tiles_overwrite_is_rejected():
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="must not overwrite"):
+    with pytest.raises(ValueError, match="must not overwrite"):
         lower_tenstorrent_ir(tvm.IRModule({"main": gemm_epilogue("overwrite")}), TARGET)
 
 

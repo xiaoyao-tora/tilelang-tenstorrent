@@ -42,20 +42,43 @@ def program(input_dtype="bfloat16", accum_dtype="float32", output_dtype="bfloat1
     return main
 
 
-def normalize(func):
+def normalize(func, verify_dataflow=True):
     mod = tirx.transform.BindTarget(TARGET)(tvm.IRModule({"main": func}))
-    for compiler_pass in (
+    passes = [
         transform.ValidateTenstorrentFrontendIR(),
         transform.CanonicalizeTTElementwise(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
-    ):
+        transform.NormalizeTenstorrentTopology(),
+        transform.NormalizeTenstorrentRegions(),
+    ]
+    if verify_dataflow:
+        passes.append(transform.VerifyTTStructuredDataflow())
+    for compiler_pass in passes:
         mod = compiler_pass(mod)
     return mod
 
 
-def verify(func):
-    return transform.VerifyTTGemmAccumulators()(normalize(func))
+def legalize(func):
+    return transform.LegalizeTenstorrentTileOps()(normalize(func))
+
+
+def structured_accumulator_calls(mod):
+    result = []
+
+    def collect(node):
+        if not isinstance(node, tirx.Call) or node.op.name != "tl.tt.tile_compute":
+            return
+        kind = node.annotations.get("tt.compute_kind")
+        if kind is not None and str(kind.value) in {
+            "accumulator_init",
+            "gemm_update",
+            "accumulator_materialize",
+        }:
+            result.append(node)
+
+    tirx.stmt_functor.post_order_visit(mod["main"].body, collect)
+    return result
 
 
 @pytest.mark.parametrize(
@@ -64,23 +87,79 @@ def verify(func):
 )
 @pytest.mark.parametrize("mode", ["valid", "clear_true"])
 def test_fragment_dtype_contract_is_independent_from_storage(input_dtype, accum_dtype, output_dtype, mode):
-    mod = verify(program(input_dtype, accum_dtype, output_dtype, mode))
-    requirements = mod["main"].attrs["tt.gemm_accumulator_requirements"]
-    assert len(requirements) == 1
-    contract = requirements[0]
-    assert contract["accumulator"].scope() == "local.fragment"
-    assert str(contract["accumulator"].dtype) == accum_dtype
-    assert contract["input_dtype"].value == input_dtype
-    assert contract["accum_dtype"].value == accum_dtype
-    assert contract["output_dtype"].value == output_dtype
-    assert contract["dest_precision_requirement"].value == ("bits32_required" if accum_dtype == "float32" else "bits16_required")
-    assert contract["materialization"].value == "after_complete_k_reduction"
+    mod = legalize(program(input_dtype, accum_dtype, output_dtype, mode))
+    init = next(call for call in structured_accumulator_calls(mod) if call.annotations["tt.compute_kind"].value == "accumulator_init")
+    accumulator = init.args[0].buffer
+    assert accumulator.scope() == "local.fragment"
+    assert str(accumulator.dtype) == accum_dtype
+    assert init.annotations["tt.input_dtype"].value == input_dtype
+    assert init.annotations["tt.accum_dtype"].value == accum_dtype
+    assert init.annotations["tt.output_dtype"].value == output_dtype
+    assert init.annotations["tt.dest_precision_requirement"].value == ("bits32_required" if accum_dtype == "float32" else "bits16_required")
+    assert init.annotations["tt.materialization"].value == "after_complete_k_reduction"
+    assert "tt.gemm_accumulator_requirements" not in mod["main"].attrs
+
+
+def test_reused_fragment_keeps_each_accumulator_lifetime_dtype_contract():
+    @T.prim_func
+    def reused(
+        A: T.Tensor((32, 32), "bfloat16"),
+        B: T.Tensor((32, 32), "bfloat16"),
+        X: T.Tensor((32, 32), "float32"),
+        Y: T.Tensor((32, 32), "float32"),
+        C: T.Tensor((32, 32), "bfloat16"),
+        D: T.Tensor((32, 32), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=1):
+            a = T.alloc_shared((32, 32), "bfloat16")
+            b = T.alloc_shared((32, 32), "bfloat16")
+            x = T.alloc_shared((32, 32), "float32")
+            y = T.alloc_shared((32, 32), "float32")
+            acc = T.alloc_fragment((32, 32), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.copy(X, x)
+            T.copy(Y, y)
+            T.gemm(a, b, acc, clear_accum=True)
+            T.copy(acc, C)
+            T.gemm(x, y, acc, clear_accum=True)
+            T.copy(acc, D)
+
+    structured = legalize(reused)
+    contracts = [
+        (
+            call.annotations["tt.compute_kind"].value,
+            call.annotations["tt.input_dtype"].value,
+            call.annotations["tt.accum_dtype"].value,
+            call.annotations["tt.output_dtype"].value,
+        )
+        for call in structured_accumulator_calls(structured)
+    ]
+    assert contracts == [
+        ("accumulator_init", "bfloat16", "float32", "bfloat16"),
+        ("gemm_update", "bfloat16", "float32", "bfloat16"),
+        ("accumulator_materialize", "bfloat16", "float32", "bfloat16"),
+        ("accumulator_init", "float32", "float32", "float32"),
+        ("gemm_update", "float32", "float32", "float32"),
+        ("accumulator_materialize", "float32", "float32", "float32"),
+    ]
+
+    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
+
+    device = D.expand_current_device_tables(TenstorrentPassPipelineBody(tvm.IRModule({"main": reused}), TARGET))
+    assert [
+        (str(entry.input_dtype), str(entry.accumulation_dtype), str(entry.output_dtype)) for entry in device.attrs["tt.accumulator_table"]
+    ] == [
+        ("bfloat16", "float32", "bfloat16"),
+        ("float32", "float32", "float32"),
+    ]
+    transform.VerifyTenstorrentDeviceIR()(device)
 
 
 @pytest.mark.parametrize(
     "mode,message",
     [
-        ("uninitialized", "dominating T.clear"),
+        ("uninitialized", "definite initialization"),
         ("duplicate_clear", "unique initialization"),
         ("intermediate_pack", "cannot materialize inside"),
         ("overwrite", "initialization requires T.clear"),
@@ -89,35 +168,54 @@ def test_fragment_dtype_contract_is_independent_from_storage(input_dtype, accum_
     ],
 )
 def test_accumulator_lifetime_is_checked(mode, message):
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match=message):
-        verify(program(mode=mode))
+    with pytest.raises(ValueError, match=message):
+        legalize(program(mode=mode))
 
 
 @pytest.mark.parametrize("dtypes", [("float32", "bfloat16", "float32"), ("bfloat16", "float32", "float32")])
 def test_unregistered_dtype_triples_are_rejected(dtypes):
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="capability registry"):
-        verify(program(*dtypes))
+    with pytest.raises(NotImplementedError, match="unsupported program:.*capability registry"):
+        legalize(program(*dtypes))
 
 
 def test_fragment_legalization_preserves_accumulator_operations():
-    mod = transform.LegalizeTenstorrentTileOps()(verify(program()))
-    kinds = []
-    tirx.stmt_functor.post_order_visit(
-        mod["main"].body,
-        lambda node: (
-            kinds.append(node.annotations["tt.compute_kind"].value)
-            if isinstance(node, tirx.Call) and node.op.name == "tl.tt.tile_compute"
-            else None
-        ),
-    )
+    mod = legalize(program())
+    restored = ir.load_json(ir.save_json(mod))
+    ir.assert_structural_equal(restored, mod)
+    calls = structured_accumulator_calls(mod)
+    kinds = [call.annotations["tt.compute_kind"].value for call in calls]
     assert kinds == ["accumulator_init", "gemm_update", "accumulator_materialize"]
+    for call in calls:
+        assert call.annotations["tt.input_dtype"].value == "bfloat16"
+        assert call.annotations["tt.accum_dtype"].value == "float32"
+        assert call.annotations["tt.output_dtype"].value == "bfloat16"
 
 
-def test_frontend_requirements_do_not_bypass_reverification():
-    mod = normalize(program(mode="uninitialized"))
+def test_formation_rejects_accumulator_operation_without_dtype_contract():
+    mod = legalize(program())
+
+    def remove_output_dtype(node):
+        if not isinstance(node, tirx.Call) or node.op.name != "tl.tt.tile_compute":
+            return None
+        kind = node.annotations.get("tt.compute_kind")
+        if kind is None or kind.value != "accumulator_init":
+            return None
+        annotations = dict(node.annotations.items())
+        annotations.pop("tt.output_dtype")
+        return tirx.Call(node.dtype, node.op, node.args, annotations, node.span)
+
+    body = tirx.stmt_functor.ir_transform(mod["main"].body, None, remove_output_dtype, ["tirx.Call"])
+    mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
+    mod = transform.InferTenstorrentTensorLayout()(mod)
+    with pytest.raises(ValueError, match="requires 'tt.output_dtype'"):
+        transform.FormTenstorrentDeviceProgram()(mod)
+
+
+def test_legacy_frontend_requirements_do_not_bypass_analysis():
+    mod = normalize(program(mode="uninitialized"), verify_dataflow=False)
     mod.update_func(mod.get_global_var("main"), mod["main"].with_attr("tt.gemm_accumulator_requirements", []))
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="dominating T.clear"):
-        transform.VerifyTTGemmAccumulators()(mod)
+    with pytest.raises(ValueError, match="dominating T.clear"):
+        transform.LegalizeTenstorrentTileOps()(mod)
 
 
 def test_conditional_initializer_does_not_dominate():
@@ -130,8 +228,8 @@ def test_conditional_initializer_does_not_dominate():
 
     body = tirx.stmt_functor.ir_transform(mod["main"].body, None, wrap_clear, ["tirx.Evaluate"])
     mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="conditional access"):
-        transform.VerifyTTGemmAccumulators()(mod)
+    with pytest.raises(NotImplementedError, match="unsupported program:.*conditional access"):
+        transform.LegalizeTenstorrentTileOps()(mod)
 
 
 def test_fragment_pointer_cannot_escape_to_opaque_call():
@@ -139,15 +237,15 @@ def test_fragment_pointer_cannot_escape_to_opaque_call():
     fragment = next(item.buffer for item in mod["main"].attrs["tt.buffer_metadata_table"] if item.kind == "compute_fragment")
     escape = tirx.Evaluate(tirx.call_extern("int32", "opaque_writer", fragment.data))
     mod.update_func(mod.get_global_var("main"), mod["main"].with_body(tirx.SeqStmt([mod["main"].body, escape])))
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="opaque pointer access"):
-        transform.VerifyTTGemmAccumulators()(mod)
+    with pytest.raises(NotImplementedError, match="unsupported program:.*opaque pointer access"):
+        transform.LegalizeTenstorrentTileOps()(mod)
 
 
 def test_fragment_cannot_be_assigned_to_data_movement_slot():
     mod = normalize(program())
     mod.update_func(mod.get_global_var("main"), mod["main"].with_attr("tt.kernel_slot", "ncrisc"))
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="cannot cross processor slots"):
-        transform.VerifyTTGemmAccumulators()(mod)
+    with pytest.raises(NotImplementedError, match="unsupported program:.*cannot cross processor slots"):
+        transform.LegalizeTenstorrentTileOps()(mod)
 
 
 def test_while_loop_cannot_bypass_reduction_lifetime_proof():
@@ -160,8 +258,8 @@ def test_while_loop_cannot_bypass_reduction_lifetime_proof():
 
     body = tirx.stmt_functor.ir_transform(mod["main"].body, None, replace_loop, ["tirx.For"])
     mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="static positive serial K loops"):
-        transform.VerifyTTGemmAccumulators()(mod)
+    with pytest.raises(NotImplementedError, match="unsupported program:.*static positive serial K loops"):
+        transform.LegalizeTenstorrentTileOps()(mod)
 
 
 def test_ordinary_fp32_fragment_does_not_imply_gemm_precision():
@@ -172,11 +270,11 @@ def test_ordinary_fp32_fragment_does_not_imply_gemm_precision():
             T.clear(c)
 
     mod = normalize(temporary)
-    checked = transform.VerifyTTGemmAccumulators()(mod)
-    assert checked["main"].same_as(mod["main"])
+    checked = transform.LegalizeTenstorrentTileOps()(mod)
     assert "tt.gemm_accumulator_requirements" not in checked["main"].attrs
+    assert not structured_accumulator_calls(checked)
     mod.update_func(mod.get_global_var("main"), mod["main"].with_attr("tt.gemm_accumulator_requirements", [tirx.StringImm("stale")]))
-    checked = transform.VerifyTTGemmAccumulators()(mod)
+    checked = transform.LegalizeTenstorrentTileOps()(mod)
     assert "tt.gemm_accumulator_requirements" not in checked["main"].attrs
 
 
@@ -269,8 +367,8 @@ def test_accumulator_alias_cannot_change_identity():
 
     body = tirx.stmt_functor.ir_transform(mod["main"].body, None, replace_accumulator, ["tirx.Call"])
     mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="unique compute_fragment"):
-        transform.VerifyTTGemmAccumulators()(mod)
+    with pytest.raises(ValueError, match="unique compute_fragment"):
+        transform.LegalizeTenstorrentTileOps()(mod)
 
 
 def test_partial_final_materialization_cannot_change_region():
@@ -279,17 +377,19 @@ def test_partial_final_materialization_cannot_change_region():
     def partial_copy(node):
         if isinstance(node, tirx.Call) and node.op.name == "tl.tileop.copy":
             region = node.args[0]
-            if region.args[0].buffer.scope() == "local.fragment":
-                partial = tirx.Call(
-                    region.dtype, region.op, [*region.args[:2], tirx.IntImm("int32", 16), *region.args[3:]], region.annotations
+            if region.buffer.scope() == "local.fragment":
+                row = region.indices[0]
+                partial = tirx.BufferLoad(
+                    region.buffer,
+                    [tirx.Ramp(row.base, row.stride, 16), *region.indices[1:]],
                 )
                 return tirx.Call(node.dtype, node.op, [partial, *node.args[1:]], node.annotations)
         return None
 
     body = tirx.stmt_functor.ir_transform(mod["main"].body, None, partial_copy, ["tirx.Call"])
     mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="same full BufferRegion"):
-        transform.VerifyTTGemmAccumulators()(mod)
+    with pytest.raises(ValueError, match="same full BufferRegion"):
+        transform.LegalizeTenstorrentTileOps()(mod)
 
 
 @pytest.mark.parametrize(
@@ -349,7 +449,9 @@ def test_compute_kernel_scopes_accumulator_precision_to_live_values(keep_fp32_li
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
     # Frontend proves individual lifetimes; the actual formed kernel owns the merge.
-    assert len(verify(mixed)["main"].attrs["tt.gemm_accumulator_requirements"]) == 2
+    assert (
+        sum(call.annotations["tt.compute_kind"].value == "accumulator_init" for call in structured_accumulator_calls(legalize(mixed))) == 2
+    )
     with pytest.raises((ValueError, NotImplementedError, tvm.error.TVMError), match="precision.*conflicts|conflicting.*destination"):
         TenstorrentPassPipelineBody(tvm.IRModule({"main": mixed}), TARGET)
 
@@ -437,19 +539,19 @@ def epilogue_program(mode="fresh", output_dtype="bfloat16"):
 
 @pytest.mark.parametrize("mode", ["fresh", "old_new", "copies"])
 def test_accumulator_epilogue_supports_fresh_values_and_multiple_consumers(mode):
-    mod = verify(epilogue_program(mode))
-    (requirement,) = mod["main"].attrs["tt.gemm_accumulator_requirements"]
-    assert requirement["input_dtype"].value == "bfloat16"
-    assert requirement["accum_dtype"].value == "float32"
-    assert requirement["output_dtype"].value == "bfloat16"
-    legalized = transform.LegalizeTenstorrentTileOps()(mod)
-    assert "tl.tt.elementwise" not in legalized.script()
-    assert "tl.tileop.copy(old" not in legalized.script()
+    mod = legalize(epilogue_program(mode))
+    init = next(call for call in structured_accumulator_calls(mod) if call.annotations["tt.compute_kind"].value == "accumulator_init")
+    assert init.annotations["tt.input_dtype"].value == "bfloat16"
+    assert init.annotations["tt.accum_dtype"].value == "float32"
+    assert init.annotations["tt.output_dtype"].value == "bfloat16"
+    assert "tt.gemm_accumulator_requirements" not in mod["main"].attrs
+    assert "tl.tt.elementwise" not in mod.script()
+    assert "tl.tileop.copy(old" not in mod.script()
 
 
 def test_derived_accumulator_output_checks_dtype_capability():
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="capability registry"):
-        verify(epilogue_program(output_dtype="float32"))
+    with pytest.raises(NotImplementedError, match="unsupported program:.*capability registry"):
+        legalize(epilogue_program(output_dtype="float32"))
 
 
 def test_both_branch_initializers_dominate_gemm_update():
@@ -462,8 +564,8 @@ def test_both_branch_initializers_dominate_gemm_update():
 
     body = tirx.stmt_functor.ir_transform(mod["main"].body, None, branch_clear, ["tirx.Evaluate"])
     mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
-    verified = transform.VerifyTTGemmAccumulators()(mod)
-    assert len(verified["main"].attrs["tt.gemm_accumulator_requirements"]) == 1
+    legalized = transform.LegalizeTenstorrentTileOps()(mod)
+    assert sum(call.annotations["tt.compute_kind"].value == "accumulator_init" for call in structured_accumulator_calls(legalized)) == 2
 
 
 def test_branch_without_update_does_not_complete_the_reduction():
@@ -476,5 +578,5 @@ def test_branch_without_update_does_not_complete_the_reduction():
 
     body = tirx.stmt_functor.ir_transform(mod["main"].body, None, branch_update, ["tirx.Evaluate"])
     mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="after all updates"):
-        transform.VerifyTTGemmAccumulators()(mod)
+    with pytest.raises(ValueError, match="after all updates"):
+        transform.LegalizeTenstorrentTileOps()(mod)

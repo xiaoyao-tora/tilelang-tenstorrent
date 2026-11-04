@@ -62,7 +62,8 @@ Reduction, logical batch dimensions, and bounded control flow reach verified thr
 Full lowering diagnoses unsupported input; it never returns `tt.ir_stage="structured"` as success.
 Capture-only clients invoke the capture and compute verifier passes directly.
 GEMM fragments have a separate [frontend precision and lifetime contract](../developer_guide/tenstorrent_frontend.md).
-`VerifyTTGemmAccumulators` validates that contract. Single-Core
+The accumulator analysis inside `LegalizeTenstorrentTileOps` validates that
+contract and emits explicit structured accumulator operations. Single-Core
 [Device IR v7](../compiler_internals/tenstorrent_compute_values.md) supports immutable
 fragment values, mixed shared/fragment elementwise computation, old/new versions,
 GEMM epilogues and exact-dtype materialization. Source-only TTL mapping covers a

@@ -119,12 +119,12 @@ reserve、publication、消费及 release 必须遵守 ordinal 顺序；compute 
 优先扩展已有 Pass，不新建平行的数据流分析路径：
 
 ```text
-BindTarget -> CanonicalizeTTElementwise -> VerifyTTComputeBlocks
- -> ValidateTenstorrentFrontendIR -> NormalizeTenstorrentLaunch
- -> NormalizeTenstorrentBufferMetadata -> NormalizeTenstorrentRegions
- -> NormalizeTenstorrentTopology -> LegalizeTenstorrentTileOps
+BindTarget -> ValidateTenstorrentFrontendIR -> CanonicalizeTTElementwise
+ -> NormalizeTenstorrentLaunch -> NormalizeTenstorrentBufferMetadata
+ -> NormalizeTenstorrentTopology -> NormalizeTenstorrentRegions
+ -> VerifyTTStructuredDataflow -> LegalizeTenstorrentTileOps
  -> InferTenstorrentTensorLayout -> FormTenstorrentDeviceProgram
- -> VerifyTenstorrentDeviceIR
+ -> InferTenstorrentComputeRequirements -> VerifyTenstorrentDeviceIR
 ```
 
 - Canonicalize/compute verifier 允许外层静态 serial/unrolled loop binder 作为表达式

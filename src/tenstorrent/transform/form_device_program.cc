@@ -88,6 +88,20 @@ struct AddDataflowPlan {
       << "[FormTenstorrentDeviceProgram] unsupported program: " << message;
 }
 
+DataType RequireDTypeAnnotation(const Call &call, const char *key) {
+  auto value = call->annotations.Get(key);
+  if (!value.has_value() || !value.value().as<StringImmNode>())
+    ThrowMalformed(std::string("accumulator operation requires '") + key +
+                   "' string annotation");
+  const ffi::String name = Downcast<StringImm>(value.value())->value;
+  if (name == "bfloat16")
+    return DataType::BFloat(16);
+  if (name == "float32")
+    return DataType::Float(32);
+  ThrowMalformed(std::string("accumulator operation has unsupported '") + key +
+                 "' dtype '" + std::string(name) + "'");
+}
+
 int64_t RequirePositiveStaticInteger(const PrimExpr &value,
                                      const std::string &field) {
   const int64_t *integer = as_const_int(value);
@@ -759,8 +773,10 @@ public:
                                  value.value().dtype() == DataType::Float(32);
                          });
         if (name == "accumulator_init" || name == "gemm_update" ||
-            name == "accumulator_materialize")
+            name == "accumulator_materialize") {
+          has_accumulator_compute_ = true;
           return;
+        }
       }
       for (const PrimExpr &arg : call.value()->args) {
         BufferRegion region = NormalizeToAccessRegion(arg, kAccessRead).region;
@@ -1698,6 +1714,23 @@ private:
     return Read(buffer, "trisc");
   }
 
+  void MergeAccumulatorContract(const Call &call, const Buffer &buffer,
+                                AccumulatorLifetime *state) {
+    DataType input = RequireDTypeAnnotation(call, "tt.input_dtype");
+    DataType accumulation = RequireDTypeAnnotation(call, "tt.accum_dtype");
+    DataType output = RequireDTypeAnnotation(call, "tt.output_dtype");
+    if (accumulation != buffer->dtype)
+      ThrowMalformed(
+          "accumulator operation accumulation dtype disagrees with its buffer");
+    if (state->input_dtype != DataType::Void() && state->input_dtype != input)
+      ThrowMalformed("accumulator operation input dtype contract changed");
+    if (state->output_dtype != DataType::Void() &&
+        state->output_dtype != output)
+      ThrowMalformed("accumulator operation output dtype contract changed");
+    state->input_dtype = input;
+    state->output_dtype = output;
+  }
+
   void PlanValueAccumulator(const Call &call, const ffi::String &kind) {
     BufferRegion region =
         NormalizeToAccessRegion(call->args[0], kAccessReadWrite).region;
@@ -1705,30 +1738,14 @@ private:
     const Buffer &buffer = region->buffer;
     auto found = accumulator_ids_.find(buffer);
     if (kind == "accumulator_init") {
+      if (call->args.size() != 1)
+        ThrowMalformed("accumulator_init requires one accumulator region");
       int64_t accumulator = accumulators_.size();
       accumulator_ids_[buffer] = accumulator;
       AccumulatorLifetime state;
       state.region = region;
       state.span = call->span;
-      // The frontend proves the final storage dtype across all epilogue uses.
-      auto requirements =
-          frontend_->GetAttr<ffi::Array<ffi::Map<ffi::String, ffi::ObjectRef>>>(
-              "tt.gemm_accumulator_requirements");
-      if (requirements.has_value()) {
-        for (const auto &requirement : requirements.value()) {
-          if (Downcast<Buffer>(requirement.at("accumulator"))
-                  ->data.same_as(buffer->data)) {
-            auto dtype = requirement.Get("output_dtype");
-            if (dtype.has_value())
-              state.output_dtype =
-                  Downcast<StringImm>(dtype.value())->value == "float32"
-                      ? DataType::Float(32)
-                      : DataType::BFloat(16);
-          }
-        }
-      }
-      if (state.output_dtype == DataType::Void())
-        state.output_dtype = buffer->dtype;
+      MergeAccumulatorContract(call, buffer, &state);
       accumulators_.push_back(std::move(state));
       int64_t value = DefineValue(buffer, accumulator, call->span);
       ffi::Map<ffi::String, ffi::ObjectRef> attrs{
@@ -1751,9 +1768,17 @@ private:
     if (found == accumulator_ids_.end())
       ThrowMalformed("accumulator update requires a dominating initialization");
     int64_t accumulator = found->second;
+    auto &state = accumulators_[accumulator];
+    MergeAccumulatorContract(call, buffer, &state);
     if (kind == "accumulator_materialize") {
+      if (call->args.size() != 2)
+        ThrowMalformed(
+            "accumulator_materialize requires accumulator and output regions");
       BufferRegion output =
           NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
+      if (output->buffer->dtype != state.output_dtype)
+        ThrowMalformed(
+            "accumulator materialization dtype disagrees with its contract");
       ffi::Array<PrimExpr> zeros(buffer->shape.size(), Integer(0));
       ffi::Map<ffi::String, ffi::ObjectRef> attrs{
           {"tt.compute_kind", StringImm("copy")},
@@ -1770,6 +1795,8 @@ private:
                             call->span));
       return;
     }
+    if (call->args.size() != 3)
+      ThrowMalformed("gemm_update requires accumulator, lhs and rhs regions");
     BufferRegion lhs =
         NormalizeToAccessRegion(call->args[1], kAccessRead).region;
     BufferRegion rhs =
@@ -1786,8 +1813,9 @@ private:
     int64_t value = DefineValue(buffer, accumulator, call->span);
     value_roots_[value] = value_roots_[old];
     value_roots_[value].insert(accumulator);
-    auto &state = accumulators_[accumulator];
-    state.input_dtype = lhs->buffer->dtype;
+    if (lhs->buffer->dtype != state.input_dtype ||
+        rhs->buffer->dtype != state.input_dtype)
+      ThrowMalformed("GEMM inputs disagree with accumulator dtype contract");
     state.full_k_tiles +=
         RequirePositiveStaticInteger(lhs->buffer->shape[ta ? 0 : 1], "GEMM K") /
         32;
@@ -2158,16 +2186,21 @@ private:
     const Buffer &buffer = region->buffer;
     auto found = accumulator_ids_.find(buffer);
     if (kind == "accumulator_init") {
-      if (found != accumulator_ids_.end())
-        ThrowMalformed("accumulator initialization must be unique");
+      if (call->args.size() != 1)
+        ThrowMalformed("accumulator_init requires one accumulator region");
+      if (found != accumulator_ids_.end() &&
+          accumulators_[found->second].output_id < 0)
+        ThrowMalformed(
+            "accumulator cannot be reinitialized before materialization");
       if (RequireMetadata(metadata_, buffer, "accumulator")->kind !=
           "compute_fragment")
         ThrowMalformed("accumulator must reference compute_fragment metadata");
       int64_t id = accumulators_.size();
-      accumulator_ids_.emplace(buffer, id);
+      accumulator_ids_[buffer] = id;
       AccumulatorLifetime state;
       state.region = region;
       state.span = call->span;
+      MergeAccumulatorContract(call, buffer, &state);
       accumulators_.push_back(std::move(state));
       compute_.push_back(MakeDeviceCall(tenstorrent::accumulator_init(),
                                         {Integer(id)}, call->span));
@@ -2178,9 +2211,12 @@ private:
           "accumulator update/materialization requires initialization");
     int64_t id = found->second;
     auto &state = accumulators_[id];
+    MergeAccumulatorContract(call, buffer, &state);
     if (state.output_id >= 0)
       ThrowMalformed("accumulator access after final materialization");
     if (kind == "gemm_update") {
+      if (call->args.size() != 3)
+        ThrowMalformed("gemm_update requires accumulator, lhs and rhs regions");
       BufferRegion lhs =
           NormalizeToAccessRegion(call->args[1], kAccessRead).region;
       BufferRegion rhs =
@@ -2192,7 +2228,9 @@ private:
           Downcast<Integer>(call->annotations.at("tt.transpose_a"))->value;
       int64_t transpose_b =
           Downcast<Integer>(call->annotations.at("tt.transpose_b"))->value;
-      state.input_dtype = lhs->buffer->dtype;
+      if (lhs->buffer->dtype != state.input_dtype ||
+          rhs->buffer->dtype != state.input_dtype)
+        ThrowMalformed("GEMM inputs disagree with accumulator dtype contract");
       state.full_k_tiles +=
           RequirePositiveStaticInteger(lhs->buffer->shape[transpose_a ? 0 : 1],
                                        "GEMM K") /
@@ -2210,8 +2248,14 @@ private:
     }
     if (state.full_k_tiles <= 0)
       ThrowMalformed("accumulator cannot materialize before GEMM updates");
+    if (call->args.size() != 2)
+      ThrowMalformed(
+          "accumulator_materialize requires accumulator and output regions");
     BufferRegion output =
         NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
+    if (output->buffer->dtype != state.output_dtype)
+      ThrowMalformed(
+          "accumulator materialization dtype disagrees with its contract");
     const auto &metadata =
         RequireMetadata(metadata_, output->buffer, "accumulator output");
     int64_t output_id;
@@ -2220,13 +2264,15 @@ private:
       output_id = Write(output->buffer, "trisc");
     } else if (metadata->kind == "tensor") {
       // Materialization allocates output storage only once, after complete K.
-      Buffer storage = decl_buffer(buffer->shape, output->buffer->dtype,
-                                   buffer->name + "_materialized", "shared",
-                                   std::nullopt, call->span);
+      ffi::String materialized_id = ".materialized." + std::to_string(id);
+      Buffer storage =
+          decl_buffer(buffer->shape, output->buffer->dtype,
+                      buffer->name + "_materialized_" + std::to_string(id),
+                      "shared", std::nullopt, call->span);
       ICHECK(!storage->data.same_as(buffer->data));
       const auto &fragment = RequireMetadata(metadata_, buffer, "accumulator");
       TTBufferMetadata output_metadata(
-          fragment->buffer_id + ".materialized", storage,
+          fragment->buffer_id + materialized_id, storage,
           "logical_dfb_candidate", std::nullopt, fragment->tile_shape,
           fragment->tile_grid_shape, "interleaved", std::nullopt, Integer(1),
           std::nullopt, std::nullopt, "inferred", "inferred", "inferred",
@@ -2253,7 +2299,6 @@ private:
       ThrowMalformed("accumulator must materialize to shared DFB or Tensor");
     }
     state.output_id = output_id;
-    state.output_dtype = output->buffer->dtype;
     Reserve(&compute_, output_id, call->span);
     compute_.push_back(MakeDeviceCall(tenstorrent::accumulator_materialize(),
                                       {Integer(id), Integer(output_id)},
@@ -2263,16 +2308,14 @@ private:
   void PlanCopy(const Copy &copy, const Call &call) {
     BufferRegion source(copy->src, copy->src_range);
     BufferRegion destination(copy->dst, copy->dst_range);
-    bool has_accumulator =
-        frontend_->attrs->dict.count("tt.gemm_accumulator_requirements");
     bool rank_mapped_tensor =
         source->region.size() != destination->region.size() &&
         (copy->src.scope() == "global" || copy->dst.scope() == "global");
-    if ((!transfers_ && !has_accumulator && !IsPipeline() &&
+    if ((!transfers_ && !has_accumulator_compute_ && !IsPipeline() &&
          !rank_mapped_tensor) ||
         copy->src.scope() == "shared" || copy->src.scope() == "shared.dyn")
       FullRegion(source);
-    if ((!transfers_ && !has_accumulator && !IsPipeline() &&
+    if ((!transfers_ && !has_accumulator_compute_ && !IsPipeline() &&
          !rank_mapped_tensor) ||
         copy->dst.scope() == "shared" || copy->dst.scope() == "shared.dyn")
       FullRegion(destination);
@@ -2626,9 +2669,8 @@ private:
     if (send) {
       int64_t input = Read(region->buffer, "trisc");
       const ResourceVersion &resource = resources_[input];
-      forward =
-          frontend_->attrs->dict.count("tt.gemm_accumulator_requirements") &&
-          resource.producer == "ncrisc" && resource.backing.has_value();
+      forward = has_accumulator_compute_ && resource.producer == "ncrisc" &&
+                resource.backing.has_value();
       if (forward) {
         has_producer_forwarding_ = true;
         // Forward the completed Tensor load before publishing the same panel
@@ -2721,6 +2763,7 @@ private:
       fragment_accesses_;
   std::vector<size_t> unknown_accesses_;
   bool compute_value_mode_{false};
+  bool has_accumulator_compute_{false};
   bool precision_regions_{false};
   int precision_mode_{-1};
   ffi::Array<ComputeValueDescriptor> values_;

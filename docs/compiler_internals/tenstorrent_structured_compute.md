@@ -101,14 +101,13 @@ The shared prefix is explicit in `tilelang/tenstorrent/pipeline.py`:
 
 ```text
 BindTarget
-CanonicalizeTTElementwise
-VerifyTTComputeBlocks
 ValidateTenstorrentFrontendIR
+CanonicalizeTTElementwise
 NormalizeTenstorrentLaunch
 NormalizeTenstorrentBufferMetadata
-VerifyTTGemmAccumulators
 NormalizeTenstorrentTopology
 NormalizeTenstorrentRegions
+VerifyTTStructuredDataflow
 LegalizeTenstorrentTileOps
 ```
 

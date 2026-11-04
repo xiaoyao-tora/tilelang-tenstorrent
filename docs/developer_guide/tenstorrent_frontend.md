@@ -23,10 +23,13 @@ across SBlock allocations and statement-level allocations produced by
 ## GEMM numerical requirements
 
 An accumulator fragment's dtype describes its required numerical precision.
-It does not change the input or output tensor's storage dtype. The standalone
-`tilelang.tenstorrent.transform.VerifyTTGemmAccumulators` pass runs after
-launch and allocation metadata normalization, before copy region lowering. It recomputes the
-GEMM def-use contract and records `tt.gemm_accumulator_requirements`.
+It does not change the input or output tensor's storage dtype.
+`LegalizeTenstorrentTileOps` analyzes the complete GEMM lifetime after region
+normalization and structured-dataflow verification. The analysis is internal to
+that pass; it does not expose a standalone transform or store a frontend
+requirement table. Successful legalization writes explicit accumulator
+init/update/materialize operations with the input, accumulation and output dtype
+contract needed by program formation.
 
 The fragment contract accepts these input/accumulator/output combinations:
 

@@ -32,15 +32,6 @@ def InferTenstorrentComputeRequirements():
     return _ffi_api.InferTenstorrentComputeRequirements()  # type: ignore[attr-defined]
 
 
-def VerifyTTGemmAccumulators():
-    """Verify GEMM fragment lifetimes and record logical precision requirements.
-
-    This frontend check does not imply that Device Lower or TTL codegen can
-    implement the requested accumulator lifetime on the selected target.
-    """
-    return _ffi_api.VerifyTTGemmAccumulators()  # type: ignore[attr-defined]
-
-
 def ValidateTenstorrentFrontendIR():
     """Validate target-bound raw Frontend syntax and module ABI."""
     return _ffi_api.ValidateTenstorrentFrontendIR()  # type: ignore[attr-defined]
@@ -83,7 +74,6 @@ __all__ = (
     "VerifyTTComputeBlocks",
     "VerifyTTStructuredDataflow",
     "InferTenstorrentComputeRequirements",
-    "VerifyTTGemmAccumulators",
     "FormTenstorrentDeviceProgram",
     "InferTenstorrentTensorLayout",
     "LegalizeTenstorrentTileOps",

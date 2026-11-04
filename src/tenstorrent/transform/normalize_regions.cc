@@ -198,57 +198,8 @@ void ValidateMatchingExtents(const BufferRegion &source,
   }
 }
 
-// Preserve operation provenance while specializing K-dependent transfer slices.
-class AccumulatorIterationSubstituter : public StmtExprMutator {
-public:
-  AccumulatorIterationSubstituter(Var variable, PrimExpr value) {
-    substitutions_.emplace(std::move(variable), std::move(value));
-  }
-
-  PrimExpr VisitExpr(const PrimExpr &expr) final {
-    PrimExpr result = StmtExprMutator::VisitExpr(expr);
-    return result.dtype().is_handle() ||
-                   SideEffect(result) > CallEffectKind::kPure
-               ? result
-               : analyzer_.Simplify(result);
-  }
-
-  PrimExpr VisitExpr_(const VarNode *op) final {
-    Var variable = ffi::GetRef<Var>(op);
-    auto found = substitutions_.find(variable);
-    return found == substitutions_.end() ? variable : found->second;
-  }
-
-  Stmt VisitStmt_(const BindNode *op) final {
-    PrimExpr value = VisitExpr(op->value);
-    // A serial iteration can make aliases such as k_begin = stage * block_k
-    // constant. Eliminate their definitions with their uses, so expanded
-    // iterations neither retain dynamic slices nor redefine the same binder.
-    if (value.as<IntImmNode>() || value.as<FloatImmNode>()) {
-      substitutions_[op->var] = value;
-      return Evaluate(Integer(0), op->span);
-    }
-    return Bind(op->var, value, op->span);
-  }
-
-  PrimExpr VisitExpr_(const CallNode *op) final {
-    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
-    if (!call.same_as(ffi::GetRef<Call>(op)))
-      call.CopyOnWrite()->span = op->span;
-    return call;
-  }
-
-private:
-  arith::Analyzer analyzer_;
-  std::unordered_map<Var, PrimExpr, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
-      substitutions_;
-};
-
 class RegionNormalizer : public StmtExprMutator {
 public:
-  explicit RegionNormalizer(bool expand_accumulator_loops)
-      : expand_accumulator_loops_(expand_accumulator_loops) {}
-
   Stmt VisitStmt_(const ForNode *op) final {
     if (op->annotations.count("tt.logical_core_axis")) {
       loop_analyzer_.Bind(op->loop_var,
@@ -348,7 +299,6 @@ public:
   }
 
 private:
-  bool expand_accumulator_loops_;
   size_t expanded_iterations_{0};
   int pipeline_depth_{0};
   int symbolic_region_depth_{0};
@@ -461,11 +411,7 @@ private:
 };
 
 PrimFunc NormalizeRegions(PrimFunc func) {
-  auto accumulators =
-      func->GetAttr<ffi::Array<ffi::Map<ffi::String, ffi::ObjectRef>>>(
-          "tt.gemm_accumulator_requirements");
-  RegionNormalizer normalizer(accumulators.has_value() &&
-                              !accumulators.value().empty());
+  RegionNormalizer normalizer;
   Stmt body = normalizer(func->body);
   if (body.same_as(func->body)) {
     return func;

@@ -952,7 +952,7 @@ def test_pipeline_executes_each_fixed_stage_once(monkeypatch, size):
     assert names == expected
     assert recorder.names.count("CanonicalizeTTElementwise") == 1
     assert recorder.names.count("VerifyTTComputeBlocks") == 0
-    assert recorder.names.count("VerifyTTGemmAccumulators") == 1
+    assert recorder.names.count("VerifyTTGemmAccumulators") == 0
     assert recorder.names.count("VerifyTTStructuredDataflow") == 1
     assert recorder.names.count("VerifyTenstorrentDeviceIR") == 1
 

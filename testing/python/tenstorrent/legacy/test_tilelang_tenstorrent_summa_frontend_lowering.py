@@ -36,9 +36,9 @@ def _normalize(core_grid=2):
         transform.CanonicalizeTTElementwise(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
-        transform.VerifyTTGemmAccumulators(),
         transform.NormalizeTenstorrentTopology(),
         transform.NormalizeTenstorrentRegions(),
+        transform.VerifyTTStructuredDataflow(),
     ):
         mod = compiler_pass(mod)
     return mod
@@ -51,10 +51,7 @@ def test_stage_aliases_resolve_and_core_accumulators_remain_independent(core_gri
     tirx.stmt_functor.post_order_visit(mod["main"].body, lambda node: binds.append(node) if isinstance(node, tirx.Bind) else None)
     assert not binds
     mod = transform.LegalizeTenstorrentTileOps()(mod)
-    requirements = mod["main"].attrs["tt.gemm_accumulator_requirements"]
-    assert len(requirements) == core_grid**2
-    if core_grid > 1:
-        assert {(int(item["core_x"]), int(item["core_y"])) for item in requirements} == {(0, 0), (0, 1), (1, 0), (1, 1)}
+    assert "tt.gemm_accumulator_requirements" not in mod["main"].attrs
     kinds = []
     tirx.stmt_functor.post_order_visit(
         mod["main"].body,
@@ -85,4 +82,4 @@ def test_other_cores_cannot_satisfy_or_hide_accumulator_initialization(mutation,
     body = tirx.stmt_functor.ir_transform(mod["main"].body, None, rewrite, ["tirx.Evaluate"])
     mod.update_func(mod.get_global_var("main"), mod["main"].with_body(body))
     with pytest.raises((NotImplementedError, tvm.error.TVMError), match=message):
-        transform.VerifyTTGemmAccumulators()(mod)
+        transform.LegalizeTenstorrentTileOps()(mod)

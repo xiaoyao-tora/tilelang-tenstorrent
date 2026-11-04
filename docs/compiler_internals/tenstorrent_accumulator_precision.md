@@ -31,9 +31,10 @@ snapshot copy. Releases follow the final local computation or output write
 completion. These are logical Device IR scheduling contracts; physical circular
 buffer allocation and hardware synchronization remain code-generation work.
 
-`VerifyTTGemmAccumulators` establishes frontend lifetime facts, without claiming
-that a target can compile or execute the program. Regions normalization makes
-bounded static K slices concrete. Legalization preserves accumulator operations;
+The accumulator analysis inside `LegalizeTenstorrentTileOps` establishes
+frontend lifetime facts, without claiming that a target can compile or execute
+the program. Regions normalization makes bounded static K slices concrete.
+Legalization emits accumulator operations carrying the dtype contract directly;
 layout validation does not assign them a CB or a physical DST index. Formation
 creates one logical accumulator, its updates, and a final output DFB. DCE keeps
 the accumulator's input dependencies live until materialization.

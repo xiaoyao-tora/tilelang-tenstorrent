@@ -7,18 +7,17 @@ TTL Codegen、TTL parser/verifier、TT-Lang compile-only 和硬件数值验证�
 
 ## 1. Pass 边界
 
-当前主线包含前端 accumulator 检查和最终 compute requirement 推导，共十四个顶层阶段：
+当前主线共十三个顶层阶段；accumulator 分析属于 legalization 内部步骤：
 
 ```text
 BindTarget
-  -> CanonicalizeTTElementwise
-  -> VerifyTTComputeBlocks
   -> ValidateTenstorrentFrontendIR
+  -> CanonicalizeTTElementwise
   -> NormalizeTenstorrentLaunch
   -> NormalizeTenstorrentBufferMetadata
-  -> VerifyTTGemmAccumulators
   -> NormalizeTenstorrentTopology
   -> NormalizeTenstorrentRegions
+  -> VerifyTTStructuredDataflow
   -> LegalizeTenstorrentTileOps
   -> InferTenstorrentTensorLayout
   -> FormTenstorrentDeviceProgram
@@ -30,7 +29,7 @@ BindTarget
 | --- | --- | --- |
 | CanonicalizeTTElementwise | 原始 Tiles/Parallel loop、allocation metadata；证明访问关系、构建统一表达式和 effects | structured compute block；不规划 DFB、不决定 processor slot |
 | VerifyTTComputeBlocks | compute block、表达式模板、访问描述和读写集合 | 验证后的同一 IR；不把合法但未消费的模板视作 Device IR |
-| LegalizeTenstorrentTileOps | 规范化的 compute block、独立 TileOp 和 metadata | 显式 tile operation、无隐式 scalar compute；验证运算和 dtype 的支持范围，不创建 processor slot |
+| LegalizeTenstorrentTileOps | 已通过 structured dataflow 的 compute block、独立 TileOp 和 metadata；内部分析完整 GEMM accumulator lifetime | 显式 tile/accumulator operation、无函数级临时 requirement；验证运算和 dtype 的支持范围，不创建 processor slot |
 | InferTenstorrentTensorLayout | tile operation 及规范化 Buffer metadata | 一致的 Tensor/DFB tile-grid 和 layout；不重复解析前端 elementwise loop、不决定运算 def-use |
 | FormTenstorrentDeviceProgram | 所有 compute 已消费、layout 完整的单 Core 程序 | 版本化 DFB、显式 transaction、TRISC/NCRISC/BRISC 和 typed module metadata |
 | VerifyTenstorrentDeviceIR | Device IR module 及所有 slot | 检查 schema、操作数、dtype、shape、effect、资源归属、ABI 和资源协议；不修补错误 IR |

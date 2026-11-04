@@ -238,7 +238,6 @@ def test_structured_compute_precedes_device_lowering_in_pass_order():
         "CanonicalizeTTElementwise",
         "NormalizeTenstorrentLaunch",
         "NormalizeTenstorrentBufferMetadata",
-        "VerifyTTGemmAccumulators",
         "NormalizeTenstorrentTopology",
         "NormalizeTenstorrentRegions",
         "VerifyTTStructuredDataflow",
