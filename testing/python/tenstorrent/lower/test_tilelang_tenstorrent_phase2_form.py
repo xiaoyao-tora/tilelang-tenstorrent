@@ -203,7 +203,7 @@ def test_form_add_rejects_incomplete_dataflow_without_mutating_input(monkeypatch
                 isinstance(candidate, tirx.Evaluate)
                 and isinstance(candidate.value, tirx.Call)
                 and isinstance(candidate.value.op, Op)
-                and candidate.value.op.name == "tl.tt.tile_add"
+                and candidate.value.op.name == "tl.tt.tile_compute"
             ):
                 changed = True
                 return tirx.SeqStmt(list(node.seq[1:]))

@@ -77,10 +77,10 @@ TVM_DLL const Op &all_gather();
 TVM_DLL const Op &all_reduce();
 
 /*!
- * \brief Canonical Phase 2 Add operation over normalized BufferRegions.
+ * \brief Legacy Phase 2 Add operation over normalized BufferRegions.
  *
- * LegalizeTenstorrentTileOps creates this intermediate operation. Program
- * formation consumes it and replaces it with logical-DFB Device IR ops.
+ * Retained only so versioned artifacts can be loaded and diagnosed. The
+ * current Lower pipeline must not create or consume this operation.
  */
 TVM_DLL const Op &tile_add();
 
@@ -142,6 +142,7 @@ TVM_DLL const Op &dfb_pipe_recv();
 TVM_DLL const Op &dfb_pipe_wait();
 TVM_DLL const Op &tensor_to_dfb();
 TVM_DLL const Op &dfb_to_tensor();
+/*! \brief Legacy schema-v1 Add marker; forbidden in current Device IR. */
 TVM_DLL const Op &dfb_add();
 /*! \brief Current Device-IR local copy/collective assembly operations. */
 TVM_DLL const Op &dfb_local_copy();

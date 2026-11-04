@@ -50,70 +50,6 @@ bool IsElementwiseBlock(const SBlock &block) {
          Downcast<ffi::String>(kind.value()) == "elementwise";
 }
 
-ffi::Optional<BufferRegion> FindRegion(const Array<BufferRegion> &regions,
-                                       const Buffer &buffer) {
-  ffi::Optional<BufferRegion> result;
-  for (const BufferRegion &region : regions) {
-    if (!region->buffer->data.same_as(buffer->data))
-      continue;
-    if (result.has_value())
-      return std::nullopt;
-    result = region;
-  }
-  return result;
-}
-
-bool IsIdentityRegion(const BufferRegion &region,
-                      const Array<PrimExpr> &domain) {
-  if (region->region.size() != domain.size())
-    return false;
-  for (size_t axis = 0; axis < domain.size(); ++axis)
-    if (!is_zero(region->region[axis]->min) ||
-        !ffi::StructuralEqual()(region->region[axis]->extent, domain[axis]))
-      return false;
-  return true;
-}
-
-bool IsDeviceAdd(const SBlock &block,
-                 const ffi::Array<TTBufferMetadata> &metadata) {
-  if (!IsElementwiseBlock(block)) {
-    return false;
-  }
-  const auto *store = block->body.as<BufferStoreNode>();
-  const auto *add = store == nullptr ? nullptr : store->value.as<AddNode>();
-  const auto *lhs_load = add == nullptr ? nullptr : add->a.as<BufferLoadNode>();
-  const auto *rhs_load = add == nullptr ? nullptr : add->b.as<BufferLoadNode>();
-  if (lhs_load == nullptr || rhs_load == nullptr || block->writes.size() != 1)
-    return false;
-  const Buffer &output = store->buffer;
-  const Buffer &lhs = lhs_load->buffer;
-  const Buffer &rhs = rhs_load->buffer;
-  if (lhs.same_as(rhs) || lhs.same_as(output) || rhs.same_as(output)) {
-    return false;
-  }
-  auto shape = Downcast<ffi::Array<PrimExpr>>(
-      block->annotations.at("tl.tt.logical_domain"));
-  auto lhs_region = FindRegion(block->reads, lhs);
-  auto rhs_region = FindRegion(block->reads, rhs);
-  if (!lhs_region.has_value() || !rhs_region.has_value() ||
-      !IsIdentityRegion(lhs_region.value(), shape) ||
-      !IsIdentityRegion(rhs_region.value(), shape) ||
-      !IsIdentityRegion(block->writes[0], shape))
-    return false;
-  const DataType dtype = output->dtype;
-  if (dtype.lanes() != 1 ||
-      !(dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32))) {
-    return false;
-  }
-  for (const BufferRegion &region : block->reads) {
-    if (region->buffer->dtype != dtype) {
-      return false;
-    }
-  }
-  return shape.size() == 2 && is_const_int(shape[0], 32) &&
-         is_const_int(shape[1], 32);
-}
-
 [[noreturn]] void ThrowMalformed(const std::string &message) {
   TVM_FFI_THROW(ValueError)
       << "[LegalizeTenstorrentTileOps] malformed input: " << message;
@@ -196,6 +132,17 @@ void ValidateRegion(const BufferRegion &region, const std::string &owner,
                                     buffer->shape[axis]),
               owner + " region extent must be positive and in bounds");
   }
+}
+
+bool IsFullBufferRegion(const BufferRegion &region) {
+  if (region->region.size() != region->buffer->shape.size())
+    return false;
+  for (size_t axis = 0; axis < region->region.size(); ++axis)
+    if (!is_zero(region->region[axis]->min) ||
+        !ffi::StructuralEqual()(region->region[axis]->extent,
+                                region->buffer->shape[axis]))
+      return false;
+  return true;
 }
 
 using Annotations = ffi::Map<ffi::String, ffi::ObjectRef>;
@@ -945,10 +892,7 @@ class StructuredComputeLowerer : public StmtExprMutator {
 public:
   StructuredComputeLowerer(const PrimFunc &func,
                            const GemmAccumulatorPlan &accumulator_plan)
-      : metadata_(func->GetAttr<ffi::Array<TTBufferMetadata>>(
-                          kBufferMetadataTableAttr)
-                      .value_or(ffi::Array<TTBufferMetadata>{})),
-        accumulator_plan_(accumulator_plan) {
+      : accumulator_plan_(accumulator_plan) {
     std::unordered_map<Buffer, int, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
         copies;
     PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
@@ -976,6 +920,8 @@ public:
       }
     });
   }
+
+  bool HasUnconsumedCompute() const { return has_unconsumed_compute_; }
 
 private:
   bool IsAccumulator(const Buffer &buffer) const {
@@ -1009,21 +955,6 @@ private:
     if (!supported_dtype)
       return ffi::GetRef<Stmt>(op);
     Span span = block->span.defined() ? block->span : op->span;
-    if (IsDeviceAdd(block, metadata_)) {
-      const auto *add = store->value.as<AddNode>();
-      const Buffer &lhs = Downcast<BufferLoad>(add->a)->buffer;
-      const Buffer &rhs = Downcast<BufferLoad>(add->b)->buffer;
-      Annotations annotations{
-          {"tt.compute_dtype", StringImm(DTypeName(output->dtype))},
-          {"tt.compute_tile_shape",
-           ffi::Array<PrimExpr>{Integer(32), Integer(32)}}};
-      return Evaluate(Call(DataType::Handle(), tile_add(),
-                           {BufferRegion::FullRegion(lhs)->ToPrimExpr(),
-                            BufferRegion::FullRegion(rhs)->ToPrimExpr(),
-                            BufferRegion::FullRegion(output)->ToPrimExpr()},
-                           annotations, span),
-                      span);
-    }
     ComputeDTypeVerifier dtype_verifier;
     dtype_verifier(store->value);
     RequireMalformed(
@@ -1235,6 +1166,12 @@ private:
                   "Fragment copy scheduling annotations are unsupported");
         const char *kind =
             copy->src->dtype == copy->dst->dtype ? "copy" : "typecast";
+        BufferRegion output(copy->dst, copy->dst_range);
+        if (copy->dst.scope() != "global" && !copy->dst.scope().empty() &&
+            !IsFullBufferRegion(output)) {
+          has_unconsumed_compute_ = true;
+          return ffi::GetRef<Stmt>(op);
+        }
         Annotations annotations = BaseAnnotations(copy->dst, kind);
         ffi::Array<PrimExpr> zeros, domain;
         for (const Range &range : copy->src_range)
@@ -1244,8 +1181,7 @@ private:
         annotations.Set("tt.logical_domain", domain);
         annotations.Set("tt.expression",
                         cast(copy->dst->dtype, BufferLoad(copy->src, zeros)));
-        return MakeCompute(BufferRegion(copy->dst, copy->dst_range),
-                           {BufferRegion(copy->src, copy->src_range)},
+        return MakeCompute(output, {BufferRegion(copy->src, copy->src_range)},
                            annotations, span, true);
       }
       if (copy->src.scope() == "local.fragment")
@@ -1309,9 +1245,9 @@ private:
         Call(DataType::Void(), tile_compute(), args, annotations, span), span);
   }
 
-  ffi::Array<TTBufferMetadata> metadata_;
   const GemmAccumulatorPlan &accumulator_plan_;
   bool has_fragment_compute_{false};
+  bool has_unconsumed_compute_{false};
 };
 
 bool HasUnconsumedStructuredCompute(const Stmt &body) {
@@ -1339,7 +1275,7 @@ tvm::transform::Pass LegalizeTenstorrentTileOps() {
     // not expose a mixed function when this pass is invoked directly; the
     // pipeline will recognize the unchanged block and return its Pass-08
     // snapshot with a deferred reason.
-    if (HasUnconsumedStructuredCompute(body))
+    if (lowerer.HasUnconsumedCompute() || HasUnconsumedStructuredCompute(body))
       return func;
     if (!body.same_as(func->body)) {
       func.CopyOnWrite()->body = std::move(body);

@@ -59,6 +59,24 @@ def _has_fragment_compute(func: tirx.PrimFunc) -> bool:
     return found
 
 
+def _unconsumed_tile_ops(func: tirx.PrimFunc) -> list[str]:
+    names: set[str] = set()
+
+    def visit(node):
+        if isinstance(node, tirx.Call) and hasattr(node.op, "name"):
+            name = str(node.op.name)
+            if name in {
+                "tl.tileop.gemm",
+                "tl.tileop.fill",
+                "tl.tileop.reduce",
+                "tl.tileop.transpose",
+            }:
+                names.add(name)
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+    return sorted(names)
+
+
 def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
     """Return verified Device IR or a complete, validated structured module.
 
@@ -106,6 +124,9 @@ def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
             )
         elif _has_compute_blocks(func):
             reasons.append(f"{symbol.name_hint}: compute block has no Device consumer")
+        remaining = _unconsumed_tile_ops(func)
+        if remaining:
+            reasons.append(f"{symbol.name_hint}: TileOps have no complete Device consumer: {', '.join(remaining)}")
         # Pipe-only programs have a communication ABI and are verified by the
         # multicore formation path even when no Tensor parameter is present.
         has_topology = func.attrs is not None and "tt.normalized_topology" in func.attrs and len(func.attrs["tt.normalized_topology"]) > 0
@@ -146,7 +167,6 @@ def _has_computation(func: tirx.PrimFunc) -> bool:
         nonlocal found
         if isinstance(node, tirx.Call) and hasattr(node.op, "name"):
             found |= str(node.op.name) in {
-                "tl.tt.tile_add",
                 "tl.tt.tile_compute",
                 "tl.tileop.gemm",
                 "tl.tileop.fill",

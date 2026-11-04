@@ -292,7 +292,7 @@ def test_legacy_gemm_query_keeps_lower_separate_from_validation(version, multico
 @pytest.mark.parametrize("arch", ["wormhole_b0", "blackhole"])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("reduction_kind", ["sum", "max", "min"])
-def test_keepdims_capability_matches_fragment_reduction_lower(arch, dtype, reduction_kind):
+def test_keepdims_reduction_is_supported_but_padding_materialization_is_deferred(arch, dtype, reduction_kind):
     capability = lower_capability(
         "reduce",
         arch=arch,
@@ -305,5 +305,6 @@ def test_keepdims_capability_matches_fragment_reduction_lower(arch, dtype, reduc
     assert capability.status == CapabilityStatus.SUPPORTED
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
     mod = lower_tenstorrent_ir(tvm.IRModule({"main": keepdims_reduction(dtype, reduction_kind)}), target)
-    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert str(mod.attrs["tt.ir_stage"]) == "structured"
     assert "tt.device_ir_version" not in mod.attrs
+    assert any("no complete Device consumer" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])

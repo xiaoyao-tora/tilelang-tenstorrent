@@ -53,6 +53,17 @@ def test_missing_or_forged_requirements_rejected_without_repair(replacement):
     assert ir.save_json(mod) == before
 
 
+def test_current_device_rejects_legacy_add_operation():
+    mod = lower()
+    gv, func = compute(mod)
+    legacy_add = tirx.Evaluate(tirx.Call("void", ir.Op.get("tl.tt.dfb_add"), [0, 1, 2, 1], span=func.span))
+    mod.update_func(gv, _with_core_statements(func, [*_core_statements(func), legacy_add]))
+    before = ir.save_json(mod)
+    with pytest.raises((ValueError, error.TVMError), match="non-current Device op.*dfb_add"):
+        transform.VerifyTenstorrentDeviceIR()(mod)
+    assert ir.save_json(mod) == before
+
+
 @pytest.mark.parametrize(
     "mutation,message",
     [

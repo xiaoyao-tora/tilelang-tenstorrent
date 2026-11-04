@@ -135,6 +135,37 @@ bool HasForbiddenPrefix(const std::string &op_name) {
       [&](const char *prefix) { return op_name.rfind(prefix, 0) == 0; });
 }
 
+bool IsCurrentDeviceOp(const std::string &op_name) {
+  static const std::unordered_set<std::string> allowed = {
+      "tl.tt.core_x",
+      "tl.tt.core_y",
+      "tl.tt.dfb_compute",
+      "tl.tt.dfb_load",
+      "tl.tt.compute_broadcast",
+      "tl.tt.compute_precision",
+      "tl.tt.compute_value",
+      "tl.tt.compute_value_load",
+      "tl.tt.compute_value_store",
+      "tl.tt.compute_value_gemm",
+      "tl.tt.tensor_to_dfb_nd",
+      "tl.tt.dfb_to_tensor_nd",
+      "tl.tt.dfb_reserve",
+      "tl.tt.dfb_wait",
+      "tl.tt.dfb_copy_wait",
+      "tl.tt.dfb_release",
+      "tl.tt.dfb_pipe_send",
+      "tl.tt.dfb_pipe_recv",
+      "tl.tt.dfb_pipe_wait",
+      "tl.tt.dfb_local_copy",
+      "tl.tt.dfb_gather_copy",
+      "tl.tt.dfb_collective_reduce",
+      "tl.tt.accumulator_init",
+      "tl.tt.gemm_update",
+      "tl.tt.accumulator_materialize",
+  };
+  return allowed.count(op_name) != 0;
+}
+
 class CoreCoordinateSubstituter : public tirx::StmtExprMutator {
 public:
   CoreCoordinateSubstituter(int64_t x, int64_t y) : x_(x), y_(y) {}
@@ -171,8 +202,8 @@ private:
   arith::Analyzer analyzer_;
 };
 
-void VerifyNoForbiddenOps(const tirx::PrimFunc &func,
-                          const std::string &symbol) {
+void VerifyNoForbiddenOps(const tirx::PrimFunc &func, const std::string &symbol,
+                          bool current = false) {
   tirx::PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
     const auto *call = object.as<tirx::CallNode>();
     if (call == nullptr) {
@@ -187,6 +218,13 @@ void VerifyNoForbiddenOps(const tirx::PrimFunc &func,
       Check(op_name != "tl.tt.tile_add" && op_name != "tl.tt.tile_compute",
             "PrimFunc `" + symbol +
                 "` retains intermediate op `tl.tt.tile_add`");
+      if (current && (op_name.rfind("tl.tt.", 0) == 0 ||
+                      SideEffect(ffi::GetRef<tirx::Call>(call)) >
+                          tirx::CallEffectKind::kPure)) {
+        Check(IsCurrentDeviceOp(op_name),
+              "PrimFunc `" + symbol + "` contains non-current Device op `" +
+                  op_name + "`");
+      }
     }
   });
 }
@@ -755,7 +793,8 @@ void VerifyFunctionABI(const tirx::PrimFunc &func, const std::string &symbol,
 void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
                      const CoreCoord &launch_grid, const TensorTable &tensors,
                      const Phase2AddPlan *phase2_plan, bool general = false,
-                     bool multicore = false, bool require_span = true) {
+                     bool multicore = false, bool require_span = true,
+                     bool current = false) {
   std::unordered_set<std::string> slots;
   std::unordered_set<std::string> symbols;
   std::unordered_set<std::string> kernel_ids;
@@ -873,7 +912,7 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
     }
     Check(IsVoidType(func->ret_type),
           "PrimFunc `" + symbol + "` must return void");
-    VerifyNoForbiddenOps(func, symbol);
+    VerifyNoForbiddenOps(func, symbol, current);
     if (phase2_plan != nullptr) {
       VerifyPhase2Body(func, symbol, slot, logical_kernel, *phase2_plan);
     } else if (!general) {
@@ -3780,7 +3819,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   }
   VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr,
                   /*general=*/true, /*multicore=*/false,
-                  /*require_span=*/false);
+                  /*require_span=*/false, /*current=*/true);
 
   std::unordered_set<std::string> ordered_symbols;
   for (const ffi::String &symbol : order)

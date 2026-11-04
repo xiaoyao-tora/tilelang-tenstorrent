@@ -151,30 +151,34 @@ def _nodes(func, node_type):
         (float32_add, "float32"),
     ),
 )
-def test_legalize_structured_add_to_one_canonical_tile_operation(func, dtype):
+def test_legalize_structured_add_to_general_compute_operation(func, dtype):
     before = _normalized(func)
     before_table = before["main"].attrs["tt.buffer_metadata_table"]
 
     legalized = transform.LegalizeTenstorrentTileOps()(before)
     result = legalized["main"]
     calls = _calls(result)
-    tile_adds = [call for call in calls if call.op.name == "tl.tt.tile_add"]
+    computes = [call for call in calls if call.op.name == "tl.tt.tile_compute"]
 
-    assert len(tile_adds) == 1
+    assert len(computes) == 1
+    assert not any(call.op.name == "tl.tt.tile_add" for call in calls)
     assert [call.op.name for call in calls].count("tl.tileop.copy") == 3
     assert not [loop for loop in _nodes(result, tirx.For) if loop.kind == tirx.ForKind.PARALLEL]
     assert not _nodes(result, tirx.BufferStore)
 
-    tile_add = tile_adds[0]
-    assert tile_add.dtype == "handle"
-    assert len(tile_add.args) == 3
-    assert all(isinstance(argument, tirx.BufferLoad) for argument in tile_add.args)
-    assert str(tile_add.annotations["tt.compute_dtype"].value) == dtype
-    assert [int(value) for value in tile_add.annotations["tt.compute_tile_shape"]] == [
+    compute = computes[0]
+    assert compute.dtype == "handle"
+    assert len(compute.args) == 3
+    assert all(isinstance(argument, tirx.BufferLoad) for argument in compute.args)
+    assert str(compute.annotations["tt.compute_kind"].value) == "elementwise"
+    assert str(compute.annotations["tt.compute_dtype"].value) == dtype
+    assert [int(value) for value in compute.annotations["tt.compute_tile_shape"]] == [
         32,
         32,
     ]
-    assert tile_add.span is not None
+    assert [int(value) for value in compute.annotations["tt.logical_domain"]] == [32, 32]
+    assert isinstance(compute.annotations["tt.expression"], tirx.Add)
+    assert compute.span is not None
 
     after_table = result.attrs["tt.buffer_metadata_table"]
     assert len(after_table) == len(before_table) == 6
@@ -200,7 +204,7 @@ def test_legalize_consumes_subtract_and_broadcast(func):
 def test_legalize_leaves_transaction_constraints_to_device_formation(func):
     # Compute instruction selection does not inspect surrounding copies or ABI.
     result = transform.LegalizeTenstorrentTileOps()(_normalized(func))
-    assert sum(call.op.name == "tl.tt.tile_add" for call in _calls(result["main"])) == 1
+    assert sum(call.op.name == "tl.tt.tile_compute" for call in _calls(result["main"])) == 1
 
 
 def test_legalize_consumes_fill_tileop():

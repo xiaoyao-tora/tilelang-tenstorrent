@@ -118,7 +118,7 @@ def row_padding_program(mode="column_zero"):
 
 
 @pytest.mark.parametrize("mode", ["column_zero", "full_copy", "nonzero_column", "other_write"])
-def test_padding_extension_requires_all_uses_to_observe_only_column_zero(mode):
+def test_row_padding_copy_remains_explicit(mode):
     result = transform.CanonicalizeTTElementwise()(bound(row_padding_program(mode)))
     calls = []
     blocks = []
@@ -131,50 +131,11 @@ def test_padding_extension_requires_all_uses_to_observe_only_column_zero(mode):
                 blocks.append(node)
 
         tirx.stmt_functor.post_order_visit(func.body, visit)
+    padding_copies = [
+        call for call in calls if str(call.args[0].args[0].buffer.name) == "row" and str(call.args[1].args[0].buffer.name) == "padded"
+    ]
+    assert len(padding_copies) == 1
+    assert len(calls) == (2 if mode == "other_write" else 3)
     padding_blocks = [block for block in blocks if str(block.writes[0].buffer.name) == "padded"]
-    if mode == "column_zero":
-        assert len(calls) == 2
-        assert len(padding_blocks) == 1
-        assert [int(axis.extent) for axis in padding_blocks[0].reads[0].region] == [32, 1]
-        assert [int(axis.extent) for axis in padding_blocks[0].writes[0].region] == [32, 32]
-    else:
-        assert len(calls) == (2 if mode == "other_write" else 3)
+    assert len(padding_blocks) == (1 if mode == "other_write" else 0)
     transform.VerifyTTComputeBlocks()(result)
-
-
-@pytest.mark.parametrize("through_match_buffer", [False, True])
-def test_padding_extension_rejects_opaque_pointer_escape(through_match_buffer):
-    mod = bound(row_padding_program("full_copy"))
-
-    def replace_output_copy(node):
-        if not isinstance(node, tirx.Evaluate) or not isinstance(node.value, tirx.Call):
-            return None
-        call = node.value
-        if call.op.name != "tl.tileop.copy":
-            return None
-        source = call.args[0].args[0]
-        if source.buffer.name == "padded":
-            if through_match_buffer:
-                alias = tirx.decl_buffer(source.buffer.shape, source.buffer.dtype, name="alias", scope=source.buffer.scope())
-                region = tirx.BufferRegion(source.buffer, [ir.Range.from_min_extent(0, extent) for extent in source.buffer.shape])
-                block = tirx.SBlock(
-                    [],
-                    [],
-                    [],
-                    "alias_escape",
-                    tirx.Evaluate(tirx.call_extern("int32", "inspect_padding", alias.data)),
-                    match_buffers=[tirx.MatchBufferRegion(alias, region)],
-                )
-                return tirx.SBlockRealize([], True, block)
-            return tirx.Evaluate(tirx.call_extern("int32", "inspect_padding", source.buffer.data))
-        return None
-
-    func = mod["main"]
-    func = func.with_body(tirx.stmt_functor.ir_transform(func.body, None, replace_output_copy, ["tirx.Evaluate"]))
-    result = transform.CanonicalizeTTElementwise()(tvm.IRModule({"main": func}))
-    copies = []
-    tirx.stmt_functor.post_order_visit(
-        result["main"].body,
-        lambda node: copies.append(node) if isinstance(node, tirx.Call) and node.op.name == "tl.tileop.copy" else None,
-    )
-    assert len(copies) == 2  # Input load and the original partial row store.
