@@ -55,7 +55,7 @@ def make_causal_mask(seq_q: int, seq_kv: int | None = None):
     """Return a NumPy FP32 bottom-right mask shared by all batches/heads.
 
     The causal kernel's fourth argument must contain this 0/-1e30 mask, converted
-    to the configured kernel dtype before launch. The finite sentinel assumes
+    to the configured accumulation/state dtype before launch. The finite sentinel assumes
     finite inputs with attention scores well above -1e30; its accuracy on the
     target FPU/SFPU must be validated on hardware. This correctness-first
     representation costs O(seq_q * seq_kv) storage.
@@ -85,14 +85,14 @@ def make_flash_attention(
     block_q: int = 32,
     block_kv: int = 32,
     input_dtype: str = "bfloat16",
-    accum_dtype: str = "bfloat16",
+    accum_dtype: str = "float32",
     output_dtype: str | None = None,
 ):
     """Describe scaled dot-product attention in BHSD layout using transfers.
 
     Non-causal ABI: (Q, K, V, Output). Causal ABI: (Q, K, V, Mask, Output),
     where Mask is the [seq_q, seq_kv] array from make_causal_mask converted to
-    input_dtype. The kernel computes QK / sqrt(D) + Mask. Arbitrary masks and
+    accum_dtype. The kernel computes QK / sqrt(D) + Mask. Arbitrary masks and
     fully masked rows are outside this example's contract.
 
     All dimensions must be positive; blocks/head_dim must be 32-aligned and
@@ -104,10 +104,12 @@ def make_flash_attention(
     consumer. The caller must choose a grid and buffer sizes fitting the target
     budgets.
 
-    The frontend contract accepts all-BF16 or all-FP32. Mixed BF16-input/FP32-
-    state attention remains deferred until the backend defines its intermediate
-    result and compute-configuration contracts. The transfer frontend supports
-    initial TIRX construction; executable lowering is pending.
+    The recommended configuration uses BF16 inputs/outputs with FP32 GEMM
+    accumulation and online state. Each BF16 GEMM result materializes only after
+    its complete K reduction, then reloads as FP32 for softmax or online output
+    accumulation. All-BF16 remains an explicit low-precision frontend mode;
+    all-FP32 remains available for reference Device lowering. TTL compilation
+    and device execution are separate validation stages.
     """
     seq_kv = seq_q if seq_kv is None else seq_kv
     output_dtype = input_dtype if output_dtype is None else output_dtype
@@ -142,16 +144,17 @@ def make_flash_attention(
     dtype_config = (input_dtype, accum_dtype, output_dtype)
     frontend_dtype_configs = {
         ("bfloat16", "bfloat16", "bfloat16"),
+        ("bfloat16", "float32", "bfloat16"),
         ("float32", "float32", "float32"),
     }
     if dtype_config not in frontend_dtype_configs:
         raise ValueError(
             "unsupported Tenstorrent FlashAttention dtype combination: "
             f"input={input_dtype}, accumulation={accum_dtype}, output={output_dtype}; "
-            "supported frontend combinations are BF16/BF16/BF16 and "
-            "FP32/FP32/FP32. "
-            "BF16 input with FP32 online state is deferred"
+            "supported frontend combinations are BF16/BF16/BF16, "
+            "BF16/FP32/BF16, and FP32/FP32/FP32"
         )
+    mixed_precision = dtype_config == ("bfloat16", "float32", "bfloat16")
 
     scores_fragment_tiles = (block_q // _DFB_TILE) * (block_kv // _DFB_TILE)
     output_fragment_tiles = (block_q // _DFB_TILE) * (head_dim // _DFB_TILE)
@@ -165,15 +168,12 @@ def make_flash_attention(
     for name, tile_count in fragment_tile_counts.items():
         if tile_count > _MAX_MVP_ACCUMULATOR_TILES:
             raise ValueError(
-                f"{name} requires {tile_count} tiles; the FlashAttention MVP "
-                f"supports at most {_MAX_MVP_ACCUMULATOR_TILES} tiles"
+                f"{name} requires {tile_count} tiles; the FlashAttention MVP supports at most {_MAX_MVP_ACCUMULATOR_TILES} tiles"
             )
     peak_fragment_tiles = output_fragment_tiles + max(scores_fragment_tiles + row_fragment_tiles, output_fragment_tiles)
     if peak_fragment_tiles > _MAX_MVP_ACCUMULATOR_TILES:
         raise ValueError(
-            "FlashAttention MVP fragment live set requires "
-            f"{peak_fragment_tiles} tiles; at most "
-            f"{_MAX_MVP_ACCUMULATOR_TILES} are supported"
+            f"FlashAttention MVP fragment live set requires {peak_fragment_tiles} tiles; at most {_MAX_MVP_ACCUMULATOR_TILES} are supported"
         )
 
     q_annotations = {"tt.dfb_block_count": 1, "tt.tile_shape": (32, 32)}
@@ -181,8 +181,9 @@ def make_flash_attention(
     q_waves = (seq_q // block_q) // core_q
     batch_head_waves = (batch * heads) // core_bh
     kv_tiles = seq_kv // block_kv
-    attention_scale = 1.0 / math.sqrt(head_dim)
-    softmax_log2e = math.log2(math.e)
+    constant_dtype = T.bfloat16 if accum_dtype == "bfloat16" else T.float32
+    attention_scale = constant_dtype(1.0 / math.sqrt(head_dim))
+    softmax_log2e = constant_dtype(math.log2(math.e))
 
     # Share the compute body between the causal and non-causal PrimFunc ABIs.
     @T.macro
@@ -196,20 +197,24 @@ def make_flash_attention(
 
             probabilities_shared = T.alloc_shared((block_q, block_kv), input_dtype, annotations=dfb_annotations)
             output_shared = T.alloc_shared((block_q, head_dim), output_dtype, annotations=dfb_annotations)
+            if mixed_precision:
+                scores_gemm_output_shared = T.alloc_shared((block_q, block_kv), input_dtype, annotations=dfb_annotations)
+                pv_gemm_output_shared = T.alloc_shared((block_q, head_dim), input_dtype, annotations=dfb_annotations)
 
-            # Physical row vectors occupy padded tiles. Reduction writes column
-            # zero; Tiles broadcasts that column and writes a full padded block.
+            # Row reductions stay compute-local. Their singleton column is
+            # broadcast directly into the following full Tiles computation.
             row_max_shared = T.alloc_shared((block_q, 32), accum_dtype, annotations=dfb_annotations)
             row_max_previous_shared = T.alloc_shared((block_q, 32), accum_dtype, annotations=dfb_annotations)
-            chunk_max_shared = T.alloc_shared((block_q, 32), accum_dtype, annotations=dfb_annotations)
             row_scale_shared = T.alloc_shared((block_q, 32), accum_dtype, annotations=dfb_annotations)
-            tile_sum_shared = T.alloc_shared((block_q, 32), accum_dtype, annotations=dfb_annotations)
             row_sum_shared = T.alloc_shared((block_q, 32), accum_dtype, annotations=dfb_annotations)
 
             # Scores stay compute-local through scale/mask/exp/reductions. The
             # online output accumulator is an outer-loop-carried fragment value.
             scores_fragment = T.alloc_fragment((block_q, block_kv), accum_dtype)
             pv_fragment = T.alloc_fragment((block_q, head_dim), accum_dtype)
+            if mixed_precision:
+                scores_acc_fragment = T.alloc_fragment((block_q, block_kv), accum_dtype)
+                pv_acc_fragment = T.alloc_fragment((block_q, head_dim), accum_dtype)
             output_acc_fragment = T.alloc_fragment((block_q, head_dim), accum_dtype)
             row_fragment = T.alloc_fragment((block_q, 1), accum_dtype)
 
@@ -236,10 +241,26 @@ def make_flash_attention(
                             T.copy(K[batch_index, head_index, kv_begin : kv_begin + block_kv, 0:head_dim], k_compute_shared)
                             T.copy(V[batch_index, head_index, kv_begin : kv_begin + block_kv, 0:head_dim], v_compute_shared)
                         if core_q > 1:
-                            T.comm.broadcast(src=k_compute_shared, dst=k_compute_shared, src_core=(0, core_y), dst_cores=T.comm.CoreRange(begin=(1, core_y), end=(core_q, core_y + 1)))
-                            T.comm.broadcast(src=v_compute_shared, dst=v_compute_shared, src_core=(0, core_y), dst_cores=T.comm.CoreRange(begin=(1, core_y), end=(core_q, core_y + 1)))
+                            T.comm.broadcast(
+                                src=k_compute_shared,
+                                dst=k_compute_shared,
+                                src_core=(0, core_y),
+                                dst_cores=T.comm.CoreRange(begin=(1, core_y), end=(core_q, core_y + 1)),
+                            )
+                            T.comm.broadcast(
+                                src=v_compute_shared,
+                                dst=v_compute_shared,
+                                src_core=(0, core_y),
+                                dst_cores=T.comm.CoreRange(begin=(1, core_y), end=(core_q, core_y + 1)),
+                            )
 
-                        T.gemm(q_shared, k_compute_shared, scores_fragment, transpose_B=True, clear_accum=True)
+                        if mixed_precision:
+                            T.gemm(q_shared, k_compute_shared, scores_acc_fragment, transpose_B=True, clear_accum=True)
+                            T.copy(scores_acc_fragment, scores_gemm_output_shared)
+                            for row, col in T.Tiles(scores_fragment):
+                                scores_fragment[row, col] = T.cast(scores_gemm_output_shared[row, col], accum_dtype)
+                        else:
+                            T.gemm(q_shared, k_compute_shared, scores_fragment, transpose_B=True, clear_accum=True)
 
                         if causal:
                             T.copy(Mask[query_begin : query_begin + block_q, kv_begin : kv_begin + block_kv], mask_shared)
@@ -250,10 +271,9 @@ def make_flash_attention(
                                 scores_fragment[row, col] = scores_fragment[row, col] * attention_scale
 
                         T.reduce_max(scores_fragment, row_fragment, dim=1, clear=True)
-                        T.copy(row_fragment, chunk_max_shared[0:block_q, 0:1])
                         T.copy(row_max_shared, row_max_previous_shared)
                         for row, col in T.Tiles(row_max_shared):
-                            row_max_shared[row, col] = T.max(row_max_previous_shared[row, 0], chunk_max_shared[row, 0])
+                            row_max_shared[row, col] = T.max(row_max_previous_shared[row, 0], row_fragment[row, 0])
                         for row, col in T.Tiles(row_scale_shared):
                             row_scale_shared[row, col] = T.exp2((row_max_previous_shared[row, 0] - row_max_shared[row, 0]) * softmax_log2e)
                         for row, col in T.Tiles(scores_fragment):
@@ -262,11 +282,16 @@ def make_flash_attention(
                         for row, col in T.Tiles(probabilities_shared):
                             probabilities_shared[row, col] = T.cast(scores_fragment[row, col], input_dtype)
                         T.reduce_sum(scores_fragment, row_fragment, dim=1, clear=True)
-                        T.copy(row_fragment, tile_sum_shared[0:block_q, 0:1])
                         for row, col in T.Tiles(row_sum_shared):
-                            row_sum_shared[row, col] = row_sum_shared[row, col] * row_scale_shared[row, col] + tile_sum_shared[row, 0]
+                            row_sum_shared[row, col] = row_sum_shared[row, col] * row_scale_shared[row, col] + row_fragment[row, 0]
 
-                        T.gemm(probabilities_shared, v_compute_shared, pv_fragment, clear_accum=True)
+                        if mixed_precision:
+                            T.gemm(probabilities_shared, v_compute_shared, pv_acc_fragment, clear_accum=True)
+                            T.copy(pv_acc_fragment, pv_gemm_output_shared)
+                            for row, col in T.Tiles(pv_fragment):
+                                pv_fragment[row, col] = T.cast(pv_gemm_output_shared[row, col], accum_dtype)
+                        else:
+                            T.gemm(probabilities_shared, v_compute_shared, pv_fragment, clear_accum=True)
                         for row, col in T.Tiles(output_acc_fragment):
                             output_acc_fragment[row, col] = output_acc_fragment[row, col] * row_scale_shared[row, 0] + pv_fragment[row, col]
 

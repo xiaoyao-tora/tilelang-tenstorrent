@@ -555,7 +555,6 @@ def test_core_predicate_must_match_its_typed_work_domain():
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
-@pytest.mark.skip(reason="requires an explicit row-padding materialization Device contract")
 def test_flash_attention_core_and_kv_repetition_remain_parameterized():
     from examples.tenstorrent.flash_attn import make_flash_attention
 
@@ -586,9 +585,9 @@ def test_flash_attention_core_and_kv_repetition_remain_parameterized():
         "tt.transport_families",
     )
     assert [tuple(len(mod.attrs[key]) for key in family_keys) for mod in modules] == [
-        (14, 2, 8, 10, 1),
-        (14, 2, 8, 10, 1),
-        (14, 2, 8, 10, 1),
+        (12, 2, 8, 10, 1),
+        (12, 2, 8, 10, 1),
+        (12, 2, 8, 10, 1),
     ]
     for mod in modules:
         assert "tt.storage_group_statements_specialized" not in mod.attrs
@@ -614,10 +613,8 @@ def test_flash_attention_core_and_kv_repetition_remain_parameterized():
     assert sizes[2] < 3 * sizes[1] // 2
 
 
-def test_bf16_flash_precision_conflict_returns_atomic_structured_module():
-    from testing.python.tenstorrent.legacy.fixtures.tenstorrent_flash_attn_03 import (
-        make_flash_attention,
-    )
+def test_mixed_precision_flash_uses_full_fp32_accumulation():
+    from examples.tenstorrent.flash_attn import make_flash_attention
 
     frontend = make_flash_attention(
         batch=1,
@@ -628,9 +625,42 @@ def test_bf16_flash_precision_conflict_returns_atomic_structured_module():
         core_q=1,
         core_bh=1,
     )
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": frontend}), TARGET)
-    assert str(mod.attrs["tt.ir_stage"]) == "structured"
-    assert len(mod.functions) == 1
-    assert "tt.device_ir_version" not in mod.attrs
-    assert "tt.dfb_table" not in mod.attrs
-    assert any("no complete Device consumer" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])
+    mod = lower(frontend)
+    concrete = expanded(mod)
+    assert {
+        (str(entry.input_dtype), str(entry.accumulation_dtype), str(entry.output_dtype)) for entry in concrete.attrs["tt.accumulator_table"]
+    } == {("bfloat16", "float32", "bfloat16")}
+    trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
+    requirements = trisc.attrs["tt.compute_requirements"]
+    assert str(requirements.destination_width) == "bits32_required"
+    assert str(requirements.matmul_full_fp32) == "required"
+    assert len(mod.attrs["tt.dfb_families"]) == 14
+
+
+def test_all_bf16_flash_uses_bf16_constants_and_destination():
+    from examples.tenstorrent.flash_attn import make_flash_attention
+
+    frontend = make_flash_attention(
+        batch=1,
+        heads=1,
+        seq_q=32,
+        seq_kv=64,
+        head_dim=32,
+        core_q=1,
+        core_bh=1,
+        accum_dtype="bfloat16",
+    )
+    source = frontend.script()
+    assert "T.bfloat16(0.17677669529663687)" in source
+    assert "T.bfloat16(1.4426950408889634)" in source
+    assert 'T.Cast("float32", scores_fragment' not in source
+    mod = lower(frontend)
+    concrete = expanded(mod)
+    assert {
+        (str(entry.input_dtype), str(entry.accumulation_dtype), str(entry.output_dtype)) for entry in concrete.attrs["tt.accumulator_table"]
+    } == {("bfloat16", "bfloat16", "bfloat16")}
+    trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
+    requirements = trisc.attrs["tt.compute_requirements"]
+    assert str(requirements.destination_width) == "bits16_required"
+    assert str(requirements.matmul_full_fp32) == "forbidden"
+    assert len(mod.attrs["tt.dfb_families"]) == 12
