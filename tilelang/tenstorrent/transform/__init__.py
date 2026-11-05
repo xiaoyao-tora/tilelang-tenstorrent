@@ -70,6 +70,21 @@ def NormalizeTenstorrentTopology():
     return _ffi_api.NormalizeTenstorrentTopology()  # type: ignore[attr-defined]
 
 
+def ValidateTenstorrentDeviceProgramInput():
+    """Check formation inputs without adding planning metadata."""
+    return _ffi_api.ValidateTenstorrentDeviceProgramInput()
+
+
+def FormTenstorrentGridProgram():
+    """Attach a temporary typed rectangular task plan; do not plan devices."""
+    return _ffi_api.FormTenstorrentGridProgram()
+
+
+def PlanTenstorrentCorePrograms():
+    """Consume a matching grid plan and form the shared Device program."""
+    return _ffi_api.PlanTenstorrentCorePrograms()
+
+
 def FormTenstorrentDeviceProgram():
     return _ffi_api.FormTenstorrentDeviceProgram()  # type: ignore[attr-defined]
 
@@ -85,6 +100,9 @@ __all__ = (
     "InferTenstorrentComputeRequirements",
     "VerifyTTGemmAccumulators",
     "FormTenstorrentDeviceProgram",
+    "ValidateTenstorrentDeviceProgramInput",
+    "FormTenstorrentGridProgram",
+    "PlanTenstorrentCorePrograms",
     "InferTenstorrentTensorLayout",
     "LegalizeTenstorrentTileOps",
     "NormalizeTenstorrentBufferMetadata",

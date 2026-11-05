@@ -11,6 +11,7 @@
 #include "../../op/copy.h"
 #include "../../op/utils.h"
 #include "../ir/device_ir.h"
+#include "../ir/grid_plan.h"
 #include "../op/builtin.h"
 #include "compute_support.h"
 #include "device_metadata_interner.h"
@@ -36,6 +37,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -334,8 +336,44 @@ struct AccumulatorLifetime {
   Span span;
 };
 
+enum class LoopStrategy { kExpand, kWindow, kPreserve };
+
+struct LoopAnalysis {
+  // Retain the original node: range, step, annotations and span are input facts.
+  For loop;
+  LoopStrategy strategy;
+  int64_t minimum{0};
+  int64_t extent{0};
+  int64_t stages{0};
+  ffi::String wait_policy{"delayed"};
+};
+
+std::vector<For> FindIndependentLoops(const Stmt &body);
+Stmt IndependentLoopBody(const std::vector<For> &loops, const Stmt &fallback);
+
 class GeneralDataflowPlanner {
 public:
+  struct LoopSchedulePlan {
+    LoopAnalysis analysis;
+    int64_t minimum{0};
+    int64_t extent{0};
+    int64_t depth{0};
+    int64_t stages{0};
+    ffi::String wait_policy{"delayed"};
+    ffi::Optional<Stmt> preserved_body;
+  };
+
+  std::vector<For> PlanRoot(const Stmt &body) {
+    auto loops = FindIndependentLoops(body);
+    if (loops.empty()) {
+      Plan(body);
+    } else {
+      auto plan = BuildLoopSchedulePlan({loops.front(), LoopStrategy::kPreserve},
+                                        IndependentLoopBody(loops, body));
+      ApplyLoopSchedulePlan(std::move(plan));
+    }
+    return loops;
+  }
   ffi::Array<AccumulatorDescriptor> Accumulators() const {
     ffi::Array<AccumulatorDescriptor> result;
     for (size_t id = 0; id < accumulators_.size(); ++id) {
@@ -460,13 +498,12 @@ public:
 
   // Phase 5 materializes bounded windows. A value remains an immutable
   // generation, while the same lexical write site shares one capacity pool.
-  void PlanPipeline(const For &loop) {
+  void AnalyzeWindowLoop(const For &loop, LoopAnalysis *plan) const {
     if (precision_regions_)
       ThrowUnsupported(
           "precision regions require statically serialized transactions");
     if (IsPipeline())
       ThrowUnsupported("one bounded T.Pipelined loop per Core is supported");
-    pipeline_resource_begin_ = resources_.size();
     for (const auto &[key, value] : loop->annotations) {
       if (key != "num_stages" && key != "tt.pipeline_wait_policy")
         ThrowUnsupported(
@@ -481,28 +518,27 @@ public:
     auto policy = loop->annotations.Get("tt.pipeline_wait_policy");
     if (policy.has_value()) {
       if (auto string = policy.value().as<ffi::String>()) {
-        pipeline_wait_policy_ = string.value();
+        plan->wait_policy = string.value();
       } else if (auto literal = policy.value().as<StringImm>()) {
-        pipeline_wait_policy_ = literal.value()->value;
+        plan->wait_policy = literal.value()->value;
       } else {
         ThrowMalformed("tt.pipeline_wait_policy must be a string");
       }
-      if (pipeline_wait_policy_ != "conservative" &&
-          pipeline_wait_policy_ != "delayed")
+      if (plan->wait_policy != "conservative" &&
+          plan->wait_policy != "delayed")
         ThrowMalformed(
             "tt.pipeline_wait_policy must be conservative or delayed");
     }
-    pipeline_stages_ = RequirePositiveStaticInteger(
+    plan->stages = RequirePositiveStaticInteger(
         Downcast<PrimExpr>(loop->annotations.at("num_stages")),
         "T.Pipelined num_stages");
-    pipeline_extent_ =
+    plan->extent =
         RequirePositiveStaticInteger(loop->extent, "T.Pipelined extent");
-    int64_t minimum = RequireStaticInteger(loop->min, "T.Pipelined minimum");
-    if (pipeline_stages_ > 32 || pipeline_extent_ > 1024) {
+    plan->minimum = RequireStaticInteger(loop->min, "T.Pipelined minimum");
+    if (plan->stages > 32 || plan->extent > 1024) {
       ThrowUnsupported(
           "T.Pipelined requires num_stages <= 32 and extent <= 1024");
     }
-    pipeline_depth_ = std::min(pipeline_stages_, pipeline_extent_);
     PostOrderVisit(loop->body, [&](const ffi::ObjectRef &object) {
       if (object.as<IfThenElseNode>()) {
         ThrowUnsupported("T.Pipelined conditional write sites are unsupported; "
@@ -515,6 +551,16 @@ public:
         }
       }
     });
+  }
+
+  void ApplyWindowIterations(const LoopSchedulePlan &plan) {
+    const For &loop = plan.analysis.loop;
+    pipeline_resource_begin_ = resources_.size();
+    pipeline_wait_policy_ = plan.wait_policy;
+    pipeline_stages_ = plan.stages;
+    pipeline_extent_ = plan.extent;
+    pipeline_depth_ = plan.depth;
+    int64_t minimum = plan.minimum;
     size_t writes_per_iteration = 0;
     for (int64_t iteration = 0; iteration < pipeline_extent_; ++iteration) {
       current_.clear();
@@ -575,9 +621,24 @@ public:
     return relations;
   }
 
-  void FinalizePipeline() {
-    if (!IsPipeline())
-      return;
+  struct WindowSchedulePlan {
+    ffi::Array<Stmt> operations;
+  };
+
+  static int64_t WindowResourceId(const CallNode *call) {
+    ICHECK(call);
+    bool second = call->op.same_as(tensor_to_dfb_nd()) ||
+                  call->op.same_as(dfb_pipe_recv()) ||
+                  call->op.same_as(dfb_pipe_send()) ||
+                  call->op.same_as(dfb_pipe_wait());
+    size_t index = second ? 1 : 0;
+    ICHECK_GT(call->args.size(), index);
+    const int64_t *id = as_const_int(call->args[index]);
+    ICHECK(id);
+    return *id;
+  }
+
+  WindowSchedulePlan BuildWindowSchedulePlan() const {
     ffi::Array<Stmt> scheduled;
     auto append_singleton = [&](const Stmt &statement) {
       const CallNode *call = statement.as<EvaluateNode>()->value.as<CallNode>();
@@ -591,13 +652,7 @@ public:
             dfb_copy_wait(), {call->args[arg], Integer(1)}, statement->span));
       }
     };
-    auto resource_id = [](const CallNode *call) {
-      bool second = call->op.same_as(tensor_to_dfb_nd()) ||
-                    call->op.same_as(dfb_pipe_recv()) ||
-                    call->op.same_as(dfb_pipe_send()) ||
-                    call->op.same_as(dfb_pipe_wait());
-      return *as_const_int(call->args[second ? 1 : 0]);
-    };
+    auto resource_id = WindowResourceId;
     for (const Stmt &statement : transfer_) {
       int64_t id =
           resource_id(statement.as<EvaluateNode>()->value.as<CallNode>());
@@ -671,7 +726,60 @@ public:
       if (resources_[id].iteration < 0 && id >= pipeline_resource_begin_)
         append_singleton(statement);
     }
-    transfer_ = std::move(scheduled);
+    return {std::move(scheduled)};
+  }
+
+  static void VerifyWindowSchedulePlan(const WindowSchedulePlan &plan,
+                                       const ffi::Array<Stmt> &transfer,
+                                       size_t resource_count) {
+    // Windows may reorder independent resources, but never a resource's own
+    // transport/copy operations. Completion calls are regenerated separately.
+    std::unordered_map<int64_t, std::vector<const Object *>> expected;
+    std::unordered_map<int64_t, size_t> next;
+    std::unordered_set<int64_t> pending_copies;
+    for (const Stmt &stmt : transfer) {
+      const auto *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
+      int64_t id = WindowResourceId(call);
+      ICHECK_GE(id, 0);
+      ICHECK_LT(id, resource_count);
+      if (!call->op.same_as(dfb_copy_wait()))
+        expected[id].push_back(stmt.get());
+    }
+    for (const Stmt &stmt : plan.operations) {
+      const auto *eval = stmt.as<EvaluateNode>();
+      ICHECK(eval);
+      const auto *call = eval->value.as<CallNode>();
+      ICHECK(call);
+      int64_t id = WindowResourceId(call);
+      auto found = expected.find(id);
+      ICHECK(found != expected.end());
+      if (call->op.same_as(dfb_copy_wait())) {
+        ICHECK_EQ(call->args.size(), 2);
+        ICHECK(is_one(call->args[1]));
+        ICHECK_EQ(pending_copies.erase(id), 1);
+        continue;
+      }
+      size_t &index = next[id];
+      ICHECK_LT(index, found->second.size());
+      ICHECK_EQ(found->second[index++], stmt.get());
+      if (call->op.same_as(tensor_to_dfb_nd()) ||
+          call->op.same_as(dfb_to_tensor_nd())) {
+        ICHECK(pending_copies.insert(id).second);
+      } else if (call->op.same_as(dfb_pipe_send())) {
+        ICHECK(!pending_copies.count(id));
+      }
+    }
+    ICHECK(pending_copies.empty());
+    for (const auto &[id, operations] : expected)
+      ICHECK_EQ(next[id], operations.size());
+  }
+
+  void FinalizePipeline() {
+    if (!IsPipeline())
+      return;
+    auto scheduled = BuildWindowSchedulePlan();
+    VerifyWindowSchedulePlan(scheduled, transfer_, resources_.size());
+    transfer_ = std::move(scheduled.operations);
     AddReleases(&compute_, "trisc");
     AddReleases(&transfer_, "ncrisc");
     if (transfers_)
@@ -777,6 +885,83 @@ public:
     unknown_accesses_.clear();
   }
 
+  LoopAnalysis AnalyzeLoop(const For &loop) const {
+    LoopAnalysis analysis{loop, loop->annotations.count("num_stages")
+                                    ? LoopStrategy::kWindow
+                                    : LoopStrategy::kExpand};
+    if (analysis.strategy == LoopStrategy::kExpand) {
+      if (loop->kind != ForKind::kSerial && loop->kind != ForKind::kUnrolled)
+        ThrowUnsupported(
+            "control flow must use a static serial or unrolled loop");
+      if (!loop->annotations.empty() ||
+          (loop->step.has_value() && !is_one(loop->step.value())))
+        ThrowUnsupported("serial computation requires unit step and no "
+                         "pipeline/scheduling annotations");
+      analysis.minimum = RequireStaticInteger(loop->min, "serial loop minimum");
+      analysis.extent =
+          RequirePositiveStaticInteger(loop->extent, "serial loop extent");
+      if (analysis.extent > 1024)
+        ThrowUnsupported("serial loop extent exceeds 1024");
+    } else {
+      AnalyzeWindowLoop(loop, &analysis);
+    }
+    return analysis;
+  }
+
+  LoopSchedulePlan BuildLoopSchedulePlan(
+      const LoopAnalysis &analysis,
+      const ffi::Optional<Stmt> &preserved_body = std::nullopt) const {
+    LoopSchedulePlan plan;
+    plan.analysis = analysis;
+    plan.minimum = analysis.minimum;
+    plan.extent = analysis.extent;
+    plan.stages = analysis.stages;
+    plan.wait_policy = analysis.wait_policy;
+    if (analysis.strategy == LoopStrategy::kWindow)
+      plan.depth = std::min(analysis.stages, analysis.extent);
+    plan.preserved_body = preserved_body;
+    return plan;
+  }
+
+  static void VerifyLoopSchedulePlan(const LoopSchedulePlan &plan) {
+    ICHECK(plan.analysis.loop.defined());
+    if (plan.analysis.strategy == LoopStrategy::kPreserve) {
+      ICHECK(plan.preserved_body.has_value());
+    } else if (plan.analysis.strategy == LoopStrategy::kExpand) {
+      ICHECK_GT(plan.extent, 0);
+      ICHECK_LE(plan.extent, 1024);
+    } else {
+      ICHECK(plan.analysis.loop->annotations.count("num_stages"));
+      ICHECK_GT(plan.stages, 0);
+      ICHECK_LE(plan.stages, 32);
+      ICHECK_GT(plan.extent, 0);
+      ICHECK_LE(plan.extent, 1024);
+      ICHECK_GT(plan.depth, 0);
+      ICHECK_EQ(plan.depth, std::min(plan.stages, plan.extent));
+    }
+  }
+
+  void ApplyLoopSchedulePlan(const LoopSchedulePlan &plan) {
+    VerifyLoopSchedulePlan(plan);
+    if (plan.analysis.strategy == LoopStrategy::kPreserve) {
+      Plan(plan.preserved_body.value());
+    } else if (plan.analysis.strategy == LoopStrategy::kWindow) {
+      ApplyWindowIterations(plan);
+    } else {
+      const For &loop = plan.analysis.loop;
+      for (int64_t i = 0; i < plan.extent; ++i) {
+        StaticIterationSubstituter substitute(
+            loop->loop_var, IntImm(loop->loop_var.dtype(), plan.minimum + i));
+        PlanImpl(substitute(loop->body));
+      }
+    }
+  }
+
+  void PlanLoop(const For &loop) {
+    auto plan = BuildLoopSchedulePlan(AnalyzeLoop(loop));
+    ApplyLoopSchedulePlan(std::move(plan));
+  }
+
   void PlanImpl(const Stmt &stmt) {
     if (++statement_count_ > 65536) {
       ThrowUnsupported(
@@ -803,29 +988,7 @@ public:
       return;
     }
     if (const auto *loop = stmt.as<ForNode>()) {
-      if (loop->annotations.count("num_stages")) {
-        PlanPipeline(ffi::GetRef<For>(loop));
-        return;
-      }
-      if (loop->kind != ForKind::kSerial && loop->kind != ForKind::kUnrolled) {
-        ThrowUnsupported(
-            "control flow must use a static serial or unrolled loop");
-      }
-      if (!loop->annotations.empty() ||
-          (loop->step.has_value() && !is_one(loop->step.value()))) {
-        ThrowUnsupported("serial computation requires unit step and no "
-                         "pipeline/scheduling annotations");
-      }
-      int64_t minimum = RequireStaticInteger(loop->min, "serial loop minimum");
-      int64_t extent =
-          RequirePositiveStaticInteger(loop->extent, "serial loop extent");
-      if (extent > 1024)
-        ThrowUnsupported("serial loop extent exceeds 1024");
-      for (int64_t i = 0; i < extent; ++i) {
-        StaticIterationSubstituter substitute(
-            loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + i));
-        PlanImpl(substitute(loop->body));
-      }
+      PlanLoop(ffi::GetRef<For>(loop));
       return;
     }
     if (const auto *branch = stmt.as<IfThenElseNode>()) {
@@ -3080,13 +3243,17 @@ ffi::Map<ffi::String, Integer> PlanNonPipelineStorageGroups(
   return assignments;
 }
 
-IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
-                              const Target &target,
-                              const ffi::String &operation,
-                              const ffi::String &arch, int64_t gx, int64_t gy,
-                              const Stmt &kernel_body, const Var &core_x_var,
-                              const Var &core_y_var,
-                              const ffi::Array<TTBufferMetadata> &metadata) {
+IRModule PlanCorePrograms(const IRModule &input, const GridPlan &plan) {
+  const PrimFunc &frontend = plan->frontend;
+  const Target target = frontend->GetAttr<Target>(tvm::attr::kTarget).value();
+  const ffi::String arch = target->GetAttr<ffi::String>("arch").value();
+  const ffi::String &operation = plan->operation;
+  const int64_t gx = plan->grid_x, gy = plan->grid_y;
+  const Stmt &kernel_body = plan->body;
+  const Var &core_x_var = plan->core_x, &core_y_var = plan->core_y;
+  const auto metadata =
+      frontend->GetAttr<ffi::Array<TTBufferMetadata>>(kBufferMetadataTableAttr)
+          .value();
   ffi::Map<GlobalVar, BaseFunc> functions;
   ffi::Array<ffi::String> order;
   std::array<std::vector<DeviceCoreBody>, 3> shared_bodies;
@@ -3111,15 +3278,14 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   std::map<int64_t, std::string> resource_storage_keys;
   // Specialize and consume one proof instance at a time. Do not materialize a
   // gx*gy clone of the structured input before shared-body parameterization.
-  for (int64_t index = 0; index < gx * gy; ++index) {
-    int64_t x = index / gy, y = index % gy;
+  for (const GridTask &task : plan->tasks) {
+    int64_t x = task->x, y = task->y;
     StaticIterationSubstituter specialize_x(core_x_var, Integer(x));
     Stmt specialized = specialize_x(kernel_body);
     StaticIterationSubstituter specialize_y(core_y_var, Integer(y));
     specialized = specialize_y(specialized);
     GeneralDataflowPlanner planner(frontend, metadata, &transfer_keys, x, y);
-    std::vector<For> independent_loops = FindIndependentLoops(specialized);
-    planner.Plan(IndependentLoopBody(independent_loops, specialized));
+    std::vector<For> independent_loops = planner.PlanRoot(specialized);
     planner.EliminateDeadWrites();
     planner.FinalizeMulticore();
     if (planner.IsPipeline()) {
@@ -3664,7 +3830,7 @@ void VerifyFormationOperations(const Stmt &body) {
   });
 }
 
-IRModule FormProgram(const IRModule &input) {
+void ValidateDeviceProgramInput(const IRModule &input) {
   ffi::Optional<GlobalVar> frontend_global;
   ffi::Optional<PrimFunc> frontend_func;
   for (const auto &[global_var, base_func] : input->functions) {
@@ -3706,10 +3872,8 @@ IRModule FormProgram(const IRModule &input) {
   if (!launch_grid.has_value() || launch_grid.value().size() != 2) {
     ThrowMalformed("function-level tt.launch_grid is missing or malformed");
   }
-  const int64_t grid_x =
-      RequirePositiveStaticInteger(launch_grid.value()[0], "launch grid x");
-  const int64_t grid_y =
-      RequirePositiveStaticInteger(launch_grid.value()[1], "launch grid y");
+  RequirePositiveStaticInteger(launch_grid.value()[0], "launch grid x");
+  RequirePositiveStaticInteger(launch_grid.value()[1], "launch grid y");
 
   ffi::Optional<ffi::Array<TTBufferMetadata>> buffer_table =
       frontend->GetAttr<ffi::Array<TTBufferMetadata>>(kBufferMetadataTableAttr);
@@ -3717,25 +3881,105 @@ IRModule FormProgram(const IRModule &input) {
     ThrowMalformed("function-level tt.buffer_metadata_table is missing");
   }
 
+  IndexBufferMetadata(buffer_table.value());
   Stmt kernel_body = StripLogicalCoreLoops(frontend, launch_grid.value());
+  VerifyFormationOperations(kernel_body);
   if (!frontend->GetAttr<Integer>("tt.topology_normalized")
            .value_or(Integer(0))->value)
     ThrowMalformed("input requires NormalizeTenstorrentTopology");
-  VerifyFormationOperations(kernel_body);
+}
+
+GridPlan FormGridProgram(const IRModule &input) {
+  const auto &[global, base] = *input->functions.begin();
+  PrimFunc frontend = Downcast<PrimFunc>(base);
+  auto grid = frontend->GetAttr<ffi::Array<PrimExpr>>(kLaunchGridAttr).value();
+  int64_t gx = Downcast<IntImm>(grid[0])->value;
+  int64_t gy = Downcast<IntImm>(grid[1])->value;
+  if (gx > std::numeric_limits<int64_t>::max() / gy)
+    ThrowMalformed("[FormTenstorrentGridProgram] grid task count overflows");
   For xloop = Downcast<For>(frontend->body);
   For yloop = Downcast<For>(xloop->body);
-  return FormMulticoreProgram(
-      input, frontend, target.value(), frontend_global.value()->name_hint,
-      target_arch.value(), grid_x, grid_y, kernel_body, xloop->loop_var,
-      yloop->loop_var, buffer_table.value());
+  ffi::Array<GridTask> tasks;
+  for (int64_t id = 0; id < gx * gy; ++id)
+    tasks.push_back(GridTask(id, id / gy, id % gy));
+  return GridPlan(global->name_hint, frontend, input->attrs, yloop->body,
+                  xloop->loop_var, yloop->loop_var, gx, gy, tasks);
+}
+
+void ValidateGridPlan(const IRModule &input, const GridPlan &plan) {
+  if (input->functions.size() != 1)
+    ThrowMalformed("[PlanTenstorrentCorePrograms] stale GridPlan entry count");
+  const auto &[global, base] = *input->functions.begin();
+  if (global->name_hint != plan->operation ||
+      !ffi::StructuralEqual()(base, plan->frontend) ||
+      !ffi::StructuralEqual()(input->attrs, plan->module_attrs))
+    ThrowMalformed("[PlanTenstorrentCorePrograms] stale GridPlan owner or metadata");
+  auto frontend = base.as<PrimFunc>();
+  if (!frontend.has_value())
+    ThrowMalformed("[PlanTenstorrentCorePrograms] invalid GridPlan frontend");
+  auto grid = frontend.value()->GetAttr<ffi::Array<PrimExpr>>(kLaunchGridAttr);
+  if (!grid.has_value() || grid.value().size() != 2 ||
+      !as_const_int(grid.value()[0]) || !as_const_int(grid.value()[1]) ||
+      *as_const_int(grid.value()[0]) != plan->grid_x ||
+      *as_const_int(grid.value()[1]) != plan->grid_y ||
+      plan->grid_x <= 0 || plan->grid_y <= 0 ||
+      plan->tasks.size() / plan->grid_y != plan->grid_x ||
+      plan->tasks.size() % plan->grid_y != 0)
+    ThrowMalformed("[PlanTenstorrentCorePrograms] malformed GridPlan grid");
+  auto xloop = frontend.value()->body.as<ForNode>();
+  auto yloop = xloop ? xloop->body.as<ForNode>() : nullptr;
+  if (!yloop || !yloop->body.same_as(plan->body) ||
+      !xloop->loop_var.same_as(plan->core_x) ||
+      !yloop->loop_var.same_as(plan->core_y))
+    ThrowMalformed("[PlanTenstorrentCorePrograms] stale GridPlan body or binders");
+  for (size_t id = 0; id < plan->tasks.size(); ++id) {
+    const GridTask &task = plan->tasks[id];
+    if (!task.defined() || task->task_id != static_cast<int64_t>(id) ||
+        task->x != static_cast<int64_t>(id) / plan->grid_y ||
+        task->y != static_cast<int64_t>(id) % plan->grid_y)
+      ThrowMalformed("[PlanTenstorrentCorePrograms] malformed GridPlan tasks");
+  }
 }
 
 } // namespace
 
+tvm::transform::Pass ValidateTenstorrentDeviceProgramInput() {
+  return tvm::transform::CreateModulePass(
+      [](IRModule mod, const tvm::transform::PassContext &) {
+        ValidateDeviceProgramInput(mod);
+        return mod;
+      }, 0, "tl.tenstorrent.ValidateTenstorrentDeviceProgramInput", {});
+}
+
+tvm::transform::Pass FormTenstorrentGridProgram() {
+  return tvm::transform::CreateModulePass(
+      [](IRModule mod, const tvm::transform::PassContext &) {
+        mod = WithoutAttr(mod, kGridPlanAttr);
+        ValidateDeviceProgramInput(mod);
+        return WithAttr(mod, kGridPlanAttr, FormGridProgram(mod));
+      }, 0, "tl.tenstorrent.FormTenstorrentGridProgram", {});
+}
+
+tvm::transform::Pass PlanTenstorrentCorePrograms() {
+  return tvm::transform::CreateModulePass(
+      [](IRModule mod, const tvm::transform::PassContext &) {
+        auto raw = mod->attrs.GetAttr<ffi::ObjectRef>(kGridPlanAttr);
+        if (!raw.has_value() || !raw.value().as<GridPlanNode>())
+          ThrowMalformed("[PlanTenstorrentCorePrograms] missing or invalid GridPlan");
+        GridPlan plan = Downcast<GridPlan>(raw.value());
+        mod = WithoutAttr(mod, kGridPlanAttr);
+        ValidateGridPlan(mod, plan);
+        ValidateDeviceProgramInput(mod);
+        return PlanCorePrograms(mod, plan);
+      }, 0, "tl.tenstorrent.PlanTenstorrentCorePrograms", {});
+}
+
 tvm::transform::Pass FormTenstorrentDeviceProgram() {
   auto pass_func = [](IRModule mod,
                       const tvm::transform::PassContext &context) {
-    return FormProgram(mod);
+    mod = ValidateTenstorrentDeviceProgramInput()(mod);
+    mod = FormTenstorrentGridProgram()(mod);
+    return PlanTenstorrentCorePrograms()(mod);
   };
   return tvm::transform::CreateModulePass(
       pass_func, 0, "tl.tenstorrent.FormTenstorrentDeviceProgram", {});
@@ -3743,8 +3987,15 @@ tvm::transform::Pass FormTenstorrentDeviceProgram() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = ffi::reflection;
-  refl::GlobalDef().def("tl.tenstorrent.transform.FormTenstorrentDeviceProgram",
-                        FormTenstorrentDeviceProgram);
+  refl::GlobalDef()
+      .def("tl.tenstorrent.transform.ValidateTenstorrentDeviceProgramInput",
+           ValidateTenstorrentDeviceProgramInput)
+      .def("tl.tenstorrent.transform.FormTenstorrentGridProgram",
+           FormTenstorrentGridProgram)
+      .def("tl.tenstorrent.transform.PlanTenstorrentCorePrograms",
+           PlanTenstorrentCorePrograms)
+      .def("tl.tenstorrent.transform.FormTenstorrentDeviceProgram",
+           FormTenstorrentDeviceProgram);
 }
 
 } // namespace tenstorrent

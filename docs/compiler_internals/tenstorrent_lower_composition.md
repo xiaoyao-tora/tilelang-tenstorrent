@@ -6,6 +6,27 @@ verifier 检查的 Device IR；不新增 TTL Codegen、运行时或硬件能力�
 后续 Flash Attention 扩展的高阶 Tensor 切片、keepdims 和 v8 精度区域合同见
 [Flash Attention Lower](tenstorrent_flash_attention_lower.md)。
 
+## Pass12 的三个真实子阶段
+
+`FormTenstorrentDeviceProgram` 保留外层 ModulePass 和 14 阶段顺序，内部依次执行
+`ValidateTenstorrentDeviceProgramInput`、`FormTenstorrentGridProgram`、
+`PlanTenstorrentCorePrograms`。TVM pass instrument 能分别观察三个子阶段。
+
+校验先检查安全结构和 buffer metadata，再检查操作支持，最后检查 topology 标记。
+网格阶段仅增加临时 `tt.internal.grid_plan`：一个共享 PrimFunc/body、Core binders、
+输入属性和按 `task_id = x * gy + y` 排列的轻量任务。独立重跑会重建计划。
+规划阶段拒绝缺失、错误类型、过期 owner/body/metadata 或不完整任务，并重新校验输入合同。
+网格尺寸按整数值核对，支持与逻辑 Core 循环一致的 int32/int64 静态网格。
+JSON 重载后的共享节点即使保持计划引用一致，也必须满足 serial、零起点等输入规则。
+规划器按核即时替换坐标，
+继续使用原有 planner、全局通信协调、共享 slot 参数化、metadata interning 和表压缩。
+最终 Device 模块及 structured rollback 不携带临时属性。
+
+GridPlan 支持反射、JSON 往返和 `show_meta=True` metadata 输出。JSON 重载保持共享引用；
+打印快照中的 metadata 也能重建输入模块并继续规划。通用 TVMScript parser 会为 structured
+函数添加 root block，原始 dotted call annotations 也不是合法 Python keyword；它不是
+直接重放这些 structured 文本的无损入口。上述限制不改变保存的 Pass11/12 文本。
+
 ## 已补齐的路径
 
 | 路径 | Lower 行为 |

@@ -88,6 +88,25 @@ def test_pipeline_materializes_bounded_windows(stages, extent, start, arch):
             assert not variables, "pipeline iteration scalar must be specialized in final Device IR"
     assert sum(call.op.name == "tl.tt.dfb_release" for call in calls) == len(dfbs)
     assert sum(call.op.name == wait for call in calls) == 3 * extent
+    pending = set()
+    for call in transfers:
+        name = call.op.name
+        if name not in {
+            issue, wait, "tl.tt.dfb_to_tensor_nd", "tl.tt.dfb_pipe_send"
+        }:
+            continue
+        resource = int(call.args[1 if name in {issue, "tl.tt.dfb_pipe_send"} else 0])
+        assert 0 <= resource < len(dfbs)
+        if name in {issue, "tl.tt.dfb_to_tensor_nd"}:
+            assert resource not in pending
+            pending.add(resource)
+        elif name == wait:
+            assert int(call.args[1]) == 1
+            assert resource in pending
+            pending.remove(resource)
+        else:
+            assert resource not in pending, "forwarding must follow copy completion"
+    assert not pending
     assert not any(isinstance(f.body, tirx.For) for f in mod.functions.values())
     repeated = lower_pipeline(func, arch)
     ir.assert_structural_equal(mod, repeated)
@@ -95,6 +114,22 @@ def test_pipeline_materializes_bounded_windows(stages, extent, start, arch):
     assert ir.save_json(mod) == ir.save_json(repeated)
     ir.assert_structural_equal(mod, ir.load_json(ir.save_json(mod)))
     ir.assert_structural_equal(mod, VerifyTenstorrentDeviceIR()(mod))
+
+
+@pytest.mark.parametrize("stages", [0, 1, 2, 8])
+def test_loop_plan_keeps_input_immutable_and_reusable(stages):
+    func = make_pipeline(stages=stages, extent=3, start=4)
+    original = ir.save_json(func)
+    first = lower_pipeline(func)
+    assert ir.save_json(func) == original
+    second = lower_pipeline(func)
+    assert ir.save_json(func) == original
+    assert ir.save_json(first) == ir.save_json(second)
+    if stages:
+        assert int(first.attrs["tt.pipeline_stages"]) == stages
+        assert int(first.attrs["tt.pipeline_extent"]) == 3
+    else:
+        assert "tt.pipeline_stages" not in first.attrs
 
 
 def test_pipeline_explicit_capacity_preserved_and_insufficient_diagnosed():
