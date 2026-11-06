@@ -425,7 +425,9 @@ public:
                                              DFBStorageGroupDescriptorNode);
 };
 
-/*! \brief Schema v5 persistent fragment, separate from published DFB values. */
+/*! \brief Persistent fragment, separate from published DFB values.
+ * Current shared-grid descriptors use a Core-local accumulator_id; the Core
+ * domain and occurrence relation complete the instance identity. */
 class AccumulatorDescriptorNode : public ffi::Object {
 public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
@@ -461,7 +463,8 @@ public:
                                              AccumulatorDescriptorNode);
 };
 
-/*! \brief One immutable compute-local value in the schema v7 def-use graph. */
+/*! \brief One immutable compute-local value in the Device def-use graph.
+ * Current shared-grid value/predecessor/accumulator IDs are Core-local. */
 class ComputeValueDescriptorNode : public ffi::Object {
 public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =

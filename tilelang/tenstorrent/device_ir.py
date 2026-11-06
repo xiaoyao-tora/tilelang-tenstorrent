@@ -481,7 +481,11 @@ class DFBStorageGroupDescriptor(Node):
 
 @tvm_ffi.register_object("tl.tenstorrent.AccumulatorDescriptor")
 class AccumulatorDescriptor(Node):
-    """One persistent fragment, retained until all ``full_k_tiles`` updates finish."""
+    """One persistent fragment contract.
+
+    In current shared-grid Device IR, ``accumulator_id`` is local to the active
+    Core; the family Core domain and occurrence relation identify the instance.
+    """
 
     def __init__(self, accumulator_id, accumulator_region, input_dtype, accumulation_dtype, output_dtype, full_k_tiles, source_span):
         self.__init_handle_by_constructor__(
@@ -498,7 +502,11 @@ class AccumulatorDescriptor(Node):
 
 @tvm_ffi.register_object("tl.tenstorrent.ComputeValueDescriptor")
 class ComputeValueDescriptor(Node):
-    """Immutable fragment version; previous and accumulator IDs use -1 when absent."""
+    """Immutable fragment version with Core-local current-stage IDs.
+
+    ``previous_value_id`` and ``accumulator_id`` use -1 when absent. Versioned
+    legacy artifacts retain their historical globally unique ID contract.
+    """
 
     def __init__(self, value_id, buffer, version, previous_value_id, accumulator_id, source_span):
         self.__init_handle_by_constructor__(

@@ -414,6 +414,67 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
     assert transform.VerifyTenstorrentDeviceIR()(modules[-1]).same_as(modules[-1])
 
 
+def test_summa_accumulator_identity_is_spmd_local():
+    from examples.tenstorrent.summa import make_summa
+
+    modules = [
+        lower(
+            make_summa(
+                core_m=cores,
+                core_n=cores,
+                k_stages=2,
+                block_m=32,
+                block_n=32,
+                block_k=32,
+            )
+        )
+        for cores in (1, 2, 4)
+    ]
+    for mod in modules:
+        (family,) = mod.attrs["tt.accumulator_families"]
+        assert set(_column_values(family.fields["accumulator_id"])) == {0}
+        trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
+        accumulator_operands = []
+        for call in calls(trisc.body):
+            if call.op.name in (
+                "tl.tt.accumulator_init",
+                "tl.tt.accumulator_materialize",
+            ):
+                accumulator_operands.append(call.args[0])
+            elif call.op.name == "tl.tt.gemm_update":
+                accumulator_operands.append(call.args[2])
+        assert accumulator_operands
+        assert all(isinstance(operand, tirx.IntImm) and int(operand) == 0 for operand in accumulator_operands)
+        diagnostic = expanded(mod)
+        assert transform.VerifyTenstorrentDeviceIR()(diagnostic).same_as(diagnostic)
+
+
+def test_duplicate_accumulator_local_id_on_one_core_is_rejected():
+    from examples.tenstorrent.summa import make_summa
+
+    mod = lower(
+        make_summa(
+            core_m=2,
+            core_n=2,
+            k_stages=2,
+            block_m=32,
+            block_n=32,
+            block_k=32,
+        )
+    )
+    families = list(mod.attrs["tt.accumulator_families"])
+    family = families[0]
+    fields = dict(family.fields)
+    fields["core_begin_x"] = D.DeviceIRIntColumn(0, 0, 4, [0, 0, 1, 1])
+    fields["core_begin_y"] = D.DeviceIRIntColumn(0, 0, 4, [0, 0, 0, 1])
+    fields["core_end_x"] = D.DeviceIRIntColumn(0, 0, 4, [1, 1, 2, 2])
+    fields["core_end_y"] = D.DeviceIRIntColumn(0, 0, 4, [1, 1, 1, 2])
+    families[0] = D.DeviceIRDescriptorFamily(family.prototype, family.positions, fields, family.source_parts)
+    malformed = mod.with_attr("tt.accumulator_families", families)
+    with pytest.raises(ValueError, match="duplicate Core-local accumulator ID"):
+        transform.VerifyTenstorrentDeviceIR()(malformed)
+
+
 def test_current_family_column_length_mismatch_is_rejected():
     mod = lower(point_transfer)
     families = list(mod.attrs["tt.communication_step_families"])

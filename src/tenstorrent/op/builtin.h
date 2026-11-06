@@ -104,7 +104,9 @@ TVM_DLL const Op &compute_value_load();
 TVM_DLL const Op &compute_value_store();
 TVM_DLL const Op &compute_value_gemm();
 // Schema v5: init(id), update(lhs, rhs, id, transpose_a, transpose_b),
-// materialize(id, output_dfb). Materialization is the sole narrowing point.
+// materialize(id, output_dfb). Current shared-grid Device IR interprets id in
+// the current Core; versioned legacy schemas retain their global IDs.
+// Materialization is the sole narrowing point.
 TVM_DLL const Op &accumulator_init();
 TVM_DLL const Op &gemm_update();
 TVM_DLL const Op &accumulator_materialize();

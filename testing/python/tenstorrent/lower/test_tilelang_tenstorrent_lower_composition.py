@@ -5,7 +5,7 @@ import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
-from tvm import ir
+from tvm import ir, tirx
 
 from testing.python.tenstorrent._support.reference import TARGET, _calls, _round, interpret
 
@@ -21,6 +21,19 @@ def lower(program, version=7):
 
 def lower_result(program):
     return lower_tenstorrent_ir(tvm.IRModule({"main": program}), TARGET)
+
+
+def _column_values(column):
+    values = list(map(int, column.values))
+    period = int(column.period)
+    return [
+        values[row % period] + int(column.step) * (row // period)
+        if period
+        else values[row]
+        if values
+        else int(column.start) + int(column.step) * row
+        for row in range(int(column.count))
+    ]
 
 
 def transpose_fragment(dtype="float32", source_fragment=False):
@@ -102,6 +115,32 @@ def test_multicore_values_have_isolated_versions_and_numeric_outputs():
         for value in definitions
     }
     assert domains == {(0, 0, 1, 1), (1, 0, 2, 1)}
+
+
+def test_multicore_values_use_spmd_local_definition_ids():
+    mod = lower_result(multicore_values())
+    assert all(len(set(_column_values(family.fields["value_id"]))) == 1 for family in mod.attrs["tt.compute_value_families"])
+    trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
+    value_operands = []
+
+    def visit(node):
+        if not isinstance(node, tirx.Call) or not hasattr(node.op, "name"):
+            return
+        if node.op.name in (
+            "tl.tt.compute_value",
+            "tl.tt.compute_value_gemm",
+            "tl.tt.compute_value_store",
+            "tl.tt.compute_value_load",
+        ):
+            value_operands.append(node.args[0])
+        if node.op.name == "tl.tt.compute_value_gemm" and int(node.args[3]) >= 0:
+            value_operands.append(node.args[3])
+        for value in node.annotations.get("tt.value_inputs", []):
+            value_operands.append(value)
+
+    tirx.stmt_functor.post_order_visit(trisc.body, visit)
+    assert value_operands
+    assert all(isinstance(operand, tirx.IntImm) for operand in value_operands)
 
 
 def pipe_values():
@@ -406,7 +445,4 @@ def pipeline_carried_fragment():
 def test_loop_carried_ordinary_fragment_requires_explicit_spill_plan():
     mod = lower_result(pipeline_carried_fragment())
     assert str(mod.attrs["tt.ir_stage"]) == "structured"
-    assert any(
-        "carries a value across iterations" in str(reason)
-        for reason in mod.attrs["tt.deferred_reasons"]
-    )
+    assert any("carries a value across iterations" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])

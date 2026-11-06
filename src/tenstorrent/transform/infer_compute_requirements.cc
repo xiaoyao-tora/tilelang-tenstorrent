@@ -57,11 +57,22 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
     bool requires_fp32 = false;
     bool has_fp32_dfb_gemm = false;
     bool has_bf16_dfb_gemm = false;
-    for (const ComputeValueDescriptor &value :
-         mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
-                kComputeValueTableAttr)
-             .value_or(ffi::Array<ComputeValueDescriptor>()))
-      requires_fp32 |= value->dtype == DataType::Float(32);
+    auto value_families = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
+        kComputeValueFamiliesAttr);
+    if (value_families.has_value()) {
+      for (const DeviceIRDescriptorFamily &family : value_families.value()) {
+        auto value = family->prototype.as<ComputeValueDescriptor>();
+        Check(value.has_value(),
+              "compute-value family has the wrong prototype type");
+        requires_fp32 |= value.value()->dtype == DataType::Float(32);
+      }
+    } else {
+      for (const ComputeValueDescriptor &value :
+           mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
+                  kComputeValueTableAttr)
+               .value_or(ffi::Array<ComputeValueDescriptor>()))
+        requires_fp32 |= value->dtype == DataType::Float(32);
+    }
     PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
       if (const auto *cast = node.as<CastNode>())
         requires_fp32 |= cast->dtype == DataType::Float(32) &&
@@ -105,9 +116,23 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       full = "forbidden";
     }
     ffi::Array<AccumulatorDescriptor> requirements;
-    ffi::Array<AccumulatorDescriptor> table =
-        mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr)
-            .value_or(ffi::Array<AccumulatorDescriptor>());
+    ffi::Array<AccumulatorDescriptor> table;
+    auto accumulator_families =
+        mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
+            kAccumulatorFamiliesAttr);
+    if (accumulator_families.has_value()) {
+      for (const DeviceIRDescriptorFamily &family :
+           accumulator_families.value()) {
+        auto accumulator = family->prototype.as<AccumulatorDescriptor>();
+        Check(accumulator.has_value(),
+              "accumulator family has the wrong prototype type");
+        table.push_back(accumulator.value());
+      }
+    } else {
+      table =
+          mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr)
+              .value_or(ffi::Array<AccumulatorDescriptor>());
+    }
     for (const AccumulatorDescriptor &accumulator : table) {
       Check(accumulator.defined() &&
                 IsSupportedAccumulatorDTypeTriple(
@@ -616,8 +641,10 @@ tvm::transform::Pass InferTenstorrentComputeRequirements() {
                            .value_or(Integer(0))
                            ->value == 9;
     bool current_families = HasCurrentDeviceFamilies(mod);
-    mod = ExpandCurrentDeviceTables(mod);
-    mod = ExpandDeviceProgram(mod);
+    if (!current_families) {
+      mod = ExpandCurrentDeviceTables(mod);
+      mod = ExpandDeviceProgram(mod);
+    }
     IRModule result = mod;
     result.CopyOnWrite();
     for (const auto &[global, base] : mod->functions) {
@@ -647,10 +674,8 @@ tvm::transform::Pass InferTenstorrentComputeRequirements() {
       }
     }
     result = DeviceMetadataInterner::Rewrite(result);
-    if (current_families) {
-      result = DiscardCurrentDeviceExpansionMetadata(result);
-      return ParameterizeCurrentDeviceTables(result);
-    }
+    if (current_families)
+      return result;
     return CompactDeviceProgram(result, was_compact);
   };
   return tvm::transform::CreateModulePass(

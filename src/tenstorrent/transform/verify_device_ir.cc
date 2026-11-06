@@ -202,6 +202,8 @@ private:
   arith::Analyzer analyzer_;
 };
 
+using CurrentComputeKey = std::tuple<int64_t, int64_t, int64_t>;
+
 void VerifyNoForbiddenOps(const tirx::PrimFunc &func, const std::string &symbol,
                           bool current = false) {
   tirx::PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
@@ -3777,9 +3779,15 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       VerifyDFBTable(dfbs, tensor_table, launch_grid, true, false);
   auto accumulators =
       mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr);
+  std::map<CurrentComputeKey, int64_t> current_accumulator_ids;
   std::map<int64_t, AccumulatorDescriptor> current_accumulators;
-  if (accumulators.has_value())
-    for (const AccumulatorDescriptor &accumulator : accumulators.value()) {
+  if (accumulators.has_value()) {
+    auto local_ids = RequireModuleAttr<ffi::Array<Integer>>(
+        mod, "tt.expanded_accumulator_local_ids");
+    Check(local_ids.size() == accumulators.value().size(),
+          "expanded accumulator local-ID relation has the wrong size");
+    for (size_t index = 0; index < accumulators.value().size(); ++index) {
+      const AccumulatorDescriptor &accumulator = accumulators.value()[index];
       Check(accumulator.defined() && accumulator->accumulator_id >= 0,
             "invalid accumulator descriptor");
       Check(
@@ -3788,11 +3796,30 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
           "duplicate accumulator descriptor ID");
       VerifyDomain(accumulator->core_domain, launch_grid,
                    "accumulator core domain");
+      Check(
+          accumulator->core_domain->end->x ==
+                  accumulator->core_domain->begin->x + 1 &&
+              accumulator->core_domain->end->y ==
+                  accumulator->core_domain->begin->y + 1 &&
+              current_accumulator_ids
+                  .emplace(CurrentComputeKey{accumulator->core_domain->begin->x,
+                                             accumulator->core_domain->begin->y,
+                                             local_ids[index]->value},
+                           accumulator->accumulator_id)
+                  .second,
+          "duplicate Core-local accumulator descriptor ID");
     }
+  }
   auto values =
       mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(kComputeValueTableAttr);
-  if (values.has_value())
-    for (const ComputeValueDescriptor &value : values.value()) {
+  std::map<CurrentComputeKey, int64_t> current_value_ids;
+  if (values.has_value()) {
+    auto local_ids = RequireModuleAttr<ffi::Array<Integer>>(
+        mod, "tt.expanded_compute_value_local_ids");
+    Check(local_ids.size() == values.value().size(),
+          "expanded compute-value local-ID relation has the wrong size");
+    for (size_t index = 0; index < values.value().size(); ++index) {
+      const ComputeValueDescriptor &value = values.value()[index];
       Check(value.defined() && value->value_id >= 0 &&
                 value->buffer.defined() &&
                 value->value_kind == "compute_fragment" &&
@@ -3804,7 +3831,18 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             "invalid compute-local value descriptor");
       VerifyDomain(value->core_domain, launch_grid,
                    "compute value core domain");
+      Check(value->core_domain->end->x == value->core_domain->begin->x + 1 &&
+                value->core_domain->end->y ==
+                    value->core_domain->begin->y + 1 &&
+                current_value_ids
+                    .emplace(CurrentComputeKey{value->core_domain->begin->x,
+                                               value->core_domain->begin->y,
+                                               local_ids[index]->value},
+                             value->value_id)
+                    .second,
+            "duplicate Core-local compute value descriptor ID");
     }
+  }
   for (const PipeDescriptor &transport : transports) {
     Check(transport.defined() && transport->pipe_net_id >= 0 &&
               transport->event_index >= 0,

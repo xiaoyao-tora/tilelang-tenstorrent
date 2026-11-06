@@ -2539,11 +2539,9 @@ PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
 // remapping and explicit Pipe transfer matching cross this boundary.
 class DeviceIDRemapper : public StmtExprMutator {
 public:
-  DeviceIDRemapper(int64_t offset, int64_t accumulator_offset,
-                   int64_t value_offset,
+  DeviceIDRemapper(int64_t offset,
                    const std::vector<int64_t> *resource_ids = nullptr)
-      : offset_(offset), accumulator_offset_(accumulator_offset),
-        value_offset_(value_offset), resource_ids_(resource_ids) {}
+      : offset_(offset), resource_ids_(resource_ids) {}
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     auto args = call->args;
@@ -2559,34 +2557,21 @@ public:
       }
       args.Set(index, Integer(id));
     };
-    auto shift_value = [&](size_t index) {
-      int64_t value = *as_const_int(args[index]);
-      if (value >= 0)
-        args.Set(index, Integer(value + value_offset_));
-    };
     if (call->op.same_as(compute_value())) {
-      shift_value(0);
       for (size_t index = 1; index < args.size(); ++index)
         shift(index);
     } else if (call->op.same_as(compute_value_gemm())) {
-      shift_value(0);
       shift(1);
       shift(2);
-      shift_value(3);
     } else if (call->op.same_as(compute_value_store())) {
-      shift_value(0);
       shift(1);
-    } else if (call->op.same_as(compute_value_load())) {
-      shift_value(0);
     } else if (call->op.same_as(tenstorrent::accumulator_init()) ||
                call->op.same_as(tenstorrent::accumulator_materialize())) {
-      args.Set(0, Integer(*as_const_int(args[0]) + accumulator_offset_));
       if (call->op.same_as(tenstorrent::accumulator_materialize()))
         shift(1);
     } else if (call->op.same_as(tenstorrent::gemm_update())) {
       shift(0);
       shift(1);
-      args.Set(2, Integer(*as_const_int(args[2]) + accumulator_offset_));
     } else if (call->op.same_as(tenstorrent::dfb_compute())) {
       for (size_t index = 0; index < args.size(); ++index)
         shift(index);
@@ -2603,21 +2588,11 @@ public:
                call->op.same_as(tenstorrent::dfb_load())) {
       shift(0);
     }
-    auto attrs = call->annotations;
-    auto inputs = attrs.Get("tt.value_inputs");
-    if (inputs.has_value()) {
-      ffi::Array<Integer> remapped;
-      for (const Integer &value : Downcast<ffi::Array<Integer>>(inputs.value()))
-        remapped.push_back(Integer(value->value + value_offset_));
-      attrs.Set("tt.value_inputs", remapped);
-    }
-    return Call(call->dtype, call->op, args, attrs, op->span);
+    return Call(call->dtype, call->op, args, call->annotations, op->span);
   }
 
 private:
   int64_t offset_;
-  int64_t accumulator_offset_;
-  int64_t value_offset_;
   const std::vector<int64_t> *resource_ids_{nullptr};
 };
 
@@ -3115,7 +3090,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   std::vector<int> effects(frontend->params.size(), 0);
   TransferKeys transfer_keys;
   std::vector<PipeEndpoint> endpoints;
-  int64_t accumulator_offset = 0, value_offset = 0;
   int64_t pipeline_stages = 0, pipeline_extent = 0;
   ffi::String pipeline_wait_policy;
   ffi::Map<ffi::String, Integer> storage_groups;
@@ -3212,22 +3186,17 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     }
     for (const AccumulatorDescriptor &accumulator : planner.Accumulators()) {
       accumulators.push_back(AccumulatorDescriptor(
-          accumulator->accumulator_id + accumulator_offset,
-          accumulator->accumulator_region, accumulator->input_dtype,
-          accumulator->accumulation_dtype, accumulator->output_dtype,
-          accumulator->full_k_tiles, domain, accumulator->source_span));
+          accumulator->accumulator_id, accumulator->accumulator_region,
+          accumulator->input_dtype, accumulator->accumulation_dtype,
+          accumulator->output_dtype, accumulator->full_k_tiles, domain,
+          accumulator->source_span));
     }
     for (const ComputeValueDescriptor &value : planner.ComputeValues()) {
       compute_values.push_back(ComputeValueDescriptor(
-          value->value_id + value_offset, value->buffer, value->version,
-          value->previous_value_id < 0
-              ? -1
-              : value->previous_value_id + value_offset,
-          value->accumulator_id < 0
-              ? -1
-              : value->accumulator_id + accumulator_offset,
-          value->value_kind, value->logical_shape, value->compute_tile_shape,
-          value->dtype, value->owner_slot, domain, value->materialization_refs,
+          value->value_id, value->buffer, value->version,
+          value->previous_value_id, value->accumulator_id, value->value_kind,
+          value->logical_shape, value->compute_tile_shape, value->dtype,
+          value->owner_slot, domain, value->materialization_refs,
           value->source_span));
     }
     for (PipeEndpoint endpoint : planner.Endpoints()) {
@@ -3245,7 +3214,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                                 : effect == "output" ? 2
                                                      : 1;
     }
-    DeviceIDRemapper remap(0, accumulator_offset, value_offset, &resource_ids);
+    DeviceIDRemapper remap(0, &resource_ids);
     size_t slot_index = 0;
     for (const ffi::String &slot :
          ffi::Array<ffi::String>{"trisc", "ncrisc", "brisc"}) {
@@ -3264,8 +3233,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
           shared_tensor_indices[slot_index].insert(tensor->value);
       ++slot_index;
     }
-    accumulator_offset += planner.AccumulatorCount();
-    value_offset += planner.ComputeValues().size();
   }
   if (!pipeline_extent)
     storage_groups = PlanNonPipelineStorageGroups(dfbs, shared_bodies,

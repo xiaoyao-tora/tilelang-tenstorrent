@@ -30,15 +30,18 @@ PipeNet communication and independent pipelined value chains are described in
 
 ## Authoritative IR
 
-`tt.compute_value_table` contains typed `ComputeValueDescriptor` entries:
+Current Device IR stores typed `ComputeValueDescriptor` prototypes and instance
+relations in `tt.compute_value_families`. Each ID in the shared body is local to
+the current Core; diagnostic expansion may synthesize a globally numbered
+`tt.compute_value_table` without changing the persisted contract.
 
 | Field | Meaning |
 | --- | --- |
-| `value_id` | Operation-local immutable definition ID |
+| `value_id` | Core-local immutable definition ID |
 | `buffer` | Logical fragment identity, shape and dtype |
 | `version` | Zero-based write version of that logical Buffer |
-| `previous_value_id` | Previous write to that Buffer, or -1 |
-| `accumulator_id` | Owning or single contributing accumulator, or -1 |
+| `previous_value_id` | Previous Core-local write to that Buffer, or -1 |
+| `accumulator_id` | Owning Core-local accumulator, or -1 |
 | `source_span` | Original source location |
 
 Multiple contributing accumulator roots are recovered from the body def-use
@@ -60,11 +63,11 @@ tile geometry. `tt.access_maps` / `tt.input_shapes` describe only DFB operands;
 compute-local operands. Tensor exports use an explicit compute cast when their
 storage dtype differs; they never silently retag a value.
 
-The verifier checks definitions, predecessor chains, exact expression effects,
-geometry, ownership, accumulator provenance, complete K, final output dtype
-and precision requirements independently of the frontend. JSON roundtrips
-retain the complete contract. Runtime objects and frontend side tables are not
-needed for codegen.
+The verifier resolves value and accumulator IDs using the active Core before it
+checks definitions, predecessor chains, exact expression effects, geometry,
+ownership, accumulator provenance, complete K, final output dtype and precision
+requirements independently of the frontend. JSON roundtrips retain the complete
+contract. Runtime objects and frontend side tables are not needed for codegen.
 
 ## Materialization and lifetime
 
