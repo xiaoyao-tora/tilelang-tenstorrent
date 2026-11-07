@@ -483,6 +483,7 @@ DFBStorageGroupDescriptor::DFBStorageGroupDescriptor(
     ffi::Array<PrimExpr> tile_shape, ffi::Array<PrimExpr> block_shape_in_tiles,
     PrimExpr block_count, ffi::String producer_slot, CoreDomain producer_domain,
     ffi::String consumer_slot, CoreDomain consumer_domain,
+    PrimExpr transaction_count_or_loop_relation,
     ffi::Optional<TensorStorageBacking> storage_backing, Span source_span) {
   auto node = ffi::make_object<DFBStorageGroupDescriptorNode>();
   node->storage_group_id = storage_group_id;
@@ -494,6 +495,8 @@ DFBStorageGroupDescriptor::DFBStorageGroupDescriptor(
   node->producer_domain = std::move(producer_domain);
   node->consumer_slot = std::move(consumer_slot);
   node->consumer_domain = std::move(consumer_domain);
+  node->transaction_count_or_loop_relation =
+      std::move(transaction_count_or_loop_relation);
   node->storage_backing = std::move(storage_backing);
   node->source_span = std::move(source_span);
   data_ = std::move(node);
@@ -514,6 +517,9 @@ void DFBStorageGroupDescriptorNode::RegisterReflection() {
       .def_ro("consumer_slot", &DFBStorageGroupDescriptorNode::consumer_slot)
       .def_ro("consumer_domain",
               &DFBStorageGroupDescriptorNode::consumer_domain)
+      .def_ro(
+          "transaction_count_or_loop_relation",
+          &DFBStorageGroupDescriptorNode::transaction_count_or_loop_relation)
       .def_ro("storage_backing",
               &DFBStorageGroupDescriptorNode::storage_backing)
       .def_ro("source_span", &DFBStorageGroupDescriptorNode::source_span);
@@ -853,6 +859,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
               ffi::Array<PrimExpr> block_shape_in_tiles, PrimExpr block_count,
               ffi::String producer_slot, CoreDomain producer_domain,
               ffi::String consumer_slot, CoreDomain consumer_domain,
+              PrimExpr transaction_count_or_loop_relation,
               ffi::Optional<TensorStorageBacking> storage_backing,
               Span source_span) {
              return DFBStorageGroupDescriptor(
@@ -860,6 +867,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(block_shape_in_tiles), std::move(block_count),
                  std::move(producer_slot), std::move(producer_domain),
                  std::move(consumer_slot), std::move(consumer_domain),
+                 std::move(transaction_count_or_loop_relation),
                  std::move(storage_backing), std::move(source_span));
            })
       .def("tl.tenstorrent.IsSupportedAccumulatorDTypeTriple",

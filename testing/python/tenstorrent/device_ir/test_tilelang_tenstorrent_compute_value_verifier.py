@@ -18,9 +18,7 @@ from testing.python.tenstorrent._support.reference import _core_statements, _wit
 
 def device(gemm=False):
     func = gemm_epilogue("store") if gemm else fragment_program()
-    return D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": func}), TARGET)
-    )
+    return D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": func}), TARGET))
 
 
 def rewrite_calls(mod, edit):
@@ -89,7 +87,7 @@ def test_duplicate_value_definition():
     statements = _core_statements(trisc)
     definition = next(s for s in statements if isinstance(s, tirx.Evaluate) and s.value.op.name == "tl.tt.compute_value")
     mod.update_func(mod.get_global_var(str(trisc.attrs["global_symbol"])), _with_core_statements(trisc, [*statements, definition]))
-    check_rejected(mod, "duplicated|after release")
+    check_rejected(mod, "duplicated|after release|no active acquisition")
 
 
 def test_missing_release_and_release_before_read():
@@ -108,7 +106,7 @@ def test_missing_release_and_release_before_read():
         premature.get_global_var(str(func.attrs["global_symbol"])),
         _with_core_statements(func, [statements[release], *statements[:release], *statements[release + 1 :]]),
     )
-    check_rejected(premature, "must follow wait|release precedes")
+    check_rejected(premature, "must follow wait|release precedes|no active acquisition")
 
 
 def test_accumulator_zero_initialization_cannot_be_forged():

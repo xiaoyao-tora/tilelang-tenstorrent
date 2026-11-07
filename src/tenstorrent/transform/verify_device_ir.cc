@@ -1087,7 +1087,8 @@ ffi::Array<PrimExpr> LocalTransferShape(const ffi::Array<PrimExpr> &shape,
 using BoundVars = std::unordered_set<const VarNode *>;
 
 void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
-                          const BoundVars *bound_vars = nullptr) {
+                          const BoundVars *bound_vars = nullptr,
+                          bool allow_stream_inplace = false) {
   Check(!call->args.empty(), "dfb_compute must have an output DFB");
   std::vector<DFBDescriptor> operands;
   std::unordered_set<int64_t> input_ids;
@@ -1100,7 +1101,7 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
     if (i)
       input_ids.insert(id);
   }
-  Check(!input_ids.count(operands[0]->dfb_id),
+  Check(allow_stream_inplace || !input_ids.count(operands[0]->dfb_id),
         "dfb_compute output must be a fresh generation");
   const DFBDescriptor &output = operands[0];
   ffi::String dtype = ComputeString(call, "tt.compute_dtype");
@@ -1716,6 +1717,8 @@ public:
     precision_epoch_ = 0;
     stored_values_.clear();
     dfb_roots_.clear();
+    active_dfb_transactions_.clear();
+    released_dfb_transactions_.clear();
     current_core_x_ = x;
     current_core_y_ = y;
     for (const auto &[id, value] : values_) {
@@ -1766,7 +1769,20 @@ public:
     Check(!precision_regions_ || value_epochs_.at(id) == precision_epoch_,
           "compute value crosses precision region without exact-dtype DFB "
           "snapshot");
+    for (const DFBTransaction &source : source_transactions_.at(id))
+      Check(!released_dfb_transactions_.count(source),
+            "compute value reads DFB provenance after release");
     return values_.at(id);
+  }
+  void AcquireDFB(int64_t id, int64_t transaction) {
+    active_dfb_transactions_[id] = transaction;
+  }
+  void ReleaseDFB(int64_t id, int64_t transaction) {
+    released_dfb_transactions_.insert({id, transaction});
+    auto active = active_dfb_transactions_.find(id);
+    if (active != active_dfb_transactions_.end() &&
+        active->second == transaction)
+      active_dfb_transactions_.erase(active);
   }
   std::set<int64_t> Expression(const Call &call, const DFBTable &dfbs) {
     arith::Analyzer analyzer;
@@ -1776,6 +1792,7 @@ public:
                                   label);
     };
     std::set<int64_t> sources;
+    std::set<DFBTransaction> source_transactions;
     for (size_t i = 1; i < call->args.size(); ++i)
       sources.insert(static_integer(call->args[i], "expression DFB input"));
     auto value_inputs = call->annotations.Get("tt.value_inputs");
@@ -1799,6 +1816,9 @@ public:
         Read(id);
         const auto &borrowed = sources_.at(id);
         sources.insert(borrowed.begin(), borrowed.end());
+        const auto &borrowed_transactions = source_transactions_.at(id);
+        source_transactions.insert(borrowed_transactions.begin(),
+                                   borrowed_transactions.end());
         for (const auto &[root, count] : value_k_.at(id)) {
           roots.insert(root);
           auto [it, inserted] = completed_k.emplace(root, count);
@@ -1812,6 +1832,9 @@ public:
     }
     for (size_t i = 1; i < call->args.size(); ++i) {
       int64_t input = static_integer(call->args[i], "DFB provenance input");
+      Check(active_dfb_transactions_.count(input),
+            "compute value reads DFB without an active acquisition");
+      source_transactions.insert({input, active_dfb_transactions_.at(input)});
       auto found = dfb_roots_.find(input);
       if (found != dfb_roots_.end()) {
         for (int64_t root : found->second) {
@@ -1884,6 +1907,7 @@ public:
       }
       value_k_[id] = completed_k;
       sources_[id] = sources;
+      source_transactions_[id] = source_transactions;
       Define(id);
     }
     if (!call->op.same_as(compute_value())) {
@@ -1966,6 +1990,13 @@ public:
     sources_[out] = sources_.at(old);
     sources_[out].insert(lhs);
     sources_[out].insert(rhs);
+    source_transactions_[out] = source_transactions_.at(old);
+    for (int64_t input : {lhs, rhs}) {
+      Check(active_dfb_transactions_.count(input),
+            "value GEMM reads DFB without an active acquisition");
+      source_transactions_[out].insert(
+          {input, active_dfb_transactions_.at(input)});
+    }
     Define(out);
     return sources_.at(out);
   }
@@ -2013,6 +2044,8 @@ public:
   }
 
 private:
+  using DFBTransaction = std::pair<int64_t, int64_t>;
+
   bool enabled_{false};
   bool current_device_{false};
   int64_t current_core_x_{-1};
@@ -2031,7 +2064,10 @@ private:
   std::set<int64_t> initialized_;
   std::map<int64_t, std::map<int64_t, int64_t>> value_k_;
   std::map<int64_t, std::set<int64_t>> sources_;
+  std::map<int64_t, std::set<DFBTransaction>> source_transactions_;
   std::map<int64_t, std::set<int64_t>> dfb_roots_;
+  std::map<int64_t, int64_t> active_dfb_transactions_;
+  std::set<DFBTransaction> released_dfb_transactions_;
   std::map<int64_t, int64_t> pipeline_iterations_;
   BoundVars bound_loop_vars_;
 };
@@ -2781,15 +2817,24 @@ CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
             !mod->attrs->dict.count(kInternalDFBTransactionRelationsAttr) &&
             !mod->attrs->dict.count(kPipelineRelationsAttr),
         "current Device IR cannot persist concrete storage-group maps");
-  auto families = RequireModuleAttr<ffi::Array<DeviceIRDescriptorFamily>>(
-      mod, kDFBFamiliesAttr);
+  bool stream_operands =
+      mod->GetAttr<Integer>("tt.stream_operands").value_or(Integer(0))->value ==
+      1;
+  auto families =
+      mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(kDFBFamiliesAttr);
   auto groups = RequireModuleAttr<ffi::Array<DFBStorageGroupDescriptor>>(
       mod, kDFBStorageGroupsAttr);
-  auto relations = RequireModuleAttr<ffi::Array<DFBStorageGroupRelation>>(
-      mod, kDFBStorageGroupRelationsAttr);
-  Check(relations.size() == families.size() &&
-            groups.empty() == families.empty(),
-        "current Device IR requires one storage relation per DFB family");
+  auto relations = mod->GetAttr<ffi::Array<DFBStorageGroupRelation>>(
+      kDFBStorageGroupRelationsAttr);
+  if (stream_operands) {
+    Check(!families.has_value() && !relations.has_value(),
+          "stream-centric Device IR cannot persist DFB generation relations");
+  } else {
+    Check(families.has_value() && relations.has_value() &&
+              relations.value().size() == families.value().size() &&
+              groups.empty() == families.value().empty(),
+          "current Device IR requires one storage relation per DFB family");
+  }
 
   CurrentStoragePlan result;
   auto pipeline_stages = mod->GetAttr<Integer>(kPipelineStagesAttr);
@@ -2814,6 +2859,11 @@ CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
         RequireStaticInteger(group->block_count, "storage group capacity");
     Check(capacity >= 1 && capacity <= 32,
           "storage group capacity must be in [1,32]");
+    int64_t transactions =
+        RequireStaticInteger(group->transaction_count_or_loop_relation,
+                             "storage group transaction count");
+    Check(transactions >= 1,
+          "storage group transaction count must be positive");
     Check(IsSupportedSlot(group->producer_slot) &&
               IsSupportedSlot(group->consumer_slot),
           "storage group has an invalid producer or consumer slot");
@@ -2848,9 +2898,12 @@ CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
     result.groups.emplace(group->storage_group_id, group);
   }
 
-  for (size_t family_id = 0; family_id < families.size(); ++family_id) {
-    const DeviceIRDescriptorFamily &family = families[family_id];
-    const DFBStorageGroupRelation &relation = relations[family_id];
+  if (stream_operands)
+    return result;
+
+  for (size_t family_id = 0; family_id < families.value().size(); ++family_id) {
+    const DeviceIRDescriptorFamily &family = families.value()[family_id];
+    const DFBStorageGroupRelation &relation = relations.value()[family_id];
     Check(relation.defined() &&
               relation->dfb_family_id == static_cast<int64_t>(family_id) &&
               family.defined() && family->positions.defined() &&
@@ -2902,7 +2955,7 @@ CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
             "DFB family and storage group contracts disagree");
     }
   }
-  Check(result.resource_groups.empty() == families.empty(),
+  Check(result.resource_groups.empty() == families.value().empty(),
         "current Device IR has incomplete storage-group resource relations");
   for (const auto &[group_id, resources] : result.ordered_resources) {
     Check(!resources.empty() && resources.begin()->first == 0,
@@ -2956,12 +3009,25 @@ void VerifyCurrentL1Budget(
   int64_t total_payload = 0;
   for (const auto &[group_id, group] : storage.groups) {
     std::set<CoreKey> cores;
-    for (const auto &[ordinal, id] : storage.ordered_resources.at(group_id)) {
-      Check(dfbs.count(id), "storage relation references a missing DFB");
-      auto uses = resource_cores.find(id);
+    bool stream_operands = mod->GetAttr<Integer>("tt.stream_operands")
+                               .value_or(Integer(0))
+                               ->value == 1;
+    if (stream_operands) {
+      Check(dfbs.count(group_id),
+            "logical stream descriptor references a missing DFB");
+      auto uses = resource_cores.find(group_id);
       Check(uses != resource_cores.end() && !uses->second.empty(),
-            "current Device DFB has no body use: " + std::to_string(id));
+            "current Device stream has no body use: " +
+                std::to_string(group_id));
       cores.insert(uses->second.begin(), uses->second.end());
+    } else {
+      for (const auto &[ordinal, id] : storage.ordered_resources.at(group_id)) {
+        Check(dfbs.count(id), "storage relation references a missing DFB");
+        auto uses = resource_cores.find(id);
+        Check(uses != resource_cores.end() && !uses->second.empty(),
+              "current Device DFB has no body use: " + std::to_string(id));
+        cores.insert(uses->second.begin(), uses->second.end());
+      }
     }
     const std::string label =
         "current Device storage group " + std::to_string(group_id);
@@ -3706,8 +3772,12 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   auto diagnostic_expansion =
       mod->GetAttr<Integer>("tt.current_device_table_expansion");
   if (diagnostic_expansion.has_value()) {
+    bool stream_operands = mod->GetAttr<Integer>("tt.stream_operands")
+                               .value_or(Integer(0))
+                               ->value == 1;
     Check(diagnostic_expansion.value()->value == 1 &&
-              mod->attrs->dict.count("tt.expanded_storage_group_descriptors"),
+              (stream_operands ||
+               mod->attrs->dict.count("tt.expanded_storage_group_descriptors")),
           "invalid current Device diagnostic expansion marker");
     IRModule parameterized = ParameterizeCurrentDeviceTables(mod);
     VerifyCurrentDeviceModule(std::move(parameterized));
@@ -3754,6 +3824,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       VerifyTensorTable(tensors, launch_grid, true, false);
   CurrentStoragePlan storage =
       VerifyCurrentStoragePlan(parameterized, tensor_table, launch_grid);
+  bool stream_operands = parameterized->GetAttr<Integer>("tt.stream_operands")
+                             .value_or(Integer(0))
+                             ->value == 1;
   mod = ExpandCurrentDeviceTables(mod);
   ffi::Array<DFBDescriptor> dfbs =
       RequireModuleAttr<ffi::Array<DFBDescriptor>>(mod, kDFBTableAttr);
@@ -3875,11 +3948,12 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
     int64_t last_use{-1};
     int64_t release_order{-1};
   };
-  using LocalKey = std::tuple<int64_t, int64_t, int64_t>;
+  using StreamKey = std::tuple<int64_t, int64_t, int64_t>;
+  using LocalKey = std::tuple<int64_t, int64_t, int64_t, int64_t>;
   using SlotKey = std::tuple<int64_t, int64_t, std::string>;
   std::map<LocalKey, LocalLifecycle> lifecycles;
   std::map<int64_t, std::set<CoreKey>> resource_cores;
-  std::map<LocalKey, int64_t> reservation_transactions;
+  std::map<StreamKey, int64_t> reservation_transactions;
   std::map<LocalKey, int64_t> reserve_events;
   std::map<LocalKey, int64_t> release_events;
   std::map<LocalKey, ffi::Array<PrimExpr>> tensor_load_shapes;
@@ -4075,9 +4149,10 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               "Tensor transfer references missing Tensor/DFB");
         const TensorDescriptor &tensor = tensor_table.at(tensor_id);
         const DFBDescriptor &dfb = dfb_table.at(dfb_id);
-        Check(dfb->tensor_backing.has_value() &&
-                  dfb->tensor_backing.value()->global_arg_index == tensor_id,
-              "Tensor transfer disagrees with DFB Tensor backing");
+        if (!stream_operands)
+          Check(dfb->tensor_backing.has_value() &&
+                    dfb->tensor_backing.value()->global_arg_index == tensor_id,
+                "Tensor transfer disagrees with DFB Tensor backing");
         Check(call->args.size() == 2 + 2 * tensor->shape.size(),
               "Tensor transfer rank/arity mismatch");
         Check(tensor->shape.size() >= dfb->block_shape_in_tiles.size(),
@@ -4242,9 +4317,18 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                                        "Device DFB transaction count"));
                   }
                 } else if (const auto *branch = stmt.as<IfThenElseNode>()) {
-                  count_reservations(branch->then_case, multiplier);
-                  if (branch->else_case.has_value())
-                    count_reservations(branch->else_case.value(), multiplier);
+                  PrimExpr condition =
+                      arith::Analyzer().Simplify(branch->condition);
+                  if (is_one(condition)) {
+                    count_reservations(branch->then_case, multiplier);
+                  } else if (is_zero(condition)) {
+                    if (branch->else_case.has_value())
+                      count_reservations(branch->else_case.value(), multiplier);
+                  } else {
+                    count_reservations(branch->then_case, multiplier);
+                    if (branch->else_case.has_value())
+                      count_reservations(branch->else_case.value(), multiplier);
+                  }
                 } else if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
                   count_reservations(realize->block->body, multiplier);
                 } else if (const auto *evaluate = stmt.as<EvaluateNode>()) {
@@ -4262,20 +4346,31 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 }
               };
           count_reservations(core_body, 1);
-          for (const auto &[resource, transactions] : block_reservations)
+          for (const auto &[resource, transactions] : block_reservations) {
+            Check(dfb_table.count(resource),
+                  "DFB reservation references a missing logical stream");
+            int64_t expected_transactions = RequireStaticInteger(
+                dfb_table.at(resource)->transaction_count_or_loop_relation,
+                "logical stream transaction count");
+            Check(transactions == expected_transactions,
+                  "DFB stream " + std::to_string(resource) + " has " +
+                      std::to_string(transactions) +
+                      " reservations but its structured loop relation "
+                      "requires " +
+                      std::to_string(expected_transactions) +
+                      "; transaction count disagrees");
             Check(reservation_transactions
-                      .emplace(LocalKey{x, y, resource}, transactions)
+                      .emplace(StreamKey{x, y, resource}, transactions)
                       .second,
-                  "DFB generation is reserved by multiple Core work blocks");
+                  "DFB stream is reserved by multiple Core work blocks");
+          }
           int64_t ordinal = 0;
           std::map<std::pair<int64_t, int64_t>, bool> sent_transfers;
           std::set<std::pair<int64_t, int64_t>> received_transfers;
-          auto state = [&](int64_t id) -> LocalLifecycle & {
-            Check(dfb_table.count(id),
-                  "Core work references missing DFB " + std::to_string(id));
-            resource_cores[id].insert({x, y});
-            return lifecycles[LocalKey{x, y, id}];
-          };
+          std::map<int64_t, int64_t> next_producer_transaction;
+          std::map<int64_t, int64_t> next_consumer_transaction;
+          std::map<int64_t, int64_t> active_producer_transaction;
+          std::map<int64_t, std::vector<int64_t>> active_consumer_transactions;
           auto id = [&](const Call &call, size_t index) {
             Check(index < call->args.size(),
                   "Core work DFB operand is missing");
@@ -4284,29 +4379,90 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                                             "inside preserved outer loops");
             return *as_const_int(simplified);
           };
+          auto state = [&](const LocalKey &key) -> LocalLifecycle & {
+            int64_t resource = std::get<2>(key);
+            Check(dfb_table.count(resource),
+                  "Core work references missing DFB stream " +
+                      std::to_string(resource));
+            resource_cores[resource].insert({x, y});
+            return lifecycles[key];
+          };
+          auto begin_producer = [&](int64_t resource) {
+            auto active = active_producer_transaction.find(resource);
+            if (active != active_producer_transaction.end()) {
+              LocalKey previous{x, y, resource, active->second};
+              Check(state(previous).produced,
+                    "DFB stream has nested producer reservations");
+              active_producer_transaction.erase(active);
+            }
+            int64_t transaction = next_producer_transaction[resource]++;
+            active_producer_transaction.emplace(resource, transaction);
+            return LocalKey{x, y, resource, transaction};
+          };
+          auto producer_key = [&](int64_t resource) {
+            Check(active_producer_transaction.count(resource),
+                  "DFB producer operation has no active reservation");
+            return LocalKey{x, y, resource,
+                            active_producer_transaction.at(resource)};
+          };
+          auto begin_consumer = [&](int64_t resource) {
+            int64_t transaction = next_consumer_transaction[resource]++;
+            auto &transactions = active_consumer_transactions[resource];
+            if (transactions.empty() || transactions.back() != transaction)
+              transactions.push_back(transaction);
+            if (compute_values.Enabled())
+              compute_values.AcquireDFB(resource, transaction);
+            return LocalKey{x, y, resource, transaction};
+          };
+          auto consumer_key = [&](int64_t resource) {
+            auto consumer = active_consumer_transactions.find(resource);
+            if (consumer != active_consumer_transactions.end() &&
+                !consumer->second.empty())
+              return LocalKey{x, y, resource, consumer->second.back()};
+            Check(false, "DFB consumer operation has no active acquisition");
+            return LocalKey{x, y, resource, 0};
+          };
+          auto release_key = [&](int64_t resource) {
+            auto consumer = active_consumer_transactions.find(resource);
+            Check(consumer != active_consumer_transactions.end() &&
+                      !consumer->second.empty(),
+                  "DFB consumer operation has no active acquisition");
+            return LocalKey{x, y, resource, consumer->second.front()};
+          };
           auto use = [&](int64_t resource) {
-            auto &entry = state(resource);
+            LocalKey key = consumer_key(resource);
+            auto &entry = state(key);
             if (entry.consumer_slot.empty())
               entry.consumer_slot = owner;
             Check(entry.consumer_slot == owner,
-                  "one Core-local DFB generation has consumers in multiple "
+                  "one Core-local DFB transaction has consumers in multiple "
                   "slots");
             entry.last_use = ordinal;
           };
           auto produce = [&](int64_t resource, int64_t event,
                              bool partial = false) {
-            auto &entry = state(resource);
+            LocalKey key = producer_key(resource);
+            auto &entry = state(key);
             if (entry.producer_slot.empty())
               entry.producer_slot = owner;
             Check(entry.producer_slot == owner,
-                  "one Core-local DFB generation has multiple producer slots");
-            LocalKey key{x, y, resource};
+                  "one Core-local DFB transaction has multiple producer slots");
             auto [producer, inserted] = producer_events.emplace(key, event);
             Check(inserted || partial,
-                  "DFB generation is published more than once");
+                  "DFB transaction is published more than once");
             if (partial)
               producer->second = event;
             entry.produced = true;
+            const DFBDescriptor &descriptor = dfb_table.at(resource);
+            if (descriptor->producer_slot == owner &&
+                descriptor->consumer_slot == owner) {
+              auto &transactions = active_consumer_transactions[resource];
+              if (transactions.empty() ||
+                  transactions.back() != std::get<3>(key))
+                transactions.push_back(std::get<3>(key));
+              if (compute_values.Enabled())
+                compute_values.AcquireDFB(resource, std::get<3>(key));
+            }
           };
           auto verify_step_refs = [&](const Call &call,
                                       int64_t dynamic_multiplier) {
@@ -4439,78 +4595,86 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                       "accumulator initialized more than once");
                 accumulator_state[accumulator] = 1;
               } else if (call->op.same_as(dfb_reserve())) {
-                auto &entry = state(id(call, 0));
+                int64_t resource = id(call, 0);
+                LocalKey key = begin_producer(resource);
+                auto &entry = state(key);
                 Check(!entry.reserved,
-                      "DFB generation is reserved more than once");
+                      "DFB transaction is reserved more than once");
                 entry.reserved = true;
                 entry.reserve_slot = owner;
-                Check(reserve_events.emplace(LocalKey{x, y, id(call, 0)}, event)
-                          .second,
-                      "DFB generation has multiple reserve events");
+                Check(reserve_events.emplace(key, event).second,
+                      "DFB transaction has multiple reserve events");
               } else if (call->op.same_as(dfb_wait())) {
-                auto &entry = state(id(call, 0));
+                int64_t resource = id(call, 0);
+                LocalKey key = begin_consumer(resource);
+                auto &entry = state(key);
                 entry.waited = true;
                 entry.last_use = ordinal;
-                wait_events[LocalKey{x, y, id(call, 0)}].push_back(event);
+                wait_events[key].push_back(event);
                 if (entry.consumer_slot.empty())
                   entry.consumer_slot = owner;
               } else if (call->op.same_as(dfb_release())) {
-                auto &entry = state(id(call, 0));
+                int64_t resource = id(call, 0);
+                LocalKey key = release_key(resource);
+                auto &entry = state(key);
                 Check(!entry.released,
-                      "DFB generation is released more than once");
+                      "DFB transaction is released more than once");
                 entry.released = true;
                 entry.release_order = ordinal;
-                Check(release_events.emplace(LocalKey{x, y, id(call, 0)}, event)
-                          .second,
-                      "DFB generation has multiple release events");
+                Check(release_events.emplace(key, event).second,
+                      "DFB transaction has multiple release events");
+                auto &transactions = active_consumer_transactions[resource];
+                transactions.erase(transactions.begin());
+                if (transactions.empty())
+                  active_consumer_transactions.erase(resource);
+                auto producer = active_producer_transaction.find(resource);
+                if (producer != active_producer_transaction.end() &&
+                    producer->second == std::get<3>(key))
+                  active_producer_transaction.erase(producer);
+                if (compute_values.Enabled())
+                  compute_values.ReleaseDFB(resource, std::get<3>(key));
               } else if (call->op.same_as(tensor_to_dfb_nd())) {
                 int64_t resource = id(call, 1);
                 int64_t tensor = RequireStaticInteger(call->args[0],
                                                       "Tensor load ABI index");
-                Check(tensor_table.count(tensor) &&
-                          dfb_table.at(resource)->tensor_backing.has_value() &&
-                          dfb_table.at(resource)
-                                  ->tensor_backing.value()
-                                  ->global_arg_index == tensor,
-                      "Tensor load disagrees with DFB backing metadata");
-                Check(copy_issues
-                          .emplace(LocalKey{x, y, resource},
-                                   std::make_pair(event, true))
+                Check(tensor_table.count(tensor),
+                      "Tensor load references a missing Tensor");
+                LocalKey key = producer_key(resource);
+                Check(copy_issues.emplace(key, std::make_pair(event, true))
                           .second,
-                      "DFB generation has multiple asynchronous copy issues");
+                      "DFB transaction has multiple asynchronous copy issues");
                 ffi::Array<PrimExpr> shape;
                 for (size_t index = 3; index < call->args.size(); index += 2)
                   shape.push_back(call->args[index]);
-                Check(
-                    tensor_load_shapes.emplace(LocalKey{x, y, resource}, shape)
-                        .second,
-                    "Tensor-backed DFB generation has multiple load shapes");
+                Check(tensor_load_shapes.emplace(key, shape).second,
+                      "Tensor-backed DFB transaction has multiple load shapes");
               } else if (call->op.same_as(dfb_to_tensor_nd())) {
                 int64_t resource = id(call, 0);
                 int64_t tensor = RequireStaticInteger(call->args[1],
                                                       "Tensor store ABI index");
-                Check(tensor_table.count(tensor) &&
-                          dfb_table.at(resource)->tensor_backing.has_value() &&
-                          dfb_table.at(resource)
-                                  ->tensor_backing.value()
-                                  ->global_arg_index == tensor,
-                      "Tensor store disagrees with DFB backing metadata");
+                Check(tensor_table.count(tensor),
+                      "Tensor store references a missing Tensor");
                 use(resource);
-                Check(copy_issues
-                          .emplace(LocalKey{x, y, resource},
-                                   std::make_pair(event, false))
+                LocalKey key = consumer_key(resource);
+                Check(copy_issues.emplace(key, std::make_pair(event, false))
                           .second,
-                      "DFB generation has multiple asynchronous copy issues");
+                      "DFB transaction has multiple asynchronous copy issues");
               } else if (call->op.same_as(dfb_copy_wait())) {
                 int64_t resource = id(call, 0);
-                LocalKey key{x, y, resource};
+                Check(active_producer_transaction.count(resource) ||
+                          active_consumer_transactions.count(resource),
+                      "DFB copy completion has no active transaction");
+                LocalKey key = active_producer_transaction.count(resource)
+                                   ? producer_key(resource)
+                                   : consumer_key(resource);
                 auto issue = copy_issues.find(key);
                 Check(issue != copy_issues.end(),
                       "DFB copy completion has no matching issue");
                 Check(copy_completions.emplace(key, event).second,
-                      "DFB generation has multiple copy completions");
-                if (issue->second.second)
+                      "DFB transaction has multiple copy completions");
+                if (issue->second.second) {
                   produce(resource, event);
+                }
               } else if (call->op.same_as(dfb_compute())) {
                 produce(id(call, 0), event);
                 for (size_t index = 1; index < call->args.size(); ++index)
@@ -4524,7 +4688,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                         "dfb_compute input shapes must cover every input "
                         "operand");
                   for (size_t index = 1; index < call->args.size(); ++index)
-                    input_shape_uses.push_back({LocalKey{x, y, id(call, index)},
+                    input_shape_uses.push_back({consumer_key(id(call, index)),
                                                 typed.value()[index - 1]});
                 }
               } else if (call->op.same_as(compute_value()) ||
@@ -4538,13 +4702,13 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               } else if (call->op.same_as(compute_value_store())) {
                 produce(id(call, 1), event);
               } else if (call->op.same_as(gemm_update())) {
-                use(id(call, 0));
-                use(id(call, 1));
                 int64_t accumulator = id(call, 2);
                 Check(current_accumulators.count(accumulator),
                       "GEMM update references missing accumulator");
                 Check(accumulator_state[accumulator] == 1,
                       "GEMM update requires a live initialized accumulator");
+                use(id(call, 0));
+                use(id(call, 1));
                 int64_t transpose_a = id(call, 3), transpose_b = id(call, 4);
                 Check((transpose_a == 0 || transpose_a == 1) &&
                           (transpose_b == 0 || transpose_b == 1),
@@ -4580,10 +4744,13 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 int64_t transfer = id(call, 0);
                 int64_t resource = id(call, 1);
                 const DFBDescriptor &descriptor = dfb_table.at(resource);
-                bool forwarding = owner == descriptor->producer_slot &&
-                                  descriptor->tensor_backing.has_value();
+                bool forwarding =
+                    owner == descriptor->producer_slot &&
+                    (stream_operands
+                         ? active_producer_transaction.count(resource)
+                         : descriptor->tensor_backing.has_value());
                 if (forwarding) {
-                  auto &entry = state(resource);
+                  auto &entry = state(producer_key(resource));
                   Check(
                       entry.produced,
                       "producer forwarding must follow Tensor copy completion");
@@ -4599,7 +4766,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               } else if (call->op.same_as(dfb_pipe_recv())) {
                 int64_t transfer = id(call, 0);
                 int64_t resource = id(call, 1);
-                state(resource);
+                state(producer_key(resource));
                 Check(received_transfers.insert({transfer, resource}).second,
                       "Pipe transfer is received more than once in one Core "
                       "work item");
@@ -4608,7 +4775,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 int64_t resource = id(call, 1);
                 auto sent = sent_transfers.find({transfer, resource});
                 if (sent != sent_transfers.end() && sent->second) {
-                  forwarding_completions[LocalKey{x, y, resource}].push_back(
+                  forwarding_completions[producer_key(resource)].push_back(
                       event);
                 } else if (received_transfers.count({transfer, resource})) {
                   produce(resource, event);
@@ -4647,7 +4814,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                                              tensor_table.at(tensor)->dtype);
                 }
               } else if (call->op.same_as(dfb_compute())) {
-                VerifyGeneralCompute(call, dfb_table, &bound_loop_vars);
+                VerifyGeneralCompute(call, dfb_table, &bound_loop_vars,
+                                     stream_operands);
               }
             } catch (const ffi::Error &error) {
               Fail(OperationContext(func, Evaluate(call)) + error.what());
@@ -4690,6 +4858,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   struct GroupReserve {
     int64_t ordinal;
     int64_t resource;
+    int64_t transaction;
     int64_t event;
   };
   std::map<std::tuple<int64_t, int64_t, int64_t>, std::vector<GroupReserve>>
@@ -4697,12 +4866,21 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   for (const auto &[key, event] : reserve_events) {
     int64_t x = std::get<0>(key), y = std::get<1>(key);
     int64_t resource = std::get<2>(key);
-    Check(storage.resource_groups.count(resource) &&
-              storage.resource_ordinals.count(resource),
-          "reserved DFB has no storage-group relation");
-    int64_t group = storage.resource_groups.at(resource);
+    int64_t transaction = std::get<3>(key);
+    int64_t group = resource;
+    int64_t ordinal = transaction;
+    if (stream_operands) {
+      Check(storage.groups.count(resource),
+            "reserved DFB references a missing logical stream");
+    } else {
+      Check(storage.resource_groups.count(resource) &&
+                storage.resource_ordinals.count(resource),
+            "reserved DFB has no storage-group relation");
+      group = storage.resource_groups.at(resource);
+      ordinal = storage.resource_ordinals.at(resource);
+    }
     group_reserves[{x, y, group}].push_back(
-        {storage.resource_ordinals.at(resource), resource, event});
+        {ordinal, resource, transaction, event});
   }
   for (auto &[key, events] : group_reserves) {
     std::sort(events.begin(), events.end(),
@@ -4724,8 +4902,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
          ++index) {
       const GroupReserve &old = events[index - capacity];
       const GroupReserve &next = events[index];
-      auto release = release_events.find(
-          LocalKey{std::get<0>(key), std::get<1>(key), old.resource});
+      auto release = release_events.find(LocalKey{
+          std::get<0>(key), std::get<1>(key), old.resource, old.transaction});
       Check(release != release_events.end(),
             "storage-group reuse is missing release-before-reserve dependency");
       event_successors[release->second].push_back(next.event);
@@ -4764,17 +4942,15 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
     int64_t resource = std::get<2>(key);
     const DFBDescriptor &descriptor = dfb_table.at(resource);
     if (state.reserved) {
-      auto transactions = reservation_transactions.find(key);
+      auto transactions = reservation_transactions.find(
+          StreamKey{std::get<0>(key), std::get<1>(key), resource});
       Check(
           transactions != reservation_transactions.end() &&
-              transactions->second ==
-                  RequireStaticInteger(
-                      descriptor->transaction_count_or_loop_relation,
-                      "DFB transaction count"),
+              std::get<3>(key) < transactions->second,
           "DFB transaction count disagrees with its structured loop relation");
     }
     Check(!state.reserved || state.produced,
-          "reserved DFB generation is never published");
+          "reserved DFB transaction is never published");
     Check(!state.produced || state.reserved,
           "DFB producer writes without reserve");
     if (!state.producer_slot.empty())
@@ -4789,7 +4965,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
     Check(!state.released || state.release_order >= state.last_use,
           "DFB release precedes its last local use");
     Check(!state.produced || state.released,
-          "published DFB generation is missing release");
+          "published DFB transaction is missing release");
   }
   VerifyCurrentL1Budget(mod, dfb_table, resource_cores, storage);
   compute_values.Finish();

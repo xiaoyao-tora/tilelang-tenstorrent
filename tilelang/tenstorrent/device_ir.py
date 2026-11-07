@@ -460,6 +460,7 @@ class DFBStorageGroupDescriptor(Node):
         producer_domain: CoreDomain,
         consumer_slot: str,
         consumer_domain: CoreDomain,
+        transaction_count_or_loop_relation,
         storage_backing: TensorStorageBacking | None,
         source_span: Span,
     ):
@@ -474,6 +475,7 @@ class DFBStorageGroupDescriptor(Node):
             producer_domain,
             consumer_slot,
             consumer_domain,
+            _expr(transaction_count_or_loop_relation),
             storage_backing,
             source_span,
         )

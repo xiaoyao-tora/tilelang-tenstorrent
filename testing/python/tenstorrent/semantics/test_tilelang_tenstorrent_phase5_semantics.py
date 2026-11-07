@@ -28,9 +28,20 @@ def run_pipeline_device(mod, inputs, *, seed=0):
     rng = np.random.default_rng(seed)
     tensors = [cast(value, desc.dtype).copy() for value, desc in zip(inputs, mod.attrs["tt.tensor_table"])]
     dfbs = {int(d.dfb_id): d for d in mod.attrs["tt.dfb_table"]}
-    groups = {int(k): int(v) for k, v in mod.attrs["tt.dfb_storage_groups"].items()}
-    epochs = {int(k): int(v[0]) for k, v in mod.attrs["tt.pipeline_relations"].items()}
-    addresses = {i: (groups[i], epochs[i] % int(d.block_count)) for i, d in dfbs.items()}
+    groups = {identifier: identifier for identifier in dfbs}
+    next_epoch = defaultdict(int)
+    epochs = {}
+    for identifier, descriptor in dfbs.items():
+        span = descriptor.source_span
+        signature = (
+            str(span.source_name.name) if span is not None else "",
+            int(span.line) if span is not None else 0,
+            str(descriptor.producer_slot),
+            str(descriptor.consumer_slot),
+        )
+        epochs[identifier] = next_epoch[signature]
+        next_epoch[signature] += 1
+    addresses = {identifier: (identifier, 0) for identifier in dfbs}
     streams = []
     for slot in ("ncrisc", "trisc", "brisc"):
         func = next(f for f in mod.functions.values() if str(f.attrs["tt.kernel_slot"]) == slot)

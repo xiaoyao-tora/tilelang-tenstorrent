@@ -403,6 +403,7 @@ public:
   CoreDomain producer_domain;
   ffi::String consumer_slot;
   CoreDomain consumer_domain;
+  PrimExpr transaction_count_or_loop_relation;
   ffi::Optional<TensorStorageBacking> storage_backing;
   Span source_span;
 
@@ -419,6 +420,7 @@ public:
       ffi::Array<PrimExpr> block_shape_in_tiles, PrimExpr block_count,
       ffi::String producer_slot, CoreDomain producer_domain,
       ffi::String consumer_slot, CoreDomain consumer_domain,
+      PrimExpr transaction_count_or_loop_relation,
       ffi::Optional<TensorStorageBacking> storage_backing, Span source_span);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DFBStorageGroupDescriptor,
                                              ffi::ObjectRef,

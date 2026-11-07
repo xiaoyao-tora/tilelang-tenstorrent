@@ -305,7 +305,7 @@ def test_full_pipeline_preserves_complete_accumulator_lifetime(dtypes, mode, upd
     assert int(lifetime[0].args[0]) == int(lifetime[-1].args[0]) == accumulator.accumulator_id
     assert len(mod.attrs["tt.dfb_table"]) == 3
     output = next(dfb for dfb in mod.attrs["tt.dfb_table"] if dfb.dfb_id == int(lifetime[-1].args[1]))
-    assert ".materialized" in str(output.source_buffer_identity)
+    assert str(output.source_buffer_identity) == f"stream.{int(output.dfb_id)}"
     assert str(output.element_dtype) == dtypes[2]
     assert accumulator.accumulator_region.buffer.scope() == "local.fragment"
     assert str(accumulator.accumulator_region.buffer.dtype) == dtypes[1]
@@ -321,7 +321,7 @@ def device_calls(mod, slot):
     return calls
 
 
-def test_serial_k_slices_keep_all_input_generations_live():
+def test_serial_k_slices_reuse_two_input_streams():
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
     @T.prim_func
@@ -342,8 +342,8 @@ def test_serial_k_slices_keep_all_input_generations_live():
     assert accumulator.full_k_tiles == 3
     updates = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.gemm_update"]
     assert len(updates) == 3
-    assert len({int(call.args[index]) for call in updates for index in (0, 1)}) == 6
-    assert len(mod.attrs["tt.dfb_table"]) == 7
+    assert {int(call.args[index]) for call in updates for index in (0, 1)} == {0, 1}
+    assert len(mod.attrs["tt.dfb_table"]) == 3
     copies = [call for call in device_calls(mod, "ncrisc") if call.op.name == "tl.tt.tensor_to_dfb_nd"]
     assert len(copies) == 6
     assert [int(call.args[4]) for call in copies[::2]] == [0, 32, 64]

@@ -59,18 +59,13 @@ def test_pipeline_materializes_bounded_windows(stages, extent, start, arch):
     assert int(mod.attrs["tt.pipeline_stages"]) == stages
     assert int(mod.attrs["tt.pipeline_extent"]) == extent
     depth = min(stages, extent)
-    groups = mod.attrs["tt.dfb_storage_groups"]
-    relations = {int(key): value for key, value in mod.attrs["tt.pipeline_relations"].items()}
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
     dfbs = mod.attrs["tt.dfb_table"]
     assert len(dfbs) == 4 * extent  # A, B, compute output, export snapshot.
+    assert [int(group.storage_group_id) for group in groups] == list(range(len(dfbs)))
     for desc in dfbs:
-        resource = int(desc.dfb_id)
         assert int(desc.block_count) == depth
         assert int(desc.transaction_count_or_loop_relation) == 1
-        epoch, stage = (int(x) for x in relations[resource])
-        assert stage == epoch % depth
-        assert 0 <= epoch < extent
-    assert len(set(int(x) for x in groups.values())) == 4
     transfers = slot_calls(mod, "ncrisc")
     issue = "tl.tt.tensor_to_dfb_nd"
     wait = "tl.tt.dfb_copy_wait"
@@ -231,6 +226,5 @@ def test_pipeline_maximum_static_extent_and_stage_boundary():
     mod = lower_pipeline(make_pipeline(stages=32, extent=1024))
     assert len(mod.attrs["tt.dfb_table"]) == 4096
     assert {int(desc.block_count) for desc in mod.attrs["tt.dfb_table"]} == {32}
-    relations = list(mod.attrs["tt.pipeline_relations"].values())
-    assert max(int(relation[0]) for relation in relations) == 1023
-    assert max(int(relation[1]) for relation in relations) == 31
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == 4096
+    assert [int(group.storage_group_id) for group in mod.attrs["tt.dfb_storage_groups"]] == list(range(4096))

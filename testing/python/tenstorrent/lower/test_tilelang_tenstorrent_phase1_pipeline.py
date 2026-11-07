@@ -20,9 +20,8 @@ MODULE_ATTRS = {
     "tt.launch_grid",
     "tt.operation_identity",
     "tt.tensor_table",
-    "tt.dfb_families",
     "tt.dfb_storage_groups",
-    "tt.dfb_storage_group_relations",
+    "tt.stream_operands",
     "tt.communication_table",
     "tt.communication_step_families",
     "tt.transport_families",
@@ -82,7 +81,7 @@ def test_backend_context_lowers_minimal_frontend_to_device_ir(monkeypatch):
     )
     assert str(lowered.attrs["tt.operation_identity"].operation_id) == "phase1_noop"
     assert len(lowered.attrs["tt.tensor_table"]) == 1
-    assert not lowered.attrs["tt.dfb_families"]
+    assert not lowered.attrs["tt.dfb_storage_groups"]
     assert not lowered.attrs["tt.communication_table"]
     assert not lowered.attrs["tt.communication_step_families"]
     assert not lowered.attrs["tt.transport_families"]
@@ -144,7 +143,7 @@ def test_unused_shared_allocation_forms_empty_device_program(monkeypatch):
     context = _context(monkeypatch)
     result = context.lower(tvm.IRModule({"dfb_only": phase1_dfb_only}))
     assert str(result.attrs["tt.ir_stage"]) == "device"
-    assert not result.attrs["tt.dfb_families"]
+    assert not result.attrs["tt.dfb_storage_groups"]
 
 
 def test_topology_rejects_legacy_pipe_when_called_directly(monkeypatch):

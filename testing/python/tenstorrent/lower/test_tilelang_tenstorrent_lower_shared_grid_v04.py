@@ -177,33 +177,28 @@ def straight_line_in_place_reuse(
         T.copy(value, C)
 
 
-def test_single_slot_in_place_update_uses_independent_generations():
+def test_single_slot_in_place_update_uses_logical_streams():
     mod = lower(single_slot_in_place)
     dfbs = list(expanded(mod).attrs["tt.dfb_table"])
     assert len(dfbs) == 3
     assert all(int(dfb.block_count) == 1 for dfb in dfbs)
-    assert all(str(dfb.source_buffer_identity).startswith("buffer.0.generation") for dfb in dfbs)
+    assert [str(dfb.source_buffer_identity) for dfb in dfbs] == [
+        "stream.0",
+        "stream.1",
+        "stream.2",
+    ]
     assert len({int(dfb.dfb_id) for dfb in dfbs}) == 3
 
 
 def test_nonpipeline_lifetime_plan_uses_two_groups_for_straight_line_in_place_updates():
     mod = lower(straight_line_in_place_reuse)
-    candidates = [
-        (family, relation)
-        for family, relation in zip(
-            mod.attrs["tt.dfb_families"],
-            mod.attrs["tt.dfb_storage_group_relations"],
-        )
-        if int(family.positions.count) >= 4
-        and str(family.prototype.producer_slot) == "trisc"
-        and str(family.prototype.consumer_slot) == "trisc"
+    streams = [
+        stream
+        for stream in mod.attrs["tt.dfb_storage_groups"]
+        if str(stream.producer_slot) == "trisc" and str(stream.consumer_slot) == "trisc"
     ]
-    assert len(candidates) == 1
-    family, relation = candidates[0]
-    groups = _column_values(relation.storage_group_ids)
-    assert int(family.prototype.block_count) == 1
-    assert len(groups) >= 4
-    assert len(set(groups)) == 2
+    assert len(streams) == 2
+    assert all(int(stream.block_count) == 1 for stream in streams)
 
 
 def test_explicit_l1_budget_checks_current_device_storage_lower_bound():
@@ -332,18 +327,11 @@ def _column_values(column):
     ]
 
 
-def _assert_storage_group_relations(mod):
-    declared = {int(group.storage_group_id) for group in mod.attrs["tt.dfb_storage_groups"]}
-    ordinals = {}
-    for relation in mod.attrs["tt.dfb_storage_group_relations"]:
-        groups = _column_values(relation.storage_group_ids)
-        transactions = _column_values(relation.transaction_ordinals)
-        assert len(groups) == len(transactions)
-        for group, ordinal in zip(groups, transactions):
-            assert group in declared
-            ordinals.setdefault(group, []).append(ordinal)
-    assert set(ordinals) == declared
-    assert all(sorted(values) == list(range(len(values))) for values in ordinals.values())
+def _assert_logical_streams(mod):
+    streams = list(mod.attrs["tt.dfb_storage_groups"])
+    assert [int(stream.storage_group_id) for stream in streams] == list(range(len(streams)))
+    assert "tt.dfb_families" not in mod.attrs
+    assert "tt.dfb_storage_group_relations" not in mod.attrs
 
 
 def test_summa_uses_parameterized_core_occurrence_and_resource_families():
@@ -365,7 +353,6 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
         )
 
     family_keys = (
-        "tt.dfb_families",
         "tt.accumulator_families",
         "tt.communication_step_families",
         "tt.transport_families",
@@ -382,9 +369,9 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
         )
     )
     assert [tuple(len(mod.attrs[key]) for key in family_keys) for mod in modules] == [
-        (3, 1, 10, 1),
-        (3, 1, 10, 1),
-        (3, 1, 10, 1),
+        (1, 10, 1),
+        (1, 10, 1),
+        (1, 10, 1),
     ]
 
     for mod in modules:
@@ -397,8 +384,8 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
         assert trisc["for"] >= 1
         assert "tt.storage_group_statements_specialized" not in mod.attrs
         assert _compact_loop_names(mod)
-        assert _dynamic_dfb_operands(mod)
-        _assert_storage_group_relations(mod)
+        assert not _dynamic_dfb_operands(mod)
+        _assert_logical_streams(mod)
         assert ncrisc["if"] <= 4
         assert ncrisc["block"] <= 4
         blocks = []
@@ -494,17 +481,11 @@ def test_current_family_column_length_mismatch_is_rejected():
         transform.VerifyTenstorrentDeviceIR()(malformed)
 
 
-def test_storage_group_relation_requires_a_declared_group():
+def test_device_body_requires_a_declared_logical_stream():
     mod = lower(point_transfer)
-    relations = list(mod.attrs["tt.dfb_storage_group_relations"])
-    relation = relations[0]
-    relations[0] = D.DFBStorageGroupRelation(
-        int(relation.dfb_family_id),
-        D.DeviceIRIntColumn(999, 0, int(relation.storage_group_ids.count)),
-        relation.transaction_ordinals,
-    )
-    malformed = mod.with_attr("tt.dfb_storage_group_relations", relations)
-    with pytest.raises(ValueError, match="invalid ID or ordinal"):
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
+    malformed = mod.with_attr("tt.dfb_storage_groups", groups[:-1])
+    with pytest.raises(ValueError, match="missing DFB|missing logical stream"):
         transform.VerifyTenstorrentDeviceIR()(malformed)
 
 
@@ -522,6 +503,7 @@ def test_tensor_storage_backing_requires_the_complete_cb_capacity():
         group.producer_domain,
         str(group.consumer_slot),
         group.consumer_domain,
+        group.transaction_count_or_loop_relation,
         D.TensorStorageBacking(0, 0, 1),
         group.source_span,
     )
@@ -588,9 +570,9 @@ def test_lower_preserves_parameterized_storage_group_selection_for_codegen():
     )
     assert "tt.storage_group_statements_specialized" not in mod.attrs
     assert _compact_loop_names(mod)
-    assert _dynamic_dfb_operands(mod)
-    _assert_storage_group_relations(mod)
-    assert len(mod.attrs["tt.dfb_storage_groups"]) < len(expanded(mod).attrs["tt.dfb_table"])
+    assert not _dynamic_dfb_operands(mod)
+    _assert_logical_streams(mod)
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == len(expanded(mod).attrs["tt.dfb_table"])
     resolved = resolve_current_function_groups(mod)
     assert set(resolved) == set(map(str, mod.attrs["tt.kernel_order"]))
     assert resolved["main_trisc"]
@@ -598,7 +580,7 @@ def test_lower_preserves_parameterized_storage_group_selection_for_codegen():
     assert not resolved["main_brisc"]
     with pytest.raises(NotImplementedError) as error:
         codegen.prepare_ttl_codegen(mod, TARGET)
-    assert "DFB-family binding resolution failed" not in str(error.value)
+    assert "DFB stream binding resolution failed" not in str(error.value)
 
 
 def test_core_predicate_must_match_its_typed_work_domain():
@@ -639,30 +621,25 @@ def test_flash_attention_core_and_kv_repetition_remain_parameterized():
         )
 
     family_keys = (
-        "tt.dfb_families",
         "tt.accumulator_families",
         "tt.compute_value_families",
         "tt.communication_step_families",
         "tt.transport_families",
     )
     assert [tuple(len(mod.attrs[key]) for key in family_keys) for mod in modules] == [
-        (12, 2, 8, 10, 1),
-        (12, 2, 8, 10, 1),
-        (12, 2, 8, 10, 1),
+        (2, 8, 10, 1),
+        (2, 8, 10, 1),
+        (2, 8, 10, 1),
+    ]
+    assert [len(mod.attrs["tt.dfb_storage_groups"]) for mod in modules] == [
+        27,
+        38,
+        38,
     ]
     for mod in modules:
         assert "tt.storage_group_statements_specialized" not in mod.attrs
-        assert _compact_loop_names(mod)
-        assert _dynamic_dfb_operands(mod)
-        _assert_storage_group_relations(mod)
-        assert any(
-            int(family.positions.count) > int(family.prototype.block_count)
-            and len(set(_column_values(relation.storage_group_ids))) == int(family.positions.count)
-            for family, relation in zip(
-                mod.attrs["tt.dfb_families"],
-                mod.attrs["tt.dfb_storage_group_relations"],
-            )
-        )
+        assert not _dynamic_dfb_operands(mod)
+        _assert_logical_streams(mod)
         trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
         counts = _body_counts(trisc)
         assert counts["if"] == 0
@@ -695,7 +672,7 @@ def test_mixed_precision_flash_uses_full_fp32_accumulation():
     requirements = trisc.attrs["tt.compute_requirements"]
     assert str(requirements.destination_width) == "bits32_required"
     assert str(requirements.matmul_full_fp32) == "required"
-    assert len(mod.attrs["tt.dfb_families"]) == 14
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == 31
 
 
 def test_all_bf16_flash_uses_bf16_constants_and_destination():
@@ -724,4 +701,4 @@ def test_all_bf16_flash_uses_bf16_constants_and_destination():
     requirements = trisc.attrs["tt.compute_requirements"]
     assert str(requirements.destination_width) == "bits16_required"
     assert str(requirements.matmul_full_fp32) == "forbidden"
-    assert len(mod.attrs["tt.dfb_families"]) == 12
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == 27

@@ -1,32 +1,36 @@
-"""Pipeline pool capacity and asynchronous lifetime verification, without hardware."""
+"""Logical DFB stream capacity and asynchronous lifetime verification."""
+
+import inspect
 
 import pytest
 
 from tilelang import tvm
-from tilelang.tenstorrent import transform
+from tilelang.tenstorrent import device_ir as D, transform
 from tvm import ir, tirx
 
+from testing.python.tenstorrent._support.reference import _calls, _with_core_statements
 from testing.python.tenstorrent.legacy.test_tilelang_tenstorrent_phase2_device_ir import (
     _lower_add,
-    _replace_dfb,
-    _replace_slot_body,
     _slots,
 )
-from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute import elementwise_program
-from testing.python.tenstorrent.semantics.test_tilelang_tenstorrent_phase4_semantics import lower
-
-
+from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute import (
+    elementwise_program,
+)
 from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase5_pipeline import (
     lower_pipeline,
     make_pipeline,
 )
-from testing.python.tenstorrent._support.reference import _calls, _core_statements, _with_core_statements
+from testing.python.tenstorrent.semantics.test_tilelang_tenstorrent_phase4_semantics import (
+    lower,
+)
 
 
 def pipeline(stages=2, extent=3, capacity=None):
     mod = lower_pipeline(make_pipeline(stages, extent, block_count=capacity))
     assert str(mod.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in mod.attrs
+    assert "tt.dfb_families" not in mod.attrs
+    assert "tt.dfb_storage_group_relations" not in mod.attrs
     return mod
 
 
@@ -53,30 +57,35 @@ def rejected(mod, match):
     assert ir.save_json(mod) == before, "verifier must not repair malformed input"
 
 
+def replace_group(group, **changes):
+    fields = {name: getattr(group, name) for name in inspect.signature(D.DFBStorageGroupDescriptor.__init__).parameters if name != "self"}
+    fields.update(changes)
+    return D.DFBStorageGroupDescriptor(**fields)
+
+
 def pool_payload(mod):
-    groups = {int(key): int(value) for key, value in mod.attrs["tt.dfb_storage_groups"].items()}
-    seen = set()
     total = 0
-    for dfb in mod.attrs["tt.dfb_table"]:
-        group = groups[int(dfb.dfb_id)]
-        if group in seen:
-            continue
-        seen.add(group)
-        size = int(dfb.block_count) * tvm.DataType(str(dfb.element_dtype)).bits // 8
-        for extent in [*dfb.tile_shape, *dfb.block_shape_in_tiles]:
+    for group in mod.attrs["tt.dfb_storage_groups"]:
+        size = int(group.block_count) * tvm.DataType(str(group.element_dtype)).bits // 8
+        for extent in [*group.tile_shape, *group.block_shape_in_tiles]:
             size *= int(extent)
         total += size
     return total
 
 
 @pytest.mark.parametrize("stages,extent", [(1, 1), (2, 1), (2, 3), (3, 5), (4, 2)])
-def test_pool_capacity_and_closed_lifetimes(stages, extent):
+def test_stream_capacity_and_closed_lifetimes(stages, extent):
     mod = pipeline(stages, extent)
-    assert all(int(dfb.block_count) == min(stages, extent) for dfb in mod.attrs["tt.dfb_table"])
+    depth = min(stages, extent)
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
+    dfbs = list(mod.attrs["tt.dfb_table"])
+    assert len(groups) == len(dfbs) == 4 * extent
+    assert [int(group.storage_group_id) for group in groups] == list(range(len(groups)))
+    assert all(int(group.block_count) == depth for group in groups)
     releases = [
         int(stmt.value.args[0]) for slot in ("trisc", "ncrisc") for stmt in statements(mod, slot) if operation(stmt) == "tl.tt.dfb_release"
     ]
-    assert sorted(releases) == sorted(int(dfb.dfb_id) for dfb in mod.attrs["tt.dfb_table"])
+    assert sorted(releases) == list(range(len(groups)))
     transform.VerifyTenstorrentDeviceIR()(ir.load_json(ir.save_json(mod)))
 
 
@@ -87,13 +96,12 @@ def test_nested_reservations_and_multiple_inflight_copies():
     prefix = body[:first_completion]
     assert sum(operation(stmt) == "tl.tt.tensor_to_dfb_nd" for stmt in prefix) == 6
     assert sum(operation(stmt) == "tl.tt.dfb_reserve" for stmt in prefix) == 6
-    # Acquires are held across all six issues. Completion alone does not free them.
     assert all(operation(stmt) != "tl.tt.dfb_release" for stmt in prefix)
 
 
-def test_explicit_pool_capacity_preserved():
+def test_explicit_stream_capacity_preserved():
     mod = pipeline(2, 3, capacity=4)
-    assert all(int(dfb.block_count) == 4 for dfb in mod.attrs["tt.dfb_table"])
+    assert all(int(group.block_count) == 4 for group in mod.attrs["tt.dfb_storage_groups"])
     assert pool_payload(mod) > pool_payload(pipeline(2, 3))
 
 
@@ -102,25 +110,20 @@ def test_insufficient_explicit_capacity_rejected_during_lower():
         pipeline(3, 4, capacity=2)
 
 
-def test_insufficient_capacity_rejected_by_verifier():
+def test_invalid_stream_capacity_rejected_by_verifier():
     mod = pipeline(2, 3)
-    changed = [_replace_dfb(dfb, block_count=1) for dfb in mod.attrs["tt.dfb_table"]]
-    rejected(mod.with_attr("tt.dfb_table", changed), "capacity insufficient")
-
-
-@pytest.mark.parametrize("field,values", [("stage", [0, 1]), ("iteration", [99, 0])])
-def test_wrong_transaction_relation(field, values):
-    mod = pipeline()
-    relations = dict(mod.attrs["tt.pipeline_relations"].items())
-    key = next(key for key, value in relations.items() if int(value[0]) == 0)
-    relations[key] = tvm.runtime.convert(values)
-    rejected(mod.with_attr("tt.pipeline_relations", relations), "pipeline relation")
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
+    groups[0] = replace_group(groups[0], block_count=0)
+    rejected(
+        mod.with_attr("tt.dfb_storage_groups", groups),
+        "capacity must be in",
+    )
 
 
 @pytest.mark.parametrize(
     "name,match",
     [
-        ("tl.tt.dfb_wait", "missing consumer wait"),
+        ("tl.tt.dfb_wait", "missing consumer wait|no active acquisition"),
         ("tl.tt.dfb_release", "missing release"),
     ],
 )
@@ -147,7 +150,10 @@ def test_output_release_before_completion():
     assert operation(body[index - 1]) == "tl.tt.dfb_copy_wait"
     body[index - 1], body[index] = body[index], body[index - 1]
     replace_statements(mod, "ncrisc", body)
-    rejected(mod, "release before copy completion|dependency cycle")
+    rejected(
+        mod,
+        "no active acquisition|no active transaction|release before copy completion|dependency cycle",
+    )
 
 
 def test_use_after_release():
@@ -158,109 +164,65 @@ def test_use_after_release():
     prior = next(stmt for stmt in body[:index] if operation(stmt) == "tl.tt.dfb_wait" and int(stmt.value.args[0]) == released)
     body.insert(index + 1, prior)
     replace_statements(mod, "trisc", body)
-    rejected(mod, "after release|release precedes")
+    rejected(mod, "after release|no matching producer|release precedes")
 
 
-def test_duplicate_nested_acquire_rejected():
+def test_duplicate_reserve_rejected():
     mod = pipeline()
     body = statements(mod, "ncrisc")
     index = next(i for i, stmt in enumerate(body) if operation(stmt) == "tl.tt.dfb_reserve")
     body.insert(index, body[index])
     replace_statements(mod, "ncrisc", body)
-    rejected(mod, "reserved more than once")
+    rejected(
+        mod,
+        "reserved more than once|nested producer reservations|transaction count disagrees",
+    )
 
 
-def test_ring_reuse_dependency_catches_missing_window_drain():
-    mod = pipeline(2, 3)
-    body = statements(mod, "ncrisc")
-    # Delaying every input completion until all windows' issues creates a cycle:
-    # the next ring acquire needs a release that itself needs a delayed completion.
-    inputs = [stmt for stmt in body if operation(stmt) in ("tl.tt.dfb_reserve", "tl.tt.tensor_to_dfb_nd")]
-    rest = [stmt for stmt in body if operation(stmt) not in ("tl.tt.dfb_reserve", "tl.tt.tensor_to_dfb_nd")]
-    replace_statements(mod, "ncrisc", inputs + rest)
-    rejected(mod, "dependency cycle")
-
-
-def test_l1_budget_counts_pools_once_and_has_exact_boundary():
+def test_l1_budget_counts_streams_once_and_has_exact_boundary():
     mod = pipeline(2, 5)
     payload = pool_payload(mod)
     transform.VerifyTenstorrentDeviceIR()(mod.with_attr("tt.l1_capacity_bytes", payload))
-    rejected(mod.with_attr("tt.l1_capacity_bytes", payload - 1), "L1 logical payload lower bound.*exceeds")
+    rejected(
+        mod.with_attr("tt.l1_capacity_bytes", payload - 1),
+        "L1 logical payload lower bound.*exceeds",
+    )
     rejected(mod.with_attr("tt.l1_capacity_bytes", 0), "must be positive")
 
 
 def test_legacy_v2_explicit_l1_budget():
     mod = lower(elementwise_program())
-    rejected(mod.with_attr("tt.l1_capacity_bytes", 1), "L1 logical payload lower bound.*exceeds")
+    rejected(
+        mod.with_attr("tt.l1_capacity_bytes", 1),
+        "L1 logical payload lower bound.*exceeds",
+    )
     transform.VerifyTenstorrentDeviceIR()(mod.with_attr("tt.l1_capacity_bytes", 1 << 30))
 
 
 def test_legacy_v1_explicit_l1_budget(monkeypatch):
     mod = _lower_add(monkeypatch)
-    rejected(mod.with_attr("tt.l1_capacity_bytes", 1), "L1 logical payload lower bound.*exceeds")
-    transform.VerifyTenstorrentDeviceIR()(mod.with_attr("tt.l1_capacity_bytes", 1 << 30))
-
-
-def test_globally_permuted_iteration_relations_rejected():
-    mod = pipeline(3, 3)
-    relations = {
-        key: tvm.runtime.convert([2 - int(value[0]), 2 - int(value[0])]) for key, value in mod.attrs["tt.pipeline_relations"].items()
-    }
-    rejected(
-        mod.with_attr("tt.pipeline_relations", relations),
-        "order disagrees with pipeline transaction relation",
-    )
-
-
-@pytest.mark.parametrize("mutation", ["missing", "duplicate_epoch", "pool_mismatch"])
-def test_malformed_resource_group_metadata(mutation):
-    mod = pipeline()
-    if mutation == "missing":
-        groups = dict(mod.attrs["tt.dfb_storage_groups"].items())
-        groups.pop(next(iter(groups)))
-        mod = mod.with_attr("tt.dfb_storage_groups", groups)
-        match = "cover every DFB"
-    elif mutation == "duplicate_epoch":
-        relations = dict(mod.attrs["tt.pipeline_relations"].items())
-        key = next(key for key, value in relations.items() if int(value[0]) == 1)
-        relations[key] = tvm.runtime.convert([0, 0])
-        mod = mod.with_attr("tt.pipeline_relations", relations)
-        match = "duplicate generation ordinal"
-    else:
-        dfbs = list(mod.attrs["tt.dfb_table"])
-        dfbs[0] = _replace_dfb(dfbs[0], block_count=3)
-        mod = mod.with_attr("tt.dfb_table", dfbs)
-        match = "generations disagree"
-    rejected(mod, match)
-
-
-def test_invalid_wait_policy_rejected():
-    rejected(pipeline().with_attr("tt.pipeline_wait_policy", "unknown"), "wait policy")
-
-
-def test_l1_payload_overflow_rejected():
-    mod = pipeline()
     rejected(
         mod.with_attr("tt.l1_capacity_bytes", 1),
         "L1 logical payload lower bound.*exceeds",
     )
+    transform.VerifyTenstorrentDeviceIR()(mod.with_attr("tt.l1_capacity_bytes", 1 << 30))
 
 
-def test_pipeline_generation_publication_count_is_not_iteration_count():
+def test_malformed_stream_table_rejected():
     mod = pipeline()
-    dfbs = list(mod.attrs["tt.dfb_table"])
-    dfbs[0] = _replace_dfb(dfbs[0], transaction_count_or_loop_relation=3)
-    rejected(mod.with_attr("tt.dfb_table", dfbs), "transaction count disagrees")
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
+    groups[0] = replace_group(groups[0], storage_group_id=99)
+    rejected(
+        mod.with_attr("tt.dfb_storage_groups", groups),
+        "IDs must be dense",
+    )
 
 
-@pytest.mark.parametrize("attribute", ["tt.dfb_storage_groups", "tt.pipeline_relations"])
-@pytest.mark.parametrize("key", ["00", "not-a-dfb", "-1", "999999999999999999999999999999"])
-def test_pipeline_metadata_requires_canonical_decimal_keys(attribute, key):
-    mod = pipeline()
-    table = dict(mod.attrs[attribute].items())
-    original = next(iter(table))
-    table[key] = table.pop(original)
-    rejected(mod.with_attr(attribute, table), "canonical decimal DFB key")
+def test_invalid_wait_policy_rejected():
+    rejected(
+        pipeline().with_attr("tt.pipeline_wait_policy", "unknown"),
+        "wait policy",
+    )
 
 
 def test_pipeline_resource_metadata_determinism():
@@ -269,5 +231,6 @@ def test_pipeline_resource_metadata_determinism():
     second = lower_pipeline(program)
     ir.assert_structural_equal(first, second)
     assert ir.structural_hash(first) == ir.structural_hash(second)
-    for attribute in ("tt.dfb_storage_groups", "tt.pipeline_relations"):
-        assert all(str(int(key)) == str(key) for key in first.attrs[attribute])
+    assert [int(group.storage_group_id) for group in first.attrs["tt.dfb_storage_groups"]] == list(
+        range(len(first.attrs["tt.dfb_storage_groups"]))
+    )

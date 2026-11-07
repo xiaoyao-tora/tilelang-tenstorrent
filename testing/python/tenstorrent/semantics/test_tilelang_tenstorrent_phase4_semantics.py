@@ -128,6 +128,7 @@ def run_device(mod, inputs):
         return result
     tensors = [cast(value, desc.dtype).copy() for value, desc in zip(inputs, mod.attrs["tt.tensor_table"])]
     values = {}
+    preserve_next_release = set()
     streams = []
     from testing.python.tenstorrent._support.reference import _calls
 
@@ -192,8 +193,13 @@ def run_device(mod, inputs):
                 else:
                     raise AssertionError(kind)
                 values[output] = cast(result, attrs["tt.compute_dtype"].value).copy()
+                if output in operands:
+                    preserve_next_release.add(output)
             elif name == "tl.tt.dfb_release":
-                values.pop(args[0], None)
+                if args[0] in preserve_next_release:
+                    preserve_next_release.remove(args[0])
+                else:
+                    values.pop(args[0], None)
             else:
                 raise AssertionError(f"Unsupported reference Device op: {name}")
             positions[slot] += 1

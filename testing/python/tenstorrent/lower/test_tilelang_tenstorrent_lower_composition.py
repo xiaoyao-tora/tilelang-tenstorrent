@@ -230,7 +230,7 @@ def test_independent_fragment_pipeline_prefetch_and_semantics(stages, extent):
     calls = list(_calls(transfer.body))
     first_completion = next(i for i, call in enumerate(calls) if call.op.name == "tl.tt.dfb_copy_wait")
     assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in calls[:first_completion]) == min(stages, extent)
-    assert len(set(map(int, mod.attrs["tt.dfb_storage_groups"].values()))) == 2
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == len(mod.attrs["tt.dfb_table"])
 
 
 def full_k_pipeline(blocks=5, stages=2):
@@ -261,10 +261,9 @@ def test_full_k_pipeline_preserves_fp32_and_finite_pools(seed):
     result, _ = interpret(mod, [a, b, np.zeros((32, 32), "float32")], seed)
     np.testing.assert_array_equal(result[2], identity * 2.375)
     assert int(mod.attrs["tt.accumulator_table"][0].full_k_tiles) == 5
-    relations = mod.attrs["tt.pipeline_relations"]
-    singletons = [dfb for dfb in mod.attrs["tt.dfb_table"] if int(relations[str(int(dfb.dfb_id))][0]) == -1]
+    singletons = [dfb for dfb in mod.attrs["tt.dfb_table"] if str(dfb.producer_slot) == "trisc" and str(dfb.consumer_slot) == "ncrisc"]
     assert len(singletons) == 1 and int(singletons[0].block_count) == 1
-    assert len(set(map(int, mod.attrs["tt.dfb_storage_groups"].values()))) == 3
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == len(mod.attrs["tt.dfb_table"])
     transfers = [call for f in mod.functions.values() if str(f.attrs["tt.kernel_slot"]) == "ncrisc" for call in _calls(f.body)]
     first_completion = next(i for i, call in enumerate(transfers) if call.op.name == "tl.tt.dfb_copy_wait")
     assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in transfers[:first_completion]) == 4

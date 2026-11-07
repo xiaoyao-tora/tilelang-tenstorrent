@@ -2540,11 +2540,14 @@ PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
 class DeviceIDRemapper : public StmtExprMutator {
 public:
   DeviceIDRemapper(int64_t offset,
-                   const std::vector<int64_t> *resource_ids = nullptr)
-      : offset_(offset), resource_ids_(resource_ids) {}
+                   const std::vector<int64_t> *resource_ids = nullptr,
+                   bool annotate_streams = false)
+      : offset_(offset), resource_ids_(resource_ids),
+        annotate_streams_(annotate_streams) {}
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     auto args = call->args;
+    std::vector<int64_t> referenced_resources;
     auto shift = [&](size_t index) {
       int64_t id = *as_const_int(args[index]);
       if (resource_ids_) {
@@ -2555,7 +2558,10 @@ public:
       } else {
         id += offset_;
       }
-      args.Set(index, Integer(id));
+      args.Set(index, IntImm(args[index].dtype(), id,
+                             args[index]->span.defined() ? args[index]->span
+                                                         : call->span));
+      referenced_resources.push_back(id);
     };
     if (call->op.same_as(compute_value())) {
       for (size_t index = 1; index < args.size(); ++index)
@@ -2588,12 +2594,60 @@ public:
                call->op.same_as(tenstorrent::dfb_load())) {
       shift(0);
     }
-    return Call(call->dtype, call->op, args, call->annotations, op->span);
+    auto annotations = call->annotations;
+    bool stream_lifecycle = call->op.same_as(tenstorrent::dfb_reserve()) ||
+                            call->op.same_as(tenstorrent::dfb_wait()) ||
+                            call->op.same_as(tenstorrent::dfb_copy_wait()) ||
+                            call->op.same_as(tenstorrent::dfb_release()) ||
+                            call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
+                            call->op.same_as(tenstorrent::dfb_to_tensor_nd()) ||
+                            call->op.same_as(tenstorrent::dfb_pipe_send()) ||
+                            call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+                            call->op.same_as(tenstorrent::dfb_pipe_wait());
+    if (annotate_streams_ && stream_lifecycle &&
+        !referenced_resources.empty()) {
+      std::string identity;
+      for (int64_t resource : referenced_resources) {
+        if (!identity.empty())
+          identity += ",";
+        identity += std::to_string(resource);
+      }
+      annotations.Set("tt.stream_identity", StringImm(identity));
+    }
+    return Call(call->dtype, call->op, args, annotations, op->span);
   }
 
 private:
   int64_t offset_;
   const std::vector<int64_t> *resource_ids_{nullptr};
+  bool annotate_streams_{false};
+};
+
+class DuplicateGenerationWaitRemover : public StmtExprMutator {
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!call || !call->op.same_as(tenstorrent::dfb_wait()))
+      return StmtExprMutator::VisitStmt_(op);
+    const int64_t *resource = as_const_int(call->args[0]);
+    if (!resource)
+      ThrowMalformed("pre-stream DFB wait must have a static generation ID");
+    if (!waited_.insert(*resource).second)
+      return Evaluate(Integer(0));
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  std::set<int64_t> waited_;
+};
+
+class StreamIdentityAnnotationRemover : public StmtExprMutator {
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (!call->annotations.count("tt.stream_identity"))
+      return call;
+    auto annotations = call->annotations;
+    annotations.erase("tt.stream_identity");
+    return Call(call->dtype, call->op, call->args, annotations, call->span);
+  }
 };
 
 using TransferStepKey =
@@ -3071,6 +3125,110 @@ ffi::Map<ffi::String, Integer> PlanNonPipelineStorageGroups(
   return assignments;
 }
 
+struct LogicalStreamPlan {
+  ffi::Array<DFBStorageGroupDescriptor> descriptors;
+  std::vector<int64_t> resource_stream_ids;
+};
+
+bool SameLogicalStreamContract(const DFBStorageGroupDescriptor &stream,
+                               const DFBDescriptor &resource) {
+  return stream->element_dtype == resource->element_dtype &&
+         ffi::StructuralEqual()(stream->tile_shape, resource->tile_shape) &&
+         ffi::StructuralEqual()(stream->block_shape_in_tiles,
+                                resource->block_shape_in_tiles) &&
+         ffi::StructuralEqual()(stream->block_count, resource->block_count) &&
+         stream->producer_slot == resource->producer_slot &&
+         ffi::StructuralEqual()(stream->producer_domain,
+                                resource->producer_domain) &&
+         stream->consumer_slot == resource->consumer_slot &&
+         ffi::StructuralEqual()(stream->consumer_domain,
+                                resource->consumer_domain);
+}
+
+LogicalStreamPlan
+BuildLogicalStreamPlan(const ffi::Array<DFBDescriptor> &resources,
+                       const ffi::Map<ffi::String, Integer> &raw_groups) {
+  if (raw_groups.size() != resources.size())
+    ThrowMalformed("logical stream plan must cover every DFB transaction");
+  LogicalStreamPlan result;
+  result.resource_stream_ids.assign(resources.size(), -1);
+  std::map<int64_t, int64_t> canonical_groups;
+  for (const DFBDescriptor &resource : resources) {
+    int64_t id = resource->dfb_id;
+    if (id < 0 || id >= static_cast<int64_t>(resources.size()) ||
+        result.resource_stream_ids[id] >= 0)
+      ThrowMalformed("DFB transaction IDs must be dense and unique");
+    ffi::String key = std::to_string(id);
+    if (!raw_groups.count(key))
+      ThrowMalformed("logical stream plan is missing a DFB transaction");
+    int64_t raw_group = raw_groups.at(key)->value;
+    if (raw_group < 0)
+      ThrowMalformed("logical stream ID must be nonnegative");
+    auto [found, inserted] =
+        canonical_groups.emplace(raw_group, canonical_groups.size());
+    int64_t stream_id = found->second;
+    result.resource_stream_ids[id] = stream_id;
+    if (inserted) {
+      result.descriptors.push_back(DFBStorageGroupDescriptor(
+          stream_id, resource->element_dtype, resource->tile_shape,
+          resource->block_shape_in_tiles, resource->block_count,
+          resource->producer_slot, resource->producer_domain,
+          resource->consumer_slot, resource->consumer_domain,
+          resource->transaction_count_or_loop_relation, std::nullopt,
+          resource->source_span));
+    } else if (!SameLogicalStreamContract(result.descriptors[stream_id],
+                                          resource)) {
+      ThrowMalformed("logical stream transactions disagree on capacity, "
+                     "layout, or slots");
+    }
+  }
+  return result;
+}
+
+void FinalizeLogicalStreamTransactionCounts(
+    LogicalStreamPlan *plan, const ffi::Array<DFBDescriptor> &resources,
+    const std::array<std::vector<DeviceCoreBody>, 3> &shared_bodies) {
+  std::map<std::tuple<int64_t, int64_t, int64_t>, int64_t> per_core;
+  for (const auto &slot_bodies : shared_bodies) {
+    for (const DeviceCoreBody &core_body : slot_bodies) {
+      PostOrderVisit(core_body.body, [&](const ffi::ObjectRef &object) {
+        const auto *call = object.as<CallNode>();
+        if (!call || !call->op.same_as(tenstorrent::dfb_reserve()))
+          return;
+        const int64_t *resource_id = as_const_int(call->args[0]);
+        if (!resource_id || *resource_id < 0 ||
+            *resource_id >= static_cast<int64_t>(resources.size()))
+          ThrowMalformed("pre-stream DFB reserve has an invalid generation ID");
+        int64_t stream_id = plan->resource_stream_ids[*resource_id];
+        int64_t transactions = RequirePositiveStaticInteger(
+            resources[*resource_id]->transaction_count_or_loop_relation,
+            "DFB transaction count");
+        auto key = std::make_tuple(core_body.x, core_body.y, stream_id);
+        if (per_core[key] > std::numeric_limits<int64_t>::max() - transactions)
+          ThrowMalformed("logical stream transaction count overflows");
+        per_core[key] += transactions;
+      });
+    }
+  }
+  std::vector<int64_t> maxima(plan->descriptors.size(), 0);
+  for (const auto &[key, count] : per_core)
+    maxima[std::get<2>(key)] = std::max(maxima[std::get<2>(key)], count);
+  for (size_t stream_id = 0; stream_id < plan->descriptors.size();
+       ++stream_id) {
+    if (maxima[stream_id] <= 0)
+      ThrowMalformed("logical stream has no producer reservation");
+    const DFBStorageGroupDescriptor &stream = plan->descriptors[stream_id];
+    plan->descriptors.Set(
+        stream_id, DFBStorageGroupDescriptor(
+                       stream->storage_group_id, stream->element_dtype,
+                       stream->tile_shape, stream->block_shape_in_tiles,
+                       stream->block_count, stream->producer_slot,
+                       stream->producer_domain, stream->consumer_slot,
+                       stream->consumer_domain, Integer(maxima[stream_id]),
+                       stream->storage_backing, stream->source_span));
+  }
+}
+
 IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                               const Target &target,
                               const ffi::String &operation,
@@ -3502,6 +3660,66 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
         step->parameter, step->source_span));
   }
   communication_steps = std::move(ordered_steps);
+
+  ffi::Map<ffi::String, Integer> materialized_streams = storage_groups;
+  if (pipeline_extent) {
+    materialized_streams = {};
+    for (const DFBDescriptor &dfb : dfbs)
+      materialized_streams.Set(std::to_string(dfb->dfb_id),
+                               Integer(dfb->dfb_id));
+  }
+  LogicalStreamPlan stream_plan =
+      BuildLogicalStreamPlan(dfbs, materialized_streams);
+  FinalizeLogicalStreamTransactionCounts(&stream_plan, dfbs, shared_bodies);
+  auto stream_id = [&](int64_t resource) {
+    if (resource < 0)
+      return resource;
+    if (resource >=
+            static_cast<int64_t>(stream_plan.resource_stream_ids.size()) ||
+        stream_plan.resource_stream_ids[resource] < 0)
+      ThrowMalformed("Device metadata references an unplanned DFB transaction");
+    return stream_plan.resource_stream_ids[resource];
+  };
+  DeviceIDRemapper remap_streams(0, &stream_plan.resource_stream_ids,
+                                 /*annotate_streams=*/true);
+  for (auto &slot_bodies : shared_bodies)
+    for (DeviceCoreBody &core_body : slot_bodies) {
+      core_body.body = DuplicateGenerationWaitRemover()(core_body.body);
+      core_body.body = remap_streams(core_body.body);
+    }
+
+  ffi::Array<CommunicationStepDescriptor> stream_steps;
+  for (const CommunicationStepDescriptor &step : communication_steps)
+    stream_steps.push_back(CommunicationStepDescriptor(
+        step->step_id, step->communication_id, step->occurrence, step->kind,
+        step->source_core, step->destination_core,
+        stream_id(step->source_dfb_id), stream_id(step->destination_dfb_id),
+        step->owner_slot, step->dependencies, step->parameter,
+        step->source_span));
+  communication_steps = std::move(stream_steps);
+
+  ffi::Array<PipeDescriptor> stream_pipes;
+  for (const PipeDescriptor &pipe : pipes)
+    stream_pipes.push_back(
+        PipeDescriptor(pipe->pipe_net_id, pipe->event_index, pipe->src_coord,
+                       pipe->dst_begin, pipe->dst_end, pipe->contract,
+                       stream_id(pipe->payload_dfb_id), pipe->source_span));
+  pipes = std::move(stream_pipes);
+
+  ffi::Array<ComputeValueDescriptor> stream_values;
+  for (const ComputeValueDescriptor &value : compute_values) {
+    ffi::Array<Integer> materialization_refs;
+    for (const Integer &resource : value->materialization_refs)
+      materialization_refs.push_back(Integer(stream_id(resource->value)));
+    stream_values.push_back(ComputeValueDescriptor(
+        value->value_id, value->buffer, value->version,
+        value->previous_value_id, value->accumulator_id, value->value_kind,
+        value->logical_shape, value->compute_tile_shape, value->dtype,
+        value->owner_slot, value->core_domain, materialization_refs,
+        value->source_span));
+  }
+  compute_values = std::move(stream_values);
+
   const std::array<ffi::String, 3> slots = {"trisc", "ncrisc", "brisc"};
   for (size_t index = 0; index < slots.size(); ++index) {
     const ffi::String &slot = slots[index];
@@ -3516,6 +3734,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       tensor_indices.push_back(Integer(tensor));
     Stmt slot_body = ParameterizeDeviceCoreStatements(shared_bodies[index], gx,
                                                       gy, slot, frontend->span);
+    slot_body = StreamIdentityAnnotationRemover()(slot_body);
     PrimFunc func = MakeSlotFunction(
         frontend, target, shared_domain, operation, slot,
         compute ? "compute" : "datamovement",
@@ -3546,6 +3765,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       {kOperationIdentityAttr, OperationIdentity(operation, frontend->span)},
       {kTensorTableAttr, tensors},
       {kDFBTableAttr, dfbs},
+      {kDFBStorageGroupsAttr, stream_plan.descriptors},
+      {"tt.stream_operands", Integer(1)},
       {"tt.communication_table", communications},
       {"tt.communication_step_table", communication_steps},
       {"tt.transport_table", pipes},

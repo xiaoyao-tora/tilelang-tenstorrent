@@ -1,5 +1,7 @@
 """Device formation, dependency, metadata, and host-reference regressions."""
 
+import inspect
+
 import numpy as np
 import pytest
 
@@ -20,7 +22,6 @@ from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute i
     transpose_program,
 )
 from testing.python.tenstorrent.legacy.test_tilelang_tenstorrent_phase2_device_ir import (
-    _replace_dfb,
     _slots,
 )
 from testing.python.tenstorrent._support.reference import _calls, _core_statements, _with_core_statements
@@ -46,6 +47,12 @@ def replace_core_statements(mod, slot, statements):
             mod[global_var] = _with_core_statements(function, statements)
             return
     raise AssertionError(f"missing slot {slot}")
+
+
+def replace_group(group, **changes):
+    fields = {name: getattr(group, name) for name in inspect.signature(D.DFBStorageGroupDescriptor.__init__).parameters if name != "self"}
+    fields.update(changes)
+    return D.DFBStorageGroupDescriptor(**fields)
 
 
 def reference_device(mod, inputs):
@@ -168,7 +175,7 @@ def test_elementwise_semantics(monkeypatch, broadcast, inplace):
     b = rng.uniform(0.5, 2, (32 if broadcast else 64, 64)).astype("float32")
     actual = reference_device(mod, {0: a, 1: b})[2]
     np.testing.assert_allclose(actual, np.sqrt(a * a + (b[0] if broadcast else b)) / 2, rtol=1e-6)
-    assert all(".generation" in str(d.source_buffer_identity) for d in mod.attrs["tt.dfb_table"])
+    assert all(str(d.source_buffer_identity).startswith("stream.") for d in mod.attrs["tt.dfb_table"])
 
 
 @pytest.mark.parametrize("program", [cast_program, fill_program, transpose_program])
@@ -212,9 +219,9 @@ def test_reduction_semantics(monkeypatch, kind, axis, clear):
 )
 def test_resource_metadata_rejected(monkeypatch, change, match):
     mod = lower(monkeypatch, elementwise_program())
-    dfbs = list(mod.attrs["tt.dfb_table"])
-    dfbs[0] = _replace_dfb(dfbs[0], **change)
-    mod = mod.with_attr("tt.dfb_table", dfbs)
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
+    groups[0] = replace_group(groups[0], **change)
+    mod = mod.with_attr("tt.dfb_storage_groups", groups)
     with pytest.raises(ValueError, match=match):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
@@ -226,7 +233,7 @@ def test_missing_wait_rejected(monkeypatch):
         statement for statement in statements if not (statement.value.op.name == "tl.tt.dfb_wait" and int(statement.value.args[0]) == 0)
     ]
     replace_core_statements(mod, "trisc", statements)
-    with pytest.raises(ValueError, match="missing consumer wait"):
+    with pytest.raises(ValueError, match="missing consumer wait|no active acquisition"):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 

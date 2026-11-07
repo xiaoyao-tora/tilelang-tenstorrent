@@ -15,9 +15,7 @@ def preflight_ttl_mapping(mod: IRModule) -> None:
     attrs = mod.attrs
     issues: set[str] = set()
     required = (
-        "tt.dfb_families",
         "tt.dfb_storage_groups",
-        "tt.dfb_storage_group_relations",
         "tt.communication_step_families",
         "tt.transport_families",
         "tt.kernel_order",
@@ -46,7 +44,7 @@ def preflight_ttl_mapping(mod: IRModule) -> None:
     try:
         resolve_current_function_groups(mod)
     except (KeyError, ResourceResolutionError) as error:
-        issues.add(f"DFB-family binding resolution failed: {error}")
+        issues.add(f"DFB stream binding resolution failed: {error}")
     current_operations = {
         "tl.tt.core_x",
         "tl.tt.core_y",

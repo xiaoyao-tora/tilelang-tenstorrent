@@ -1,5 +1,7 @@
 """Independent verifier checks for composed v7 lowering contracts."""
 
+import inspect
+
 import pytest
 
 from tilelang import tvm
@@ -243,23 +245,22 @@ def test_pipeline_value_cannot_resurrect_released_previous_epoch():
     check_rejected(malformed, "after release")
 
 
-@pytest.mark.parametrize("mutation", ["stage", "shared_pool"])
-def test_pipeline_singleton_contract_cannot_be_forged(mutation):
+@pytest.mark.parametrize("mutation", ["transaction_count", "duplicate_id"])
+def test_pipeline_stream_contract_cannot_be_forged(mutation):
     from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_lower_composition import full_k_pipeline, lower
 
     mod = lower(full_k_pipeline(), version=5)
-    relations = {str(key): list(value) for key, value in mod.attrs["tt.pipeline_relations"].items()}
-    singleton = next(key for key, relation in relations.items() if int(relation[0]) == -1)
-    if mutation == "stage":
-        relations[singleton] = [tirx.IntImm("int64", -1), tirx.IntImm("int64", 1)]
-        malformed = mod.with_attr("tt.pipeline_relations", relations)
-        check_rejected(malformed, "invalid iteration/stage")
-    else:
-        groups = {str(key): value for key, value in mod.attrs["tt.dfb_storage_groups"].items()}
-        pooled = next(key for key, relation in relations.items() if int(relation[0]) >= 0)
-        groups[singleton] = groups[pooled]
-        malformed = mod.with_attr("tt.dfb_storage_groups", groups)
-        check_rejected(malformed, "singleton|generations disagree")
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
+    group = groups[0]
+    fields = {name: getattr(group, name) for name in inspect.signature(D.DFBStorageGroupDescriptor.__init__).parameters if name != "self"}
+    fields["transaction_count_or_loop_relation" if mutation == "transaction_count" else "storage_group_id"] = (
+        2 if mutation == "transaction_count" else 1
+    )
+    groups[0] = D.DFBStorageGroupDescriptor(**fields)
+    check_rejected(
+        mod.with_attr("tt.dfb_storage_groups", groups),
+        "transaction count disagrees|IDs must be dense",
+    )
 
 
 @pytest.mark.skip(reason="legacy PipeNet pipeline is not an active v04 Lower input")
