@@ -921,8 +921,6 @@ public:
     });
   }
 
-  bool HasUnconsumedCompute() const { return has_unconsumed_compute_; }
-
 private:
   bool IsAccumulator(const Buffer &buffer) const {
     return accumulator_plan_.Contains(buffer);
@@ -939,21 +937,22 @@ private:
     const auto *store = block->body.as<BufferStoreNode>();
     ICHECK(store != nullptr);
     const Buffer &output = store->buffer;
-    bool supported_dtype = true;
     PostOrderVisit(store->value, [&](const ffi::ObjectRef &object) {
       if (auto expr = object.as<PrimExpr>()) {
         if (!expr.value().as<IntImmNode>() && !expr.value().as<VarNode>()) {
           DataType dtype = expr.value().dtype();
-          supported_dtype &= dtype.lanes() == 1 &&
-                             (dtype == DataType::BFloat(16) ||
-                              dtype == DataType::Float(32) || dtype.is_bool());
+          if (dtype.lanes() != 1 ||
+              (dtype != DataType::BFloat(16) && dtype != DataType::Float(32) &&
+               !dtype.is_bool()))
+            ThrowUnsupported(
+                "structured elementwise expression supports scalar bfloat16, "
+                "float32 and bool values, got " +
+                DTypeName(dtype) + " in output buffer '" +
+                std::string(output->name) + "'");
         }
       }
     });
-    supported_dtype &= output->dtype == DataType::BFloat(16) ||
-                       output->dtype == DataType::Float(32);
-    if (!supported_dtype)
-      return ffi::GetRef<Stmt>(op);
+    ValidateDType(output->dtype);
     Span span = block->span.defined() ? block->span : op->span;
     ComputeDTypeVerifier dtype_verifier;
     dtype_verifier(store->value);
@@ -1168,10 +1167,11 @@ private:
             copy->src->dtype == copy->dst->dtype ? "copy" : "typecast";
         BufferRegion output(copy->dst, copy->dst_range);
         if (copy->dst.scope() != "global" && !copy->dst.scope().empty() &&
-            !IsFullBufferRegion(output)) {
-          has_unconsumed_compute_ = true;
-          return ffi::GetRef<Stmt>(op);
-        }
+            !IsFullBufferRegion(output))
+          ThrowUnsupported("fragment materialization to buffer '" +
+                           std::string(copy->dst->name) +
+                           "' requires a complete destination region; partial "
+                           "materialization has no Device consumer");
         Annotations annotations = BaseAnnotations(copy->dst, kind);
         ffi::Array<PrimExpr> zeros, domain;
         for (const Range &range : copy->src_range)
@@ -1247,10 +1247,9 @@ private:
 
   const GemmAccumulatorPlan &accumulator_plan_;
   bool has_fragment_compute_{false};
-  bool has_unconsumed_compute_{false};
 };
 
-bool HasUnconsumedStructuredCompute(const Stmt &body) {
+bool HasStructuredCompute(const Stmt &body) {
   bool found = false;
   PostOrderVisit(body, [&](const ffi::ObjectRef &object) {
     if (auto block = object.as<SBlock>())
@@ -1271,12 +1270,8 @@ tvm::transform::Pass LegalizeTenstorrentTileOps() {
         GemmAccumulatorAnalyzer::Analyze(func);
     StructuredComputeLowerer lowerer(func, accumulator_plan);
     Stmt body = lowerer(func->body);
-    // A legal but unsupported compute leaves its structured block intact. Do
-    // not expose a mixed function when this pass is invoked directly; the
-    // pipeline will recognize the unchanged block and return its Pass-08
-    // snapshot with a deferred reason.
-    if (lowerer.HasUnconsumedCompute() || HasUnconsumedStructuredCompute(body))
-      return func;
+    if (HasStructuredCompute(body))
+      ThrowUnsupported("structured compute block has no Device consumer");
     if (!body.same_as(func->body)) {
       func.CopyOnWrite()->body = std::move(body);
     }

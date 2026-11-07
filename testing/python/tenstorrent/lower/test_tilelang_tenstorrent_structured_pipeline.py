@@ -1,4 +1,4 @@
-"""Structured success is atomic and cannot hide invalid frontend dataflow."""
+"""Strict Lower errors are atomic and cannot hide invalid frontend dataflow."""
 
 import pytest
 
@@ -37,58 +37,38 @@ def standalone_fill():
         T.fill(a, 1)
 
 
-def compute_blocks(mod):
-    found = []
-    for func in mod.functions.values():
-        tirx.stmt_functor.post_order_visit(
-            func.body,
-            lambda node: found.append(node) if isinstance(node, tirx.SBlock) and "tl.tt.compute_kind" in node.annotations else None,
-        )
-    return found
-
-
-def test_unsupported_dtype_returns_whole_structured_module_without_mutation():
+def test_unsupported_dtype_fails_at_legalization_without_mutation():
     frontend = tvm.IRModule({"main": program()})
     before = ir.save_json(frontend)
-    result = lower_tenstorrent_ir(frontend, TARGET)
-    assert result.attrs["tt.ir_stage"] == "structured"
-    assert "tt.device_ir_version" not in result.attrs
-    assert len(compute_blocks(result)) == 1
-    assert "tl.tt.tile_compute" not in result.script()
-    assert "tl.tt.tile_add" not in result.script()
+    with pytest.raises(NotImplementedError, match="structured elementwise expression.*float16"):
+        lower_tenstorrent_ir(frontend, TARGET)
     assert ir.save_json(frontend) == before
-    transform.VerifyTTComputeBlocks()(result)
-    ir.assert_structural_equal(ir.load_json(ir.save_json(result)), result)
-    with pytest.raises(ValueError, match="original frontend module"):
-        lower_tenstorrent_ir(result, TARGET)
 
 
-def test_supported_sibling_is_not_partially_rewritten_on_structured_return():
+def test_multiple_frontend_functions_are_rejected_before_lowering():
     frontend = tvm.IRModule({"deferred": program(), "supported": program("float32")})
     with pytest.raises(NotImplementedError, match="exactly one frontend PrimFunc"):
         lower_tenstorrent_ir(frontend, TARGET)
 
 
 @pytest.mark.parametrize("initialize,partial", [(False, False), (True, True)])
-def test_deferred_capability_does_not_hide_read_before_initialization(initialize, partial):
+def test_unsupported_capability_does_not_hide_read_before_initialization(initialize, partial):
     frontend = tvm.IRModule({"main": program(initialize=initialize, partial=partial)})
     with pytest.raises(ValueError, match="definite initialization"):
         lower_tenstorrent_ir(frontend, TARGET)
 
 
-def test_invalid_supported_sibling_cannot_hide_behind_deferred_capability():
+def test_invalid_multiple_frontend_functions_fail_at_contract_boundary():
     frontend = tvm.IRModule({"deferred": program(), "invalid": program("float32", initialize=False)})
     with pytest.raises(NotImplementedError, match="exactly one frontend PrimFunc"):
         lower_tenstorrent_ir(frontend, TARGET)
 
 
-def test_standalone_computation_is_structured_and_compile_pipeline_is_strict():
+def test_standalone_computation_fails_without_tensor_abi():
     frontend = tvm.IRModule({"main": standalone_fill})
-    result = lower_tenstorrent_ir(frontend, TARGET)
-    assert result.attrs["tt.ir_stage"] == "structured"
-    assert "Tensor ABI" in str(result.attrs["tt.deferred_reasons"])
-    assert "T.fill(" in result.script()
-    with pytest.raises(NotImplementedError, match="structured IR, not executable Device IR"):
+    with pytest.raises(NotImplementedError, match="standalone computation has no Tensor ABI"):
+        lower_tenstorrent_ir(frontend, TARGET)
+    with pytest.raises(NotImplementedError, match="standalone computation has no Tensor ABI"):
         TENSTORRENT_PIPELINE.lower(frontend, TARGET)
 
 
@@ -118,8 +98,8 @@ def test_frontend_prebound_target_is_rejected_without_mutation(bound_target, low
     assert ir.save_json(frontend) == before
 
 
-def test_unconsumed_compute_is_rejected_before_host_device_filtering():
-    with pytest.raises(NotImplementedError, match="compute block has no Device consumer"):
+def test_unsupported_compute_is_rejected_before_host_device_filtering():
+    with pytest.raises(NotImplementedError, match="structured elementwise expression.*float16"):
         TENSTORRENT_PIPELINE.lower(tvm.IRModule({"main": program()}), TARGET)
 
 

@@ -34,10 +34,10 @@ BindTarget
 | FormTenstorrentDeviceProgram | 所有 compute 已消费、layout 完整的单 Core 程序 | 版本化 DFB、显式 transaction、TRISC/NCRISC/BRISC 和 typed module metadata |
 | VerifyTenstorrentDeviceIR | Device IR module 及所有 slot | 检查 schema、操作数、dtype、shape、effect、资源归属、ABI 和资源协议；不修补错误 IR |
 
-完整 backend pipeline 要么返回通过 `VerifyTenstorrentDeviceIR` 的 module，要么报告
-具体不支持条件。独立的 `lower_tenstorrent_ir` 入口还允许返回验证后的完整 structured
-module，并标记 `tt.ir_stage="structured"`；它不表示可执行。需要只查看 capture
-结果的工具和测试仍可直接调用前两个 compute Pass。
+`lower_tenstorrent_ir` 和完整 backend pipeline 都只返回通过
+`VerifyTenstorrentDeviceIR` 的 module。不支持的程序在负责该能力的 Pass 中抛出
+`NotImplementedError`，malformed IR 或失败的语义证明抛出 `ValueError`。需要查看
+capture 结果的工具和测试直接调用 canonicalize 与 structured verifier Pass。
 
 GEMM fragment 的完整 K 生命周期和 v5 扩展见
 [accumulator precision](tenstorrent_accumulator_precision.md)。本文的 v2 DFB GEMM

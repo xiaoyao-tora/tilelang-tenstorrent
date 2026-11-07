@@ -132,6 +132,5 @@ def test_branch_with_transfer_effect_is_not_speculated():
             if p[0, 0] > 0:
                 T.copy(a, C)
 
-    result = lower(main)
-    assert str(result.attrs["tt.ir_stage"]) == "structured"
-    assert any("control flow" in str(reason) or "transaction" in str(reason) for reason in result.attrs["tt.deferred_reasons"])
+    with pytest.raises(NotImplementedError, match="data-dependent control flow.*transaction"):
+        lower(main)

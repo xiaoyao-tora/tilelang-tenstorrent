@@ -454,9 +454,8 @@ def pipeline_tensor_inout():
 
 
 def test_fragment_tensor_inout_cannot_be_prefetched():
-    mod = lower_result(pipeline_tensor_inout())
-    assert str(mod.attrs["tt.ir_stage"]) == "structured"
-    assert any("inout Tensor" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])  # codespell:ignore inout
+    with pytest.raises(NotImplementedError, match="inout Tensor"):  # codespell:ignore inout
+        lower_result(pipeline_tensor_inout())
 
 
 def pipeline_carried_fragment():
@@ -474,6 +473,5 @@ def pipeline_carried_fragment():
 
 
 def test_loop_carried_ordinary_fragment_requires_explicit_spill_plan():
-    mod = lower_result(pipeline_carried_fragment())
-    assert str(mod.attrs["tt.ir_stage"]) == "structured"
-    assert any("carries a value across iterations" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])
+    with pytest.raises(NotImplementedError, match="carries a value across iterations"):
+        lower_result(pipeline_carried_fragment())

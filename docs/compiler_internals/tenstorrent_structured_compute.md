@@ -138,23 +138,17 @@ InferTenstorrentComputeRequirements
 VerifyTenstorrentDeviceIR
 ```
 
-`tilelang.tenstorrent.lower_tenstorrent_ir(mod, target)` returns Device IR when
-all computations have consumers. Versions 1–4 retain the existing Add, general,
-pipeline and multicore contracts; version 5 adds persistent GEMM accumulators.
-Legal unconsumed elementwise expressions and standalone computations without
-a Tensor ABI return the complete normalized module with
-`tt.ir_stage="structured"` and `tt.deferred_reasons`. Supported siblings are
-not partially replaced by Device operations in this result.
+`tilelang.tenstorrent.lower_tenstorrent_ir(mod, target)` returns verified Device
+IR. A computation without a complete Device consumer raises
+`NotImplementedError` in legalization, layout inference, formation, or compute
+requirement inference. `VerifyTTStructuredDataflow` checks definite
+initialization and region bounds before those capability checks; uninitialized
+reads, malformed metadata and failed semantic proofs raise `ValueError`.
 
-Before structured return, `VerifyTTStructuredDataflow` checks definite
-initialization and region bounds. Uninitialized reads, malformed metadata and
-other errors are not converted into capability fallbacks. This verifier is
-conservative about aliases and symbolic regions. The registered compilation
-pipeline still requires Device IR and rejects structured output before shared
-host/device filtering. Clients needing capture alone can continue to invoke
-the two capture passes directly. To rerun the complete lowering pipeline, pass
-the original frontend module; normalized structured input is explicitly rejected
-instead of trusting its stage marker to bypass frontend validation.
+Clients needing capture alone invoke the capture and structured verifier passes
+directly. Complete lowering accepts only the original frontend module;
+normalized structured input is rejected instead of trusting a stage marker to
+bypass frontend validation.
 
 SIMT layout inference, generic simplification, `LowerOpaqueBlock`, buffer
 flattening, and scalar loop lowering do not run on the structured templates.

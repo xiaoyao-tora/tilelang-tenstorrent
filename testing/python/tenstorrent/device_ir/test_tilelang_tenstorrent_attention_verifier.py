@@ -36,15 +36,9 @@ def attention_row_program(dtype="float32", cores=1):
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("cores", [1, 2])
-def test_attention_row_padding_materialization_is_atomically_deferred(dtype, cores):
-    mod = attention_row_program(dtype, cores)
-    assert str(mod.attrs["tt.ir_stage"]) == "structured"
-    assert "tt.device_ir_version" not in mod.attrs
-    assert len(mod.functions) == 1
-    assert "tt.dfb_table" not in mod.attrs
-    assert any("no complete Device consumer" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])
-    restored = ir.load_json(ir.save_json(mod))
-    assert ir.structural_equal(mod, restored)
+def test_attention_partial_row_materialization_fails_at_legalization(dtype, cores):
+    with pytest.raises(NotImplementedError, match="partial materialization has no Device consumer"):
+        attention_row_program(dtype, cores)
 
 
 @pytest.mark.parametrize("cores", [1, 2])

@@ -75,9 +75,8 @@ def test_index_dependent_conditions_normalize_without_semantic_loss():
     from tilelang.tenstorrent import lower_tenstorrent_ir
 
     target = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": index_condition}), target)
-    assert str(mod.attrs["tt.ir_stage"]) == "structured"
-    assert any("data-dependent control flow" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])
+    with pytest.raises(NotImplementedError, match="data-dependent control flow"):
+        lower_tenstorrent_ir(tvm.IRModule({"main": index_condition}), target)
 
 
 @pytest.mark.parametrize("mutation", ["trip_count", "relation", "unwrapped", "step"])
