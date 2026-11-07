@@ -177,6 +177,26 @@ def test_compound_expression_and_repeated_loads():
     assert _effects_by_name(block.reads) == {"A": [64, 64], "B": [64, 64]}
 
 
+def test_multiple_stores_form_ordered_single_output_blocks():
+    def body(a, b, c, ij, store):
+        return tirx.SeqStmt([store, tirx.BufferStore(a, c[tuple(ij)] * b[0, ij[1]], ij)])
+
+    mod = _canonicalize(_module(body=body))
+    root_body = mod["main"].body.block.body
+    assert isinstance(root_body, tirx.SeqStmt)
+    assert len(root_body.seq) == 2
+    blocks = [statement.block for statement in root_body.seq]
+    assert all(isinstance(statement, tirx.SBlockRealize) for statement in root_body.seq)
+    assert [block.writes[0].buffer.name for block in blocks] == ["C", "A"]
+    assert [_effects_by_name(block.reads) for block in blocks] == [
+        {"A": [64, 64], "B": [64, 64]},
+        {"C": [64, 64], "B": [1, 64]},
+    ]
+    assert all(len(block.writes) == 1 for block in blocks)
+    assert not _nodes(mod["main"], tirx.For)
+    transform.VerifyTTComputeBlocks()(mod)
+
+
 @pytest.mark.parametrize("kind", ["constant", "cast", "exp", "inplace"])
 def test_pure_expression_templates(kind):
     def expression(a, b, c, ij):
@@ -359,11 +379,9 @@ def test_reject_unsupported_access_or_expression(kind):
     _reject(_module(expression=expression), "indices|[Aa]ccess|loop variables|[Cc]all|pure|Phase 1")
 
 
-@pytest.mark.parametrize("kind", ["stores", "conditional", "nested", "loop", "side_effect", "copy", "gemm"])
+@pytest.mark.parametrize("kind", ["conditional", "nested", "loop", "side_effect", "copy", "gemm"])
 def test_reject_unsupported_scope_body(kind):
     def body(a, b, c, ij, store):
-        if kind == "stores":
-            return tirx.SeqStmt([store, tirx.BufferStore(a, b[tuple(ij)], ij)])
         if kind == "conditional":
             return tirx.IfThenElse(ij[0] < 10, store, None)
         if kind == "nested":
@@ -378,6 +396,20 @@ def test_reject_unsupported_scope_body(kind):
         return tirx.SeqStmt([tirx.Evaluate(value), store])
 
     _reject(_module(body=body), "[Ss]tore|body|[Nn]ested|scope|unsupported|Phase 1")
+
+
+@pytest.mark.parametrize("kind", ["repeated_output", "broadcast_dependency"])
+def test_reject_unsafe_multiple_store_dependencies_atomically(kind):
+    def body(a, b, c, ij, store):
+        if kind == "repeated_output":
+            second = tirx.BufferStore(c, c[tuple(ij)] * a[tuple(ij)], ij)
+        else:
+            first = tirx.BufferStore(c, a[0, ij[1]] + b[tuple(ij)], ij)
+            second = tirx.BufferStore(a, b[tuple(ij)], ij)
+            return tirx.SeqStmt([first, second])
+        return tirx.SeqStmt([store, second])
+
+    _reject(_module(body=body), "written only once|matching logical coordinates")
 
 
 @pytest.mark.parametrize("kind", ["load", "store"])

@@ -278,8 +278,6 @@ def make_flash_attention(
                             row_scale_shared[row, col] = T.exp2((row_max_previous_shared[row, 0] - row_max_shared[row, 0]) * softmax_log2e)
                         for row, col in T.Tiles(scores_fragment):
                             scores_fragment[row, col] = T.exp2((scores_fragment[row, col] - row_max_shared[row, 0]) * softmax_log2e)
-
-                        for row, col in T.Tiles(probabilities_shared):
                             probabilities_shared[row, col] = T.cast(scores_fragment[row, col], input_dtype)
                         T.reduce_sum(scores_fragment, row_fragment, dim=1, clear=True)
                         for row, col in T.Tiles(row_sum_shared):
@@ -288,12 +286,17 @@ def make_flash_attention(
                         if mixed_precision:
                             T.gemm(probabilities_shared, v_compute_shared, pv_acc_fragment, clear_accum=True)
                             T.copy(pv_acc_fragment, pv_gemm_output_shared)
-                            for row, col in T.Tiles(pv_fragment):
+                            for row, col in T.Tiles(output_acc_fragment):
                                 pv_fragment[row, col] = T.cast(pv_gemm_output_shared[row, col], accum_dtype)
+                                output_acc_fragment[row, col] = (
+                                    output_acc_fragment[row, col] * row_scale_shared[row, 0] + pv_fragment[row, col]
+                                )
                         else:
                             T.gemm(probabilities_shared, v_compute_shared, pv_fragment, clear_accum=True)
-                        for row, col in T.Tiles(output_acc_fragment):
-                            output_acc_fragment[row, col] = output_acc_fragment[row, col] * row_scale_shared[row, 0] + pv_fragment[row, col]
+                            for row, col in T.Tiles(output_acc_fragment):
+                                output_acc_fragment[row, col] = (
+                                    output_acc_fragment[row, col] * row_scale_shared[row, 0] + pv_fragment[row, col]
+                                )
 
                     for row, col in T.Tiles(output_shared):
                         output_shared[row, col] = T.cast(output_acc_fragment[row, col] / row_sum_shared[row, 0], output_dtype)
