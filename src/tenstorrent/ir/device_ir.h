@@ -314,13 +314,19 @@ public:
                                              CommunicationDescriptorNode);
 };
 
-/*! \brief One deterministic Device communication/collective algorithm step. */
+/*! \brief One deterministic Device communication/collective algorithm step.
+ *
+ * Transport steps use a nonnegative Pipe record index. Local algorithm steps
+ * use -1. A record-level send has no single destination Core; destination
+ * receive/completion/publish steps retain their concrete Core instance.
+ */
 class CommunicationStepDescriptorNode : public ffi::Object {
 public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
       kTVMFFISEqHashKindTreeNode;
   int64_t step_id;
   int64_t communication_id;
+  int64_t record_index;
   int64_t occurrence;
   ffi::String kind;
   ffi::Optional<CoreCoord> source_core;
@@ -341,8 +347,9 @@ public:
 class CommunicationStepDescriptor : public ffi::ObjectRef {
 public:
   TVM_DLL CommunicationStepDescriptor(
-      int64_t step_id, int64_t communication_id, int64_t occurrence,
-      ffi::String kind, ffi::Optional<CoreCoord> source_core,
+      int64_t step_id, int64_t communication_id, int64_t record_index,
+      int64_t occurrence, ffi::String kind,
+      ffi::Optional<CoreCoord> source_core,
       ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
       int64_t destination_dfb_id, ffi::String owner_slot,
       ffi::Array<Integer> dependencies, PrimExpr parameter, Span source_span);

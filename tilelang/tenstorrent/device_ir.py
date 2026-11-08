@@ -377,10 +377,13 @@ class CommunicationDescriptor(Node):
 
 @tvm_ffi.register_object("tl.tenstorrent.CommunicationStepDescriptor")
 class CommunicationStepDescriptor(Node):
+    """One algorithm step keyed by communication, Pipe record and occurrence."""
+
     def __init__(
         self,
         step_id,
         communication_id,
+        record_index,
         occurrence,
         kind,
         source_core,
@@ -396,6 +399,7 @@ class CommunicationStepDescriptor(Node):
             _ffi_api.CommunicationStepDescriptor,
             int(step_id),
             int(communication_id),
+            int(record_index),
             int(occurrence),
             kind,
             source_core,

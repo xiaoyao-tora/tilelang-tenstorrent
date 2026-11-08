@@ -146,14 +146,15 @@ void CommunicationDescriptorNode::RegisterReflection() {
 }
 
 CommunicationStepDescriptor::CommunicationStepDescriptor(
-    int64_t step_id, int64_t communication_id, int64_t occurrence,
-    ffi::String kind, ffi::Optional<CoreCoord> source_core,
+    int64_t step_id, int64_t communication_id, int64_t record_index,
+    int64_t occurrence, ffi::String kind, ffi::Optional<CoreCoord> source_core,
     ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
     int64_t destination_dfb_id, ffi::String owner_slot,
     ffi::Array<Integer> dependencies, PrimExpr parameter, Span source_span) {
   auto node = ffi::make_object<CommunicationStepDescriptorNode>();
   node->step_id = step_id;
   node->communication_id = communication_id;
+  node->record_index = record_index;
   node->occurrence = occurrence;
   node->kind = std::move(kind);
   node->source_core = std::move(source_core);
@@ -172,6 +173,7 @@ void CommunicationStepDescriptorNode::RegisterReflection() {
       .def_ro("step_id", &CommunicationStepDescriptorNode::step_id)
       .def_ro("communication_id",
               &CommunicationStepDescriptorNode::communication_id)
+      .def_ro("record_index", &CommunicationStepDescriptorNode::record_index)
       .def_ro("occurrence", &CommunicationStepDescriptorNode::occurrence)
       .def_ro("kind", &CommunicationStepDescriptorNode::kind)
       .def_ro("source_core", &CommunicationStepDescriptorNode::source_core)
@@ -804,18 +806,19 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(source_span));
            })
       .def("tl.tenstorrent.CommunicationStepDescriptor",
-           [](int64_t step_id, int64_t communication_id, int64_t occurrence,
-              ffi::String kind, ffi::Optional<CoreCoord> source_core,
+           [](int64_t step_id, int64_t communication_id, int64_t record_index,
+              int64_t occurrence, ffi::String kind,
+              ffi::Optional<CoreCoord> source_core,
               ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
               int64_t destination_dfb_id, ffi::String owner_slot,
               ffi::Array<Integer> dependencies, PrimExpr parameter,
               Span source_span) {
              return CommunicationStepDescriptor(
-                 step_id, communication_id, occurrence, std::move(kind),
-                 std::move(source_core), std::move(destination_core),
-                 source_dfb_id, destination_dfb_id, std::move(owner_slot),
-                 std::move(dependencies), std::move(parameter),
-                 std::move(source_span));
+                 step_id, communication_id, record_index, occurrence,
+                 std::move(kind), std::move(source_core),
+                 std::move(destination_core), source_dfb_id, destination_dfb_id,
+                 std::move(owner_slot), std::move(dependencies),
+                 std::move(parameter), std::move(source_span));
            })
       .def("tl.tenstorrent.OperationIdentity",
            [](ffi::String operation_id, Span source_span) {

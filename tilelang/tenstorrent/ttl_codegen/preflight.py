@@ -5,6 +5,7 @@ from __future__ import annotations
 from tvm import IRModule, tirx
 
 from .resources import ResourceResolutionError, resolve_current_function_groups
+from .records import RecordResolutionError, resolve_transport_records
 
 
 class TTLMappingPreflightError(NotImplementedError):
@@ -45,6 +46,10 @@ def preflight_ttl_mapping(mod: IRModule) -> None:
         resolve_current_function_groups(mod)
     except (KeyError, ResourceResolutionError) as error:
         issues.add(f"DFB stream binding resolution failed: {error}")
+    try:
+        resolve_transport_records(mod)
+    except (KeyError, RecordResolutionError) as error:
+        issues.add(f"PipeNet record resolution failed: {error}")
     current_operations = {
         "tl.tt.core_x",
         "tl.tt.core_y",
@@ -62,9 +67,9 @@ def preflight_ttl_mapping(mod: IRModule) -> None:
         "tl.tt.dfb_wait",
         "tl.tt.dfb_copy_wait",
         "tl.tt.dfb_release",
-        "tl.tt.dfb_pipe_send",
-        "tl.tt.dfb_pipe_recv",
-        "tl.tt.dfb_pipe_wait",
+        "tl.tt.dfb_pipe_send_record",
+        "tl.tt.dfb_pipe_recv_record",
+        "tl.tt.dfb_pipe_wait_record",
         "tl.tt.dfb_local_copy",
         "tl.tt.dfb_gather_copy",
         "tl.tt.dfb_collective_reduce",

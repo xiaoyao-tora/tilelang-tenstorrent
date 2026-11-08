@@ -4,6 +4,7 @@ import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import codegen, device_ir as D
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
+from tilelang.tenstorrent.ttl_codegen.records import resolve_transport_records
 from tvm import arith, ir, tirx
 
 
@@ -242,9 +243,9 @@ def test_tensor_panel_producer_forwarding_is_a_closed_ncrisc_transaction():
         (str(function.attrs["tt.kernel_slot"]), call.op.name)
         for function in mod.functions.values()
         for call in calls(function.body)
-        if call.op.name == "tl.tt.dfb_pipe_send"
+        if call.op.name == "tl.tt.dfb_pipe_send_record"
     ]
-    assert sends == [("ncrisc", "tl.tt.dfb_pipe_send")]
+    assert sends == [("ncrisc", "tl.tt.dfb_pipe_send_record")]
     role_blocks = []
     for function in mod.functions.values():
         tirx.stmt_functor.post_order_visit(
@@ -257,6 +258,27 @@ def test_tensor_panel_producer_forwarding_is_a_closed_ncrisc_transaction():
         ("source", 0),
         ("destination", 0),
     }
+
+
+def test_collective_transport_families_resolve_to_ordered_pipenet_records():
+    from examples.tenstorrent.summa import make_summa
+
+    mod = lower(make_summa(core_m=4, core_n=4, k_stages=2, block_m=32, block_n=32, block_k=32))
+    records = resolve_transport_records(mod)
+    assert set(records) == {0, 1}
+    assert len(records[0]) == len(records[1]) == 4
+    for row, record in enumerate(records[0]):
+        assert record.record_index == 4 * row
+        assert record.source == (0, row)
+        assert record.destination_begin == (1, row)
+        assert record.destination_end == (4, row + 1)
+        assert record.contract == "collective"
+    for column, record in enumerate(records[1]):
+        assert record.record_index == column
+        assert record.source == (column, 0)
+        assert record.destination_begin == (column, 1)
+        assert record.destination_end == (column + 1, 4)
+        assert record.contract == "collective"
 
 
 def _body_counts(function):
@@ -301,6 +323,9 @@ def _dynamic_dfb_operands(mod):
         "tl.tt.dfb_pipe_send": (1,),
         "tl.tt.dfb_pipe_recv": (1,),
         "tl.tt.dfb_pipe_wait": (1,),
+        "tl.tt.dfb_pipe_send_record": (3,),
+        "tl.tt.dfb_pipe_recv_record": (3,),
+        "tl.tt.dfb_pipe_wait_record": (3,),
         "tl.tt.tensor_to_dfb_nd": (1,),
         "tl.tt.dfb_to_tensor_nd": (0,),
         "tl.tt.gemm_update": (0, 1),
@@ -349,8 +374,9 @@ def _assert_logical_streams(mod):
 def test_summa_uses_parameterized_core_occurrence_and_resource_families():
     from examples.tenstorrent.summa import make_summa
 
+    configs = ((2, 2), (2, 4), (4, 4))
     modules = []
-    for cores, stages in ((2, 2), (2, 4), (4, 4)):
+    for cores, stages in configs:
         modules.append(
             lower(
                 make_summa(
@@ -386,7 +412,7 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
         (1, 10, 1),
     ]
 
-    for mod in modules:
+    for mod, (cores, stages) in zip(modules, configs):
         assert len(mod.attrs["tt.dfb_storage_groups"]) == 3
         functions = {str(func.attrs["tt.kernel_slot"]): func for func in mod.functions.values()}
         trisc = _body_counts(functions["trisc"])
@@ -434,6 +460,23 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
                 ),
             )
             assert len(coordinates) == 1
+        source_blocks = [block for block in role_blocks if str(block.annotations["tt.communication_role"]) == "source"]
+        for block in source_blocks:
+            source_calls = calls(block.body)
+            assert sum(call.op.name == "tl.tt.dfb_pipe_send_record" for call in source_calls) == 1
+            assert sum(call.op.name == "tl.tt.dfb_pipe_wait_record" for call in source_calls) == 1
+            assert not any(call.op.name == "tl.tt.dfb_pipe_send" for call in source_calls)
+            nested_loops = []
+            tirx.stmt_functor.post_order_visit(
+                block.body,
+                lambda node, nested_loops=nested_loops: nested_loops.append(node) if isinstance(node, tirx.For) else None,
+            )
+            assert not nested_loops
+        concrete_steps = list(expanded(mod).attrs["tt.communication_step_table"])
+        send_steps = [step for step in concrete_steps if str(step.kind) == "send"]
+        assert len(send_steps) == 2 * cores * stages
+        assert all(step.destination_core is None and int(step.record_index) >= 0 for step in send_steps)
+        assert sum(str(step.kind) == "receive" for step in concrete_steps) == 2 * cores * (cores - 1) * stages
         blocks = []
         tirx.stmt_functor.post_order_visit(
             functions["trisc"].body,
@@ -481,6 +524,29 @@ def test_device_verifier_rejects_mismatched_stream_work_role():
     assert changed
     with pytest.raises(ValueError, match="destination communication role contains a send|role annotation disagrees"):
         transform.VerifyTenstorrentDeviceIR()(malformed)
+
+
+def test_device_verifier_rejects_missing_pipe_record_identity():
+    from examples.tenstorrent.summa import make_summa
+
+    mod = ir.load_json(ir.save_json(lower(make_summa(core_m=2, core_n=2, k_stages=2, block_m=32, block_n=32, block_k=32))))
+    changed = False
+
+    def corrupt(call):
+        nonlocal changed
+        if changed or call.op.name != "tl.tt.dfb_pipe_send_record":
+            return None
+        changed = True
+        args = list(call.args)
+        args[1] = tirx.IntImm(args[1].dtype, 999)
+        return tirx.Call(call.dtype, call.op, args, call.annotations, call.span)
+
+    for global_var, function in list(mod.functions.items()):
+        body = tirx.stmt_functor.ir_transform(function.body, None, corrupt, ["tirx.Call"])
+        mod.update_func(global_var, function.with_body(body))
+    assert changed
+    with pytest.raises(ValueError, match="different record identities|no matching step|missing transport"):
+        transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 def test_summa_accumulator_identity_is_spmd_local():
@@ -602,6 +668,7 @@ def test_communication_step_kind_must_match_the_referencing_body_op():
     prototype = D.CommunicationStepDescriptor(
         int(step.step_id),
         int(step.communication_id),
+        int(step.record_index),
         int(step.occurrence),
         "unknown_step",
         step.source_core,

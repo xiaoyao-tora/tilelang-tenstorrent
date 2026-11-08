@@ -44,6 +44,14 @@ unreachable from the stage-only public entry. Pipeline/multicore Device Lower
 remains available. Its typed DFB-to-storage-group resolver is implemented, but
 the current TTL operation/control-flow/transport emitter is not.
 
+Current Device communication bodies use record-level
+`dfb_pipe_send_record`/`dfb_pipe_recv_record`/`dfb_pipe_wait_record` operations.
+One source operation represents the complete `PipeDescriptor` destination
+range; destination Cores execute one receive role each. The current emitter must
+map source/destination `tt_device_stream_work` regions to
+`ttl.pipenet_foreach_src`/`ttl.pipenet_foreach_dst` and must not expand a
+collective source record into per-destination `ttl.copy` operations.
+
 The pinned finalizer can recolor many static logical DFB declarations into at
 most the target's physical CB-index capacity; therefore logical storage-group
 count alone is not a preflight failure. Current Lower keeps compiler-made

@@ -153,9 +153,9 @@ bool IsCurrentDeviceOp(const std::string &op_name) {
       "tl.tt.dfb_wait",
       "tl.tt.dfb_copy_wait",
       "tl.tt.dfb_release",
-      "tl.tt.dfb_pipe_send",
-      "tl.tt.dfb_pipe_recv",
-      "tl.tt.dfb_pipe_wait",
+      "tl.tt.dfb_pipe_send_record",
+      "tl.tt.dfb_pipe_recv_record",
+      "tl.tt.dfb_pipe_wait_record",
       "tl.tt.dfb_local_copy",
       "tl.tt.dfb_gather_copy",
       "tl.tt.dfb_collective_reduce",
@@ -3910,6 +3910,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             "duplicate Core-local compute value descriptor ID");
     }
   }
+  std::map<std::pair<int64_t, int64_t>, PipeDescriptor> transport_records;
   for (const PipeDescriptor &transport : transports) {
     Check(transport.defined() && transport->pipe_net_id >= 0 &&
               transport->event_index >= 0,
@@ -3921,6 +3922,12 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
            transport->contract == "collective") &&
               dfb_table.count(transport->payload_dfb_id),
           "transport descriptor has an invalid contract or payload DFB");
+    Check(transport_records
+              .emplace(std::make_pair(transport->pipe_net_id,
+                                      transport->event_index),
+                       transport)
+              .second,
+          "transport descriptor has a duplicate Pipe record identity");
   }
   VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr,
                   /*general=*/true, /*multicore=*/false,
@@ -4125,6 +4132,10 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                  call->op.same_as(dfb_pipe_recv()) ||
                  call->op.same_as(dfb_pipe_wait()))
         check_dfb(1);
+      else if (call->op.same_as(dfb_pipe_send_record()) ||
+               call->op.same_as(dfb_pipe_recv_record()) ||
+               call->op.same_as(dfb_pipe_wait_record()))
+        check_dfb(3);
       else if (call->op.same_as(dfb_to_tensor_nd()) ||
                call->op.same_as(accumulator_materialize()) ||
                call->op.same_as(compute_value_store()))
@@ -4392,14 +4403,19 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             const auto *call = nested.as<CallNode>();
             if (!call || (!call->op.same_as(dfb_pipe_send()) &&
                           !call->op.same_as(dfb_pipe_recv()) &&
-                          !call->op.same_as(dfb_pipe_wait())))
+                          !call->op.same_as(dfb_pipe_wait()) &&
+                          !call->op.same_as(dfb_pipe_send_record()) &&
+                          !call->op.same_as(dfb_pipe_recv_record()) &&
+                          !call->op.same_as(dfb_pipe_wait_record())))
               return;
             found_pipe = true;
             if (role_name == "source")
-              Check(!call->op.same_as(dfb_pipe_recv()),
+              Check(!call->op.same_as(dfb_pipe_recv()) &&
+                        !call->op.same_as(dfb_pipe_recv_record()),
                     "source communication role contains a receive");
             else
-              Check(!call->op.same_as(dfb_pipe_send()),
+              Check(!call->op.same_as(dfb_pipe_send()) &&
+                        !call->op.same_as(dfb_pipe_send_record()),
                     "destination communication role contains a send");
             auto call_role = call->annotations.Get("tt.communication_role");
             auto call_site = call->annotations.Get("tt.communication_site");
@@ -4530,6 +4546,10 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
           int64_t ordinal = 0;
           std::map<std::pair<int64_t, int64_t>, bool> sent_transfers;
           std::set<std::pair<int64_t, int64_t>> received_transfers;
+          using RecordTransferKey =
+              std::tuple<int64_t, int64_t, int64_t, int64_t>;
+          std::map<RecordTransferKey, bool> sent_records;
+          std::set<RecordTransferKey> received_records;
           std::map<int64_t, int64_t> next_producer_transaction;
           std::map<int64_t, int64_t> next_consumer_transaction;
           std::map<int64_t, int64_t> active_producer_transaction;
@@ -4632,10 +4652,14 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             bool pipe_send = call->op.same_as(dfb_pipe_send());
             bool pipe_recv = call->op.same_as(dfb_pipe_recv());
             bool pipe_wait = call->op.same_as(dfb_pipe_wait());
+            bool record_send = call->op.same_as(dfb_pipe_send_record());
+            bool record_recv = call->op.same_as(dfb_pipe_recv_record());
+            bool record_wait = call->op.same_as(dfb_pipe_wait_record());
             bool local_copy = call->op.same_as(dfb_local_copy());
             bool gather_copy = call->op.same_as(dfb_gather_copy());
             bool local_reduce = call->op.same_as(dfb_collective_reduce());
             bool communication_op = pipe_send || pipe_recv || pipe_wait ||
+                                    record_send || record_recv || record_wait ||
                                     local_copy || gather_copy || local_reduce;
             auto attribute =
                 call->annotations.Get("tt_communication_step_refs");
@@ -4649,8 +4673,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             Check(
                 refs.has_value() && !refs.value().empty(),
                 "communication step refs must be a nonempty expression array");
-            Check((pipe_wait && refs.value().size() <= 2) ||
-                      (!pipe_wait && refs.value().size() == 1),
+            Check(((pipe_wait || record_wait) && refs.value().size() <= 2) ||
+                      (!pipe_wait && !record_wait && refs.value().size() == 1),
                   "communication operation has the wrong number of step refs");
             std::set<int64_t> unique;
             for (size_t ref_index = 0; ref_index < refs.value().size();
@@ -4675,6 +4699,54 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 return coord.has_value() && coord.value()->x == x &&
                        coord.value()->y == y;
               };
+              if (record_send || record_recv || record_wait) {
+                int64_t communication = id(call, 0);
+                int64_t record = id(call, 1);
+                int64_t occurrence = id(call, 2);
+                int64_t resource = id(call, 3);
+                Check(step->communication_id == communication &&
+                          step->record_index == record &&
+                          step->occurrence == occurrence,
+                      "Pipe record operation and step use different record "
+                      "identities");
+                auto transport =
+                    transport_records.find({communication, record});
+                Check(transport != transport_records.end(),
+                      "Pipe record operation references missing transport");
+                if (record_send) {
+                  Check(step->kind == "send" && coord_is(step->source_core) &&
+                            !step->destination_core.has_value() &&
+                            step->source_dfb_id == resource &&
+                            step->destination_dfb_id < 0,
+                        "Pipe record send disagrees with its communication "
+                        "step");
+                } else if (record_recv) {
+                  Check(step->kind == "receive" &&
+                            coord_is(step->destination_core) &&
+                            step->destination_dfb_id == resource,
+                        "Pipe record receive disagrees with its communication "
+                        "step");
+                } else if (ref_index == 0) {
+                  auto role = call->annotations.Get("tt.communication_role");
+                  Check(role.has_value() && role.value().as<StringImm>(),
+                        "Pipe record wait has no communication role");
+                  bool source =
+                      Downcast<StringImm>(role.value())->value == "source";
+                  Check(step->kind == "completion" &&
+                            (source ? coord_is(step->source_core) &&
+                                          !step->destination_core.has_value() &&
+                                          step->source_dfb_id == resource
+                                    : coord_is(step->destination_core) &&
+                                          step->destination_dfb_id == resource),
+                        "Pipe record wait disagrees with its completion step");
+                } else {
+                  Check(step->kind == "publish" &&
+                            coord_is(step->destination_core) &&
+                            step->destination_dfb_id == resource,
+                        "Pipe record wait disagrees with its publication step");
+                }
+                continue;
+              }
               if (pipe_send || pipe_recv || pipe_wait) {
                 int64_t transfer = id(call, 0);
                 int64_t resource = id(call, 1);
@@ -4948,6 +5020,51 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                   Check(false,
                         "Pipe completion has no matching send or receive");
                 }
+              } else if (call->op.same_as(dfb_pipe_send_record())) {
+                int64_t resource = id(call, 3);
+                const DFBDescriptor &descriptor = dfb_table.at(resource);
+                bool forwarding =
+                    owner == descriptor->producer_slot &&
+                    (stream_operands
+                         ? active_producer_transaction.count(resource)
+                         : descriptor->tensor_backing.has_value());
+                if (forwarding) {
+                  auto &entry = state(producer_key(resource));
+                  Check(entry.produced,
+                        "record forwarding must follow Tensor copy completion");
+                } else {
+                  use(resource);
+                }
+                RecordTransferKey record{id(call, 0), id(call, 1), id(call, 2),
+                                         resource};
+                Check(sent_records.emplace(record, forwarding).second,
+                      "Pipe record is sent more than once in one Core work "
+                      "item");
+              } else if (call->op.same_as(dfb_pipe_recv_record())) {
+                int64_t resource = id(call, 3);
+                state(producer_key(resource));
+                RecordTransferKey record{id(call, 0), id(call, 1), id(call, 2),
+                                         resource};
+                Check(received_records.insert(record).second,
+                      "Pipe record is received more than once in one Core work "
+                      "item");
+              } else if (call->op.same_as(dfb_pipe_wait_record())) {
+                int64_t resource = id(call, 3);
+                RecordTransferKey record{id(call, 0), id(call, 1), id(call, 2),
+                                         resource};
+                auto sent = sent_records.find(record);
+                if (sent != sent_records.end() && sent->second) {
+                  forwarding_completions[producer_key(resource)].push_back(
+                      event);
+                } else if (received_records.count(record)) {
+                  produce(resource, event);
+                } else if (sent != sent_records.end()) {
+                  use(resource);
+                } else {
+                  Check(
+                      false,
+                      "Pipe record completion has no matching send or receive");
+                }
               } else if (call->op.same_as(dfb_local_copy()) ||
                          call->op.same_as(dfb_gather_copy())) {
                 use(id(call, 0));
@@ -5151,7 +5268,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             "communication descriptor has no selected algorithm");
       Check((entry->kind == "transfer" &&
              (entry->algorithm == "direct_p2p" ||
-              entry->algorithm == "direct_broadcast")) ||
+              entry->algorithm == "direct_multicast")) ||
                 (entry->kind == "all_gather" &&
                  entry->algorithm == "direct_all_to_all") ||
                 (entry->kind == "all_reduce" &&
@@ -5174,6 +5291,15 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               step->kind == "completion" || step->kind == "publish" ||
               step->kind == "local_copy" || step->kind == "local_reduce",
           "communication step has an unknown kind");
+    bool transport_step = step->kind == "send" || step->kind == "receive" ||
+                          step->kind == "completion" || step->kind == "publish";
+    Check((transport_step && step->record_index >= 0) ||
+              (!transport_step && step->record_index == -1),
+          "communication step has an invalid record index");
+    if (transport_step)
+      Check(
+          transport_records.count({step->communication_id, step->record_index}),
+          "communication step references a missing Pipe record");
     Check(
         step_ref_counts[index] == 1,
         "communication step must be referenced by exactly one body operation");
@@ -5234,6 +5360,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               "communication occurrence IDs must be dense");
         std::map<std::string, int64_t> kinds;
         std::set<TransferPair> sends, receives;
+        std::set<std::pair<int64_t, int64_t>> source_records;
         for (const CommunicationStepDescriptor &step :
              by_occurrence.at(occurrence)) {
           Check(step_ref_dynamic_counts[step->step_id] == dynamic_multiplier,
@@ -5242,26 +5369,54 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
           ++kinds[std::string(step->kind)];
           if (step->kind != "send" && step->kind != "receive")
             continue;
-          Check(step->source_core.has_value() &&
-                    step->destination_core.has_value(),
-                "transport step is missing endpoint coordinates");
+          Check(step->source_core.has_value(),
+                "transport step is missing source coordinates");
           CoreCoord source = step->source_core.value();
-          CoreCoord destination = step->destination_core.value();
-          Check(
-              (!collective || (source->x >= bx && source->x < ex &&
-                               source->y >= by && source->y < ey)) &&
-                  destination->x >= bx && destination->x < ex &&
-                  destination->y >= by && destination->y < ey &&
-                  (source->x != destination->x || source->y != destination->y),
-              "transport step has an invalid or loopback group endpoint");
-          TransferPair pair{source->x, source->y, destination->x,
-                            destination->y};
-          Check((step->kind == "send" ? sends : receives).insert(pair).second,
-                "communication occurrence has a duplicate transport endpoint");
+          if (step->kind == "send") {
+            Check(!step->destination_core.has_value(),
+                  "record-level send must not name one destination Core");
+            auto record = transport_records.find(
+                {step->communication_id, step->record_index});
+            Check(record != transport_records.end() &&
+                      ffi::StructuralEqual()(record->second->src_coord, source),
+                  "record-level send disagrees with its transport record");
+            Check(source_records
+                      .insert({step->communication_id, step->record_index})
+                      .second,
+                  "communication occurrence has a duplicate record send");
+            for (int64_t dx = record->second->dst_begin->x;
+                 dx < record->second->dst_end->x; ++dx)
+              for (int64_t dy = record->second->dst_begin->y;
+                   dy < record->second->dst_end->y; ++dy) {
+                Check(dx != source->x || dy != source->y,
+                      "record-level send has a loopback destination");
+                Check(sends.insert({source->x, source->y, dx, dy}).second,
+                      "communication occurrence has a duplicate transport "
+                      "endpoint");
+              }
+          } else {
+            Check(step->destination_core.has_value(),
+                  "receive step is missing destination coordinates");
+            CoreCoord destination = step->destination_core.value();
+            Check((!collective || (source->x >= bx && source->x < ex &&
+                                   source->y >= by && source->y < ey)) &&
+                      destination->x >= bx && destination->x < ex &&
+                      destination->y >= by && destination->y < ey &&
+                      (source->x != destination->x ||
+                       source->y != destination->y),
+                  "transport step has an invalid or loopback group endpoint");
+            Check(receives
+                      .insert({source->x, source->y, destination->x,
+                               destination->y})
+                      .second,
+                  "communication occurrence has a duplicate receive endpoint");
+          }
         }
         Check(sends == receives,
               "communication send/receive endpoint coverage disagrees");
-        Check(kinds["completion"] == 2 * static_cast<int64_t>(sends.size()) &&
+        Check(kinds["completion"] ==
+                      static_cast<int64_t>(sends.size() +
+                                           source_records.size()) &&
                   kinds["publish"] == static_cast<int64_t>(sends.size()),
               "communication completion/publication coverage is incomplete");
 

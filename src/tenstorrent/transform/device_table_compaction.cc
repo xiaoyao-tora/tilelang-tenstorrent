@@ -709,6 +709,7 @@ ffi::Array<DeviceIRDescriptorFamily> CompactCurrentSteps(
     FamilyBuilder &builder = builders[found->second];
     builder.positions.push_back(builder.positions.size());
     builder.fields["step_id"].push_back(descriptor->step_id);
+    builder.fields["record_index"].push_back(descriptor->record_index);
     builder.fields["occurrence"].push_back(descriptor->occurrence);
     builder.fields["source_dfb_id"].push_back(descriptor->source_dfb_id);
     builder.fields["destination_dfb_id"].push_back(
@@ -1084,8 +1085,8 @@ RestoreCurrentSteps(const DeviceIRDescriptorFamily &family,
                     const CommunicationStepDescriptor &prototype) {
   Check(family->source_parts.empty(),
         "communication-step family cannot have source string parts");
-  std::set<std::string> names{"step_id", "occurrence", "source_dfb_id",
-                              "destination_dfb_id"};
+  std::set<std::string> names{"step_id", "record_index", "occurrence",
+                              "source_dfb_id", "destination_dfb_id"};
   bool parameter_column = prototype->parameter.as<IntImmNode>() != nullptr;
   if (parameter_column)
     names.insert("parameter");
@@ -1117,9 +1118,10 @@ RestoreCurrentSteps(const DeviceIRDescriptorFamily &family,
           Integer(fields.at("dependency." + std::to_string(index))[row]));
     result.emplace_back(
         fields.at("step_id")[row], prototype->communication_id,
-        fields.at("occurrence")[row], prototype->kind, source, destination,
-        fields.at("source_dfb_id")[row], fields.at("destination_dfb_id")[row],
-        prototype->owner_slot, dependencies,
+        fields.at("record_index")[row], fields.at("occurrence")[row],
+        prototype->kind, source, destination, fields.at("source_dfb_id")[row],
+        fields.at("destination_dfb_id")[row], prototype->owner_slot,
+        dependencies,
         parameter_column ? PrimExpr(Integer(fields.at("parameter")[row]))
                          : prototype->parameter,
         prototype->source_span);

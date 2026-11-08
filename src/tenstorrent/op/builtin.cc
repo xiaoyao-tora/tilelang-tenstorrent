@@ -154,6 +154,21 @@ TIR_DEFINE_TT_BUILTIN(dfb_pipe_wait)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TT_BUILTIN(dfb_pipe_send_record)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_pipe_recv_record)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_pipe_wait_record)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TT_BUILTIN(tensor_to_dfb)
     .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",

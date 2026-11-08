@@ -142,6 +142,16 @@ TVM_DLL const Op &dfb_release();
 TVM_DLL const Op &dfb_pipe_send();
 TVM_DLL const Op &dfb_pipe_recv();
 TVM_DLL const Op &dfb_pipe_wait();
+/*!
+ * \brief Current record-level PipeNet delivery and completion operations.
+ *
+ * Arguments are (communication ID, record index, occurrence, local logical
+ * stream ID). One source operation covers the record's complete destination
+ * range; each matching destination Core executes one receive operation.
+ */
+TVM_DLL const Op &dfb_pipe_send_record();
+TVM_DLL const Op &dfb_pipe_recv_record();
+TVM_DLL const Op &dfb_pipe_wait_record();
 TVM_DLL const Op &tensor_to_dfb();
 TVM_DLL const Op &dfb_to_tensor();
 /*! \brief Legacy schema-v1 Add marker; forbidden in current Device IR. */

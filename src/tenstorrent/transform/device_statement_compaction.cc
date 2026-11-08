@@ -645,8 +645,10 @@ void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
       const auto *node = object.as<CallNode>();
       if (!node)
         return;
-      sends |= node->op.same_as(tenstorrent::dfb_pipe_send());
-      receives |= node->op.same_as(tenstorrent::dfb_pipe_recv());
+      sends |= node->op.same_as(tenstorrent::dfb_pipe_send()) ||
+               node->op.same_as(tenstorrent::dfb_pipe_send_record());
+      receives |= node->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+                  node->op.same_as(tenstorrent::dfb_pipe_recv_record());
       auto site = node->annotations.Get("tt.communication_site");
       if (site.has_value()) {
         auto integer = site.value().as<Integer>();
@@ -1023,6 +1025,10 @@ std::vector<size_t> DFBOperandPositions(const Call &call) {
       call->op.same_as(tenstorrent::dfb_pipe_wait()) ||
       call->op.same_as(tenstorrent::tensor_to_dfb_nd()))
     return {1};
+  if (call->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_recv_record()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_wait_record()))
+    return {3};
   if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
     return {0};
   if (call->op.same_as(tenstorrent::gemm_update()))
