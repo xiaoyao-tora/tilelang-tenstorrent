@@ -245,6 +245,18 @@ def test_tensor_panel_producer_forwarding_is_a_closed_ncrisc_transaction():
         if call.op.name == "tl.tt.dfb_pipe_send"
     ]
     assert sends == [("ncrisc", "tl.tt.dfb_pipe_send")]
+    role_blocks = []
+    for function in mod.functions.values():
+        tirx.stmt_functor.post_order_visit(
+            function.body,
+            lambda node, role_blocks=role_blocks: (
+                role_blocks.append(node) if isinstance(node, tirx.SBlock) and "tt.communication_role" in node.annotations else None
+            ),
+        )
+    assert {(str(block.annotations["tt.communication_role"]), int(block.annotations["tt.work_group"])) for block in role_blocks} == {
+        ("source", 0),
+        ("destination", 0),
+    }
 
 
 def _body_counts(function):
@@ -386,8 +398,42 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
         assert _compact_loop_names(mod)
         assert not _dynamic_dfb_operands(mod)
         _assert_logical_streams(mod)
-        assert ncrisc["if"] <= 4
-        assert ncrisc["block"] <= 4
+        assert ncrisc["if"] == 4
+        assert ncrisc["block"] == 6
+        stream_blocks = []
+        role_conditions = []
+        tirx.stmt_functor.post_order_visit(
+            functions["ncrisc"].body,
+            lambda node, stream_blocks=stream_blocks, role_conditions=role_conditions: (
+                stream_blocks.append(node)
+                if isinstance(node, tirx.SBlock) and node.name_hint == "tt_device_stream_work"
+                else role_conditions.append(node.condition)
+                if isinstance(node, tirx.IfThenElse)
+                else None
+            ),
+        )
+        role_blocks = [block for block in stream_blocks if "tt.communication_role" in block.annotations]
+        assert len(role_blocks) == 4
+        assert {
+            (str(block.annotations["tt.communication_role"]), tuple(map(int, block.annotations["tt.communication_sites"])))
+            for block in role_blocks
+        } == {
+            ("source", (0,)),
+            ("destination", (0,)),
+            ("source", (1,)),
+            ("destination", (1,)),
+        }
+        for condition in role_conditions:
+            coordinates = set()
+            tirx.stmt_functor.post_order_visit(
+                condition,
+                lambda node, coordinates=coordinates: (
+                    coordinates.add(node.op.name)
+                    if isinstance(node, tirx.Call) and node.op.name in ("tl.tt.core_x", "tl.tt.core_y")
+                    else None
+                ),
+            )
+            assert len(coordinates) == 1
         blocks = []
         tirx.stmt_functor.post_order_visit(
             functions["trisc"].body,
@@ -399,6 +445,42 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
 
     assert len(tvm.ir.save_json(modules[1])) < 2 * len(tvm.ir.save_json(modules[0]))
     assert transform.VerifyTenstorrentDeviceIR()(modules[-1]).same_as(modules[-1])
+
+
+def test_device_verifier_rejects_mismatched_stream_work_role():
+    from examples.tenstorrent.summa import make_summa
+
+    mod = lower(make_summa(core_m=2, core_n=2, k_stages=2, block_m=32, block_n=32, block_k=32))
+    malformed = ir.load_json(ir.save_json(mod))
+    changed = False
+
+    def corrupt(node):
+        nonlocal changed
+        if changed or not isinstance(node, tirx.SBlock) or node.annotations.get("tt.communication_role") != "source":
+            return None
+        changed = True
+        annotations = dict(node.annotations)
+        annotations["tt.communication_role"] = "destination"
+        return tirx.SBlock(
+            node.iter_vars,
+            node.reads,
+            node.writes,
+            node.name_hint,
+            node.body,
+            node.init,
+            node.alloc_buffers,
+            node.match_buffers,
+            annotations,
+        )
+
+    for global_var, function in list(malformed.functions.items()):
+        if str(function.attrs["tt.kernel_slot"]) != "ncrisc":
+            continue
+        body = tirx.stmt_functor.ir_transform(function.body, None, corrupt, ["tirx.SBlock"])
+        malformed.update_func(global_var, function.with_body(body))
+    assert changed
+    with pytest.raises(ValueError, match="destination communication role contains a send|role annotation disagrees"):
+        transform.VerifyTenstorrentDeviceIR()(malformed)
 
 
 def test_summa_accumulator_identity_is_spmd_local():

@@ -118,13 +118,13 @@ size_t CoreLocalHash(const ffi::ObjectRef &object) {
     hash = Combine(hash, ScalarHash(buffer.value()->dtype));
     hash = Combine(hash, ffi::StructuralHash()(buffer.value()->shape));
     hash = Combine(hash, ffi::StructuralHash()(buffer.value()->strides));
-    hash = Combine(hash,
-                   ffi::StructuralHash()(buffer.value()->axis_separators));
+    hash =
+        Combine(hash, ffi::StructuralHash()(buffer.value()->axis_separators));
     hash = Combine(hash, ffi::StructuralHash()(buffer.value()->elem_offset));
     hash = Combine(hash, std::hash<int>()(buffer.value()->data_alignment));
     hash = Combine(hash, std::hash<int>()(buffer.value()->offset_factor));
-    hash = Combine(hash,
-                   std::hash<int>()(static_cast<int>(buffer.value()->buffer_type)));
+    hash = Combine(
+        hash, std::hash<int>()(static_cast<int>(buffer.value()->buffer_type)));
     return Combine(hash, CoreLocalHash(buffer.value()->span));
   }
   if (auto variable = object.as<Var>()) {
@@ -144,8 +144,7 @@ size_t CoreLocalHash(const ffi::ObjectRef &object) {
   return Combine(hash, ScalarHash(object));
 }
 
-bool SameCoreLocal(const ffi::ObjectRef &left,
-                   const ffi::ObjectRef &right) {
+bool SameCoreLocal(const ffi::ObjectRef &left, const ffi::ObjectRef &right) {
   if (!left.defined() || !right.defined())
     return left.defined() == right.defined();
   if (auto a = left.as<Buffer>()) {
@@ -203,9 +202,8 @@ size_t Describe(const ffi::Any &value, std::vector<IntImm> *integers,
     hash = Combine(hash, ScalarHash(integer.value()->dtype));
     return Combine(hash, ScalarHash(integer.value()->span));
   }
-  if (semantic_core_locals &&
-      (ref.as<BufferNode>() || ref.as<VarNode>() || ref.as<SpanNode>() ||
-       ref.as<SourceNameNode>()))
+  if (semantic_core_locals && (ref.as<BufferNode>() || ref.as<VarNode>() ||
+                               ref.as<SpanNode>() || ref.as<SourceNameNode>()))
     return CoreLocalHash(ref);
   if (Opaque(ref) || (!Container(ref) &&
                       !ffi::HasCreator(TVMFFIGetTypeInfo(ref->type_index()))))
@@ -214,10 +212,9 @@ size_t Describe(const ffi::Any &value, std::vector<IntImm> *integers,
   hash = Combine(hash, fields.size());
   bool map = ref.as<ffi::Map<ffi::Any, ffi::Any>>().has_value();
   for (size_t i = 0; i < fields.size(); ++i)
-    hash = Combine(hash,
-                   map && i % 2 == 0
-                       ? ScalarHash(fields[i])
-                       : Describe(fields[i], integers, semantic_core_locals));
+    hash = Combine(hash, map && i % 2 == 0 ? ScalarHash(fields[i])
+                                           : Describe(fields[i], integers,
+                                                      semantic_core_locals));
   return hash;
 }
 
@@ -249,9 +246,9 @@ bool SameSkeleton(const ffi::Any &a, const ffi::Any &b,
     return false;
   bool map = x.value().as<ffi::Map<ffi::Any, ffi::Any>>().has_value();
   for (size_t i = 0; i < lhs.size(); ++i)
-    if (!(map && i % 2 == 0 ? ScalarEqual(lhs[i], rhs[i])
-                            : SameSkeleton(lhs[i], rhs[i],
-                                           semantic_core_locals)))
+    if (!(map && i % 2 == 0
+              ? ScalarEqual(lhs[i], rhs[i])
+              : SameSkeleton(lhs[i], rhs[i], semantic_core_locals)))
       return false;
   return true;
 }
@@ -401,11 +398,15 @@ private:
       return value.dtype() == dtype ? value : Cast(dtype, value);
     };
     if (column.x_step)
-      result = result + coordinate(tenstorrent::core_x()) *
-                            IntImm(dtype, column.x_step);
+      result = Add(result,
+                   Mul(coordinate(tenstorrent::core_x()),
+                       IntImm(dtype, column.x_step), integer.value()->span),
+                   integer.value()->span);
     if (column.y_step)
-      result = result + coordinate(tenstorrent::core_y()) *
-                            IntImm(dtype, column.y_step);
+      result = Add(result,
+                   Mul(coordinate(tenstorrent::core_y()),
+                       IntImm(dtype, column.y_step), integer.value()->span),
+                   integer.value()->span);
     return result;
   }
 
@@ -432,9 +433,8 @@ bool FitCoreAffine(const std::vector<DeviceCoreBody> &points,
   if (points.empty() || points.size() != values.size())
     return false;
   const int64_t x0 = points[0].x, y0 = points[0].y, value0 = values[0];
-  bool constant =
-      std::all_of(values.begin(), values.end(),
-                  [&](int64_t value) { return value == value0; });
+  bool constant = std::all_of(values.begin(), values.end(),
+                              [&](int64_t value) { return value == value0; });
   if (constant) {
     *result = {value0, 0, 0};
     return Fits(value0, dtype);
@@ -521,8 +521,8 @@ TryParameterizeCoreBody(const std::vector<DeviceCoreBody> &points) {
     for (const StatementInfo &description : descriptions)
       values.push_back(description.integers[column]->value);
     CoreAffineColumn relation;
-    if (!FitCoreAffine(points, values,
-                       descriptions[0].integers[column]->dtype, &relation))
+    if (!FitCoreAffine(points, values, descriptions[0].integers[column]->dtype,
+                       &relation))
       return std::nullopt;
     columns.push_back(relation);
   }
@@ -574,33 +574,39 @@ PartitionRectangles(const std::vector<DeviceCoreBody> &bodies) {
   return rectangles;
 }
 
-PrimExpr CoreRangePredicate(const CoreRectangle &rectangle) {
+PrimExpr CoreRangePredicate(const CoreRectangle &rectangle, int64_t grid_x,
+                            int64_t grid_y) {
   PrimExpr x = Call(DataType::Int(32), tenstorrent::core_x(), {});
   PrimExpr y = Call(DataType::Int(32), tenstorrent::core_y(), {});
-  PrimExpr x_active = rectangle.end_x == rectangle.begin_x + 1
-                          ? x == Integer(rectangle.begin_x)
-                          : x >= Integer(rectangle.begin_x) &&
-                                x < Integer(rectangle.end_x);
-  PrimExpr y_active = rectangle.end_y == rectangle.begin_y + 1
-                          ? y == Integer(rectangle.begin_y)
-                          : y >= Integer(rectangle.begin_y) &&
-                                y < Integer(rectangle.end_y);
+  PrimExpr x_active =
+      rectangle.end_x == rectangle.begin_x + 1
+          ? x == Integer(rectangle.begin_x)
+          : x >= Integer(rectangle.begin_x) && x < Integer(rectangle.end_x);
+  PrimExpr y_active =
+      rectangle.end_y == rectangle.begin_y + 1
+          ? y == Integer(rectangle.begin_y)
+          : y >= Integer(rectangle.begin_y) && y < Integer(rectangle.end_y);
+  bool full_x = rectangle.begin_x == 0 && rectangle.end_x == grid_x;
+  bool full_y = rectangle.begin_y == 0 && rectangle.end_y == grid_y;
+  if (full_x)
+    return y_active;
+  if (full_y)
+    return x_active;
   return x_active && y_active;
 }
 
 void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
-                                int64_t grid_y,
-                                const ffi::String &owner_slot,
+                                int64_t grid_y, const ffi::String &owner_slot,
                                 const Span &fallback_span,
+                                const ffi::String &block_name,
+                                ffi::Optional<Integer> work_group,
                                 ffi::Array<Stmt> *result) {
-  ffi::Optional<Stmt> parameterized =
-      TryParameterizeCoreBody(rectangle.points);
+  ffi::Optional<Stmt> parameterized = TryParameterizeCoreBody(rectangle.points);
   if (!parameterized.has_value() && rectangle.points.size() > 1) {
     bool split_x = rectangle.end_x - rectangle.begin_x >=
                    rectangle.end_y - rectangle.begin_y;
-    int64_t middle = split_x
-                         ? (rectangle.begin_x + rectangle.end_x) / 2
-                         : (rectangle.begin_y + rectangle.end_y) / 2;
+    int64_t middle = split_x ? (rectangle.begin_x + rectangle.end_x) / 2
+                             : (rectangle.begin_y + rectangle.end_y) / 2;
     CoreRectangle first = rectangle, second = rectangle;
     first.points.clear();
     second.points.clear();
@@ -616,10 +622,10 @@ void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
           .push_back(point);
     if (!first.points.empty())
       EmitParameterizedRectangle(first, grid_x, grid_y, owner_slot,
-                                 fallback_span, result);
+                                 fallback_span, block_name, work_group, result);
     if (!second.points.empty())
       EmitParameterizedRectangle(second, grid_x, grid_y, owner_slot,
-                                 fallback_span, result);
+                                 fallback_span, block_name, work_group, result);
     return;
   }
   if (!parameterized.has_value())
@@ -628,16 +634,49 @@ void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
   Span span = body->span.defined() ? body->span : fallback_span;
   CoreDomain domain(CoreCoord(rectangle.begin_x, rectangle.begin_y),
                     CoreCoord(rectangle.end_x, rectangle.end_y));
-  SBlock work({}, {}, {}, "tt_device_core_work", body, std::nullopt, {}, {},
-              {{"tt.core_domain", domain}, {"tt.owner_slot", owner_slot}},
+  ffi::Map<ffi::String, ffi::Any> annotations{{"tt.core_domain", domain},
+                                              {"tt.owner_slot", owner_slot}};
+  if (work_group.has_value())
+    annotations.Set("tt.work_group", work_group.value());
+  if (block_name == "tt_device_stream_work") {
+    bool sends = false, receives = false;
+    std::set<int64_t> sites;
+    PostOrderVisit(body, [&](const ffi::ObjectRef &object) {
+      const auto *node = object.as<CallNode>();
+      if (!node)
+        return;
+      sends |= node->op.same_as(tenstorrent::dfb_pipe_send());
+      receives |= node->op.same_as(tenstorrent::dfb_pipe_recv());
+      auto site = node->annotations.Get("tt.communication_site");
+      if (site.has_value()) {
+        auto integer = site.value().as<Integer>();
+        if (!integer.has_value())
+          Invalid("communication site annotation must be an integer");
+        sites.insert(integer.value()->value);
+      }
+    });
+    if (sends && receives)
+      Invalid("one communication role region cannot send and receive");
+    if (sends || receives) {
+      annotations.Set("tt.communication_role",
+                      ffi::String(sends ? "source" : "destination"));
+      ffi::Array<Integer> site_array;
+      for (int64_t site : sites)
+        site_array.push_back(Integer(site));
+      if (site_array.empty())
+        Invalid("communication role region has no communication site");
+      annotations.Set("tt.communication_sites", site_array);
+    }
+  }
+  SBlock work({}, {}, {}, block_name, body, std::nullopt, {}, {}, annotations,
               span);
   Stmt realize = SBlockRealize({}, const_true(), work, span);
   if (rectangle.begin_x == 0 && rectangle.begin_y == 0 &&
       rectangle.end_x == grid_x && rectangle.end_y == grid_y)
     result->push_back(realize);
   else
-    result->push_back(
-        IfThenElse(CoreRangePredicate(rectangle), realize, std::nullopt, span));
+    result->push_back(IfThenElse(CoreRangePredicate(rectangle, grid_x, grid_y),
+                                 realize, std::nullopt, span));
 }
 
 class AffineReader : public ObjectRewriter {
@@ -695,8 +734,6 @@ private:
 int64_t ExpandedCount(const Stmt &body, int64_t limit, size_t depth = 0) {
   if (depth > 64)
     Invalid("compact statement nesting exceeds the limit of 64");
-  if (body.as<EvaluateNode>())
-    return 1;
   if (auto sequence = body.as<SeqStmt>()) {
     if (sequence.value()->seq.empty())
       Invalid("compact statement sequences must not be empty");
@@ -711,7 +748,7 @@ int64_t ExpandedCount(const Stmt &body, int64_t limit, size_t depth = 0) {
   }
   auto loop = body.as<For>();
   if (!loop.has_value())
-    Invalid("only Evaluate, SeqStmt and serial loops can be expanded");
+    return 1;
   auto minimum = loop.value()->min.as<IntImm>();
   auto extent = loop.value()->extent.as<IntImm>();
   auto step = loop.value()->step;
@@ -761,7 +798,8 @@ void Expand(const Stmt &body, AffineReader::Bindings *bindings,
 }
 } // namespace
 
-Stmt CompactDeviceStatements(const Stmt &body) {
+static Stmt CompactDeviceStatementsImpl(const Stmt &body,
+                                        bool semantic_core_locals) {
   auto sequence = body.as<SeqStmt>();
   if (!sequence.has_value() || sequence.value()->seq.size() < 2)
     return body;
@@ -772,11 +810,13 @@ Stmt CompactDeviceStatements(const Stmt &body) {
   std::vector<uint64_t> prefix(count + 1), powers(count + 1, 1);
   constexpr uint64_t kBase = 1000000007;
   for (size_t i = 0; i < count; ++i) {
-    const auto *evaluate = statements[i].as<EvaluateNode>();
-    if (!evaluate || !evaluate->value.as<CallNode>())
-      return body;
+    if (!semantic_core_locals) {
+      const auto *evaluate = statements[i].as<EvaluateNode>();
+      if (!evaluate || !evaluate->value.as<CallNode>())
+        return body;
+    }
     StatementInfo item;
-    item.hash = Describe(statements[i], &item.integers);
+    item.hash = Describe(statements[i], &item.integers, semantic_core_locals);
     positions[item.hash].push_back(i);
     prefix[i + 1] = prefix[i] * kBase + item.hash;
     powers[i + 1] = powers[i] * kBase;
@@ -812,8 +852,8 @@ Stmt CompactDeviceStatements(const Stmt &body) {
         const auto &first = info[begin + j].integers;
         const auto &second = info[begin + length + j].integers;
         if (first.size() != second.size() ||
-            !SameSkeleton(statements[begin + j],
-                          statements[begin + length + j])) {
+            !SameSkeleton(statements[begin + j], statements[begin + length + j],
+                          semantic_core_locals)) {
           valid = false;
           break;
         }
@@ -840,7 +880,8 @@ Stmt CompactDeviceStatements(const Stmt &body) {
           const auto &current = info[begin + repeats * length + j].integers;
           if (first.size() != current.size() ||
               !SameSkeleton(statements[begin + j],
-                            statements[begin + repeats * length + j])) {
+                            statements[begin + repeats * length + j],
+                            semantic_core_locals)) {
             valid = false;
             break;
           }
@@ -891,6 +932,10 @@ Stmt CompactDeviceStatements(const Stmt &body) {
   return loop;
 }
 
+Stmt CompactDeviceStatements(const Stmt &body) {
+  return CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/false);
+}
+
 namespace {
 class NestedDeviceStatementCompactor : public StmtMutator {
   Stmt VisitStmt_(const ForNode *op) final {
@@ -910,9 +955,20 @@ Stmt CompactDeviceStatementsRecursive(const Stmt &body) {
   return nested(compact);
 }
 
-Stmt ParameterizeDeviceCoreStatements(
+static Stmt CompactDeviceRoleStatements(const Stmt &body) {
+  Stmt compact =
+      CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/true);
+  NestedDeviceStatementCompactor nested;
+  return nested(compact);
+}
+
+namespace {
+
+Stmt ParameterizeDeviceCoreStatementsImpl(
     const std::vector<DeviceCoreBody> &bodies, int64_t grid_x, int64_t grid_y,
-    const ffi::String &owner_slot, const Span &span) {
+    const ffi::String &owner_slot, const Span &span,
+    const ffi::String &block_name = "tt_device_core_work",
+    ffi::Optional<Integer> work_group = std::nullopt) {
   if (bodies.empty())
     return Evaluate(Integer(0), span);
   if (grid_x <= 0 || grid_y <= 0 ||
@@ -938,10 +994,200 @@ Stmt ParameterizeDeviceCoreStatements(
   for (const auto &skeleton : skeletons)
     for (const CoreRectangle &rectangle : PartitionRectangles(skeleton))
       EmitParameterizedRectangle(rectangle, grid_x, grid_y, owner_slot, span,
-                                 &result);
+                                 block_name, work_group, &result);
   if (result.empty())
     return Evaluate(Integer(0), span);
   return result.size() == 1 ? result[0] : SeqStmt(result, span);
+}
+
+std::vector<size_t> DFBOperandPositions(const Call &call) {
+  if (call->op.same_as(tenstorrent::dfb_compute())) {
+    std::vector<size_t> positions(call->args.size());
+    std::iota(positions.begin(), positions.end(), 0);
+    return positions;
+  }
+  if (call->op.same_as(tenstorrent::compute_value())) {
+    std::vector<size_t> positions(call->args.size() > 0 ? call->args.size() - 1
+                                                        : 0);
+    std::iota(positions.begin(), positions.end(), 1);
+    return positions;
+  }
+  if (call->op.same_as(tenstorrent::dfb_reserve()) ||
+      call->op.same_as(tenstorrent::dfb_wait()) ||
+      call->op.same_as(tenstorrent::dfb_copy_wait()) ||
+      call->op.same_as(tenstorrent::dfb_release()) ||
+      call->op.same_as(tenstorrent::dfb_load()))
+    return {0};
+  if (call->op.same_as(tenstorrent::dfb_pipe_send()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_wait()) ||
+      call->op.same_as(tenstorrent::tensor_to_dfb_nd()))
+    return {1};
+  if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
+    return {0};
+  if (call->op.same_as(tenstorrent::gemm_update()))
+    return {0, 1};
+  if (call->op.same_as(tenstorrent::accumulator_materialize()) ||
+      call->op.same_as(tenstorrent::compute_value_store()))
+    return {1};
+  if (call->op.same_as(tenstorrent::compute_value_gemm()))
+    return {1, 2};
+  if (call->op.same_as(tenstorrent::dfb_local_copy()) ||
+      call->op.same_as(tenstorrent::dfb_gather_copy()))
+    return {0, 1};
+  if (call->op.same_as(tenstorrent::dfb_collective_reduce()))
+    return {0, 1, 2};
+  return {};
+}
+
+bool StatementDFBs(const Stmt &statement, std::vector<int64_t> *ids) {
+  const auto *evaluate = statement.as<EvaluateNode>();
+  if (!evaluate)
+    return false;
+  const auto *node = evaluate->value.as<CallNode>();
+  if (!node)
+    return is_zero(evaluate->value);
+  Call call = ffi::GetRef<Call>(node);
+  for (size_t position : DFBOperandPositions(call)) {
+    if (position >= call->args.size())
+      Invalid("Device DFB operation is missing an operand");
+    const int64_t *value = as_const_int(call->args[position]);
+    if (!value || *value < 0)
+      return false;
+    ids->push_back(*value);
+  }
+  return !ids->empty();
+}
+
+struct StatementSegment {
+  int64_t component;
+  Stmt body;
+};
+
+ffi::Optional<Stmt>
+TryParameterizeDFBComponents(const std::vector<DeviceCoreBody> &bodies,
+                             int64_t grid_x, int64_t grid_y,
+                             const ffi::String &owner_slot, const Span &span) {
+  if (owner_slot == "trisc" ||
+      bodies.size() != static_cast<size_t>(grid_x * grid_y))
+    return std::nullopt;
+
+  std::map<int64_t, int64_t> parent;
+  std::vector<std::vector<Stmt>> statements;
+  auto find = [&](auto &&self, int64_t value) -> int64_t {
+    auto found = parent.find(value);
+    if (found == parent.end())
+      return parent.emplace(value, value).first->second;
+    if (found->second != value)
+      found->second = self(self, found->second);
+    return found->second;
+  };
+  auto unite = [&](int64_t left, int64_t right) {
+    left = find(find, left);
+    right = find(find, right);
+    if (left == right)
+      return;
+    if (left > right)
+      std::swap(left, right);
+    parent[right] = left;
+  };
+
+  for (const DeviceCoreBody &core : bodies) {
+    ffi::Array<Stmt> flat;
+    if (auto sequence = core.body.as<SeqStmt>())
+      flat = sequence.value()->seq;
+    else
+      flat = {core.body};
+    std::vector<Stmt> local;
+    for (const Stmt &statement : flat) {
+      std::vector<int64_t> ids;
+      if (!StatementDFBs(statement, &ids))
+        return std::nullopt;
+      std::sort(ids.begin(), ids.end());
+      ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+      for (int64_t id : ids)
+        find(find, id);
+      for (size_t index = 1; index < ids.size(); ++index)
+        unite(ids[0], ids[index]);
+      local.push_back(statement);
+    }
+    statements.push_back(std::move(local));
+  }
+  std::set<int64_t> components;
+  for (const auto &[id, _] : parent)
+    components.insert(find(find, id));
+  if (components.size() < 2)
+    return std::nullopt;
+
+  std::vector<std::vector<StatementSegment>> segmented;
+  for (const auto &local : statements) {
+    std::vector<StatementSegment> segments;
+    for (const Stmt &statement : local) {
+      std::vector<int64_t> ids;
+      if (!StatementDFBs(statement, &ids) || ids.empty())
+        return std::nullopt;
+      int64_t component = find(find, ids[0]);
+      for (int64_t id : ids)
+        if (find(find, id) != component)
+          Invalid("one Device statement spans disconnected DFB components");
+      if (!segments.empty() && segments.back().component == component) {
+        segments.back().body =
+            SeqStmt::Flatten(segments.back().body, statement);
+      } else {
+        segments.push_back({component, statement});
+      }
+    }
+    if (segments.empty())
+      return std::nullopt;
+    if (!segmented.empty()) {
+      if (segments.size() != segmented.front().size())
+        return std::nullopt;
+      for (size_t index = 0; index < segments.size(); ++index)
+        if (segments[index].component != segmented.front()[index].component)
+          return std::nullopt;
+    }
+    segmented.push_back(std::move(segments));
+  }
+  if (segmented.front().size() < 2)
+    return std::nullopt;
+
+  ffi::Array<Stmt> ordered;
+  for (size_t segment = 0; segment < segmented.front().size(); ++segment) {
+    std::vector<DeviceCoreBody> points;
+    points.reserve(bodies.size());
+    for (size_t core = 0; core < bodies.size(); ++core)
+      points.push_back(
+          {bodies[core].x, bodies[core].y, segmented[core][segment].body});
+    Stmt role = ParameterizeDeviceCoreStatementsImpl(
+        points, grid_x, grid_y, owner_slot, span, "tt_device_stream_work",
+        Integer(segmented.front()[segment].component));
+    if (auto sequence = role.as<SeqStmt>()) {
+      for (const Stmt &statement : sequence.value()->seq)
+        ordered.push_back(statement);
+    } else {
+      ordered.push_back(role);
+    }
+  }
+  Stmt scheduled = ordered.size() == 1 ? ordered[0] : SeqStmt(ordered, span);
+  scheduled = CompactDeviceRoleStatements(scheduled);
+  CoreDomain domain(CoreCoord(0, 0), CoreCoord(grid_x, grid_y));
+  SBlock work({}, {}, {}, "tt_device_core_work", scheduled, std::nullopt, {},
+              {}, {{"tt.core_domain", domain}, {"tt.owner_slot", owner_slot}},
+              span);
+  return SBlockRealize({}, const_true(), work, span);
+}
+
+} // namespace
+
+Stmt ParameterizeDeviceCoreStatements(const std::vector<DeviceCoreBody> &bodies,
+                                      int64_t grid_x, int64_t grid_y,
+                                      const ffi::String &owner_slot,
+                                      const Span &span) {
+  if (auto components = TryParameterizeDFBComponents(bodies, grid_x, grid_y,
+                                                     owner_slot, span))
+    return components.value();
+  return ParameterizeDeviceCoreStatementsImpl(bodies, grid_x, grid_y,
+                                              owner_slot, span);
 }
 
 Stmt ExpandDeviceStatements(const Stmt &body, int64_t *budget) {

@@ -231,6 +231,17 @@ Stmt MakeDeviceCall(const Op &op, ffi::Array<PrimExpr> args, const Span &span) {
   return Evaluate(Call(DataType::Void(), op, std::move(args), {}, span), span);
 }
 
+Stmt MakeCommunicationDeviceCall(const Op &op, ffi::Array<PrimExpr> args,
+                                 int64_t site, int64_t occurrence,
+                                 const ffi::String &role, const Span &span) {
+  ffi::Map<ffi::String, ffi::ObjectRef> annotations{
+      {"tt.communication_site", Integer(site)},
+      {"tt.communication_occurrence", Integer(occurrence)},
+      {"tt.communication_role", StringImm(role)}};
+  return Evaluate(
+      Call(DataType::Void(), op, std::move(args), annotations, span), span);
+}
+
 // Assign an immutable generation to every write. Logical storage reuse is
 // planned only after the complete cross-slot transaction schedule is known.
 struct ResourceVersion {
@@ -2346,14 +2357,16 @@ private:
         endpoints_.push_back({transfer, occurrence, record, x, y, id, send,
                               send && forward, call->span});
         auto *body = send && !forward ? &pipe_ : &transfer_;
-        body->push_back(MakeDeviceCall(
+        ffi::String role =
+            send ? ffi::String("source") : ffi::String("destination");
+        body->push_back(MakeCommunicationDeviceCall(
             send ? tenstorrent::dfb_pipe_send() : tenstorrent::dfb_pipe_recv(),
             {IntImm(DataType::Int(64), transfer), Integer(id), Integer(1)},
-            call->span));
-        body->push_back(MakeDeviceCall(
+            site, occurrence, role, call->span));
+        body->push_back(MakeCommunicationDeviceCall(
             tenstorrent::dfb_pipe_wait(),
             {IntImm(DataType::Int(64), transfer), Integer(id), Integer(1)},
-            call->span));
+            site, occurrence, role, call->span));
       }
     }
   }

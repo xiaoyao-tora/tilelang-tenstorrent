@@ -4006,11 +4006,23 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                                "Device operation dynamic multiplicity"));
           }
         } else if (const auto *branch = stmt.as<IfThenElseNode>()) {
-          collect_calls(branch->then_case, calls, multipliers, core_x, core_y,
-                        bindings, multiplier);
-          if (branch->else_case.has_value())
-            collect_calls(branch->else_case.value(), calls, multipliers, core_x,
-                          core_y, bindings, multiplier);
+          CoreCoordinateSubstituter bind_core(core_x, core_y);
+          PrimExpr condition = arith::Analyzer().Simplify(
+              bind_core.VisitExpr(Substitute(branch->condition, bindings)));
+          if (is_one(condition)) {
+            collect_calls(branch->then_case, calls, multipliers, core_x, core_y,
+                          bindings, multiplier);
+          } else if (is_zero(condition)) {
+            if (branch->else_case.has_value())
+              collect_calls(branch->else_case.value(), calls, multipliers,
+                            core_x, core_y, bindings, multiplier);
+          } else {
+            collect_calls(branch->then_case, calls, multipliers, core_x, core_y,
+                          bindings, multiplier);
+            if (branch->else_case.has_value())
+              collect_calls(branch->else_case.value(), calls, multipliers,
+                            core_x, core_y, bindings, multiplier);
+          }
         } else if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
           collect_calls(realize->block->body, calls, multipliers, core_x,
                         core_y, bindings, multiplier);
@@ -4256,9 +4268,159 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       dispatch_body = root->block->body;
     }
     verify_dispatch(dispatch_body);
+    std::function<void(const Stmt &, ffi::Optional<PrimExpr>)>
+        verify_stream_dispatch = [&](const Stmt &stmt,
+                                     ffi::Optional<PrimExpr> predicate) {
+          if (const auto *sequence = stmt.as<SeqStmtNode>()) {
+            Check(!predicate.has_value(),
+                  "Device stream predicate must guard one stream work region");
+            for (const Stmt &child : sequence->seq)
+              verify_stream_dispatch(child, std::nullopt);
+            return;
+          }
+          if (const auto *loop = stmt.as<ForNode>()) {
+            Check(!predicate.has_value(),
+                  "Device stream predicate cannot guard a loop");
+            verify_stream_dispatch(loop->body, std::nullopt);
+            return;
+          }
+          if (const auto *branch = stmt.as<IfThenElseNode>()) {
+            Check(!predicate.has_value() && !branch->else_case.has_value(),
+                  "Device stream dispatch requires one predicate without else");
+            verify_stream_dispatch(branch->then_case, branch->condition);
+            return;
+          }
+          if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+            if (realize->block->name_hint != "tt_device_stream_work") {
+              Check(!predicate.has_value(),
+                    "Device stream predicate guards a non-stream region");
+              verify_stream_dispatch(realize->block->body, std::nullopt);
+              return;
+            }
+            CoreDomain domain = Downcast<CoreDomain>(
+                realize->block->annotations.at("tt.core_domain"));
+            for (int64_t x = 0; x < launch_grid->x; ++x) {
+              for (int64_t y = 0; y < launch_grid->y; ++y) {
+                bool expected = x >= domain->begin->x && x < domain->end->x &&
+                                y >= domain->begin->y && y < domain->end->y;
+                bool actual = true;
+                if (predicate.has_value()) {
+                  CoreCoordinateSubstituter bind_core(x, y);
+                  PrimExpr condition = arith::Analyzer().Simplify(
+                      bind_core.VisitExpr(predicate.value()));
+                  const int64_t *constant = as_const_int(condition);
+                  Check(constant,
+                        "Device stream predicate must simplify on every Core");
+                  actual = *constant != 0;
+                }
+                Check(actual == expected,
+                      "Device stream predicate disagrees with core_domain");
+              }
+            }
+            return;
+          }
+          Check(!predicate.has_value(),
+                "Device stream predicate guards a non-stream statement");
+        };
     PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
       const auto *block = object.as<SBlockNode>();
       if (!block || block->name_hint != "tt_device_core_work")
+        return;
+      bool has_stream_work = false;
+      PostOrderVisit(block->body, [&](const ffi::ObjectRef &nested) {
+        const auto *nested_block = nested.as<SBlockNode>();
+        has_stream_work |=
+            nested_block && nested_block->name_hint == "tt_device_stream_work";
+      });
+      if (has_stream_work)
+        verify_stream_dispatch(block->body, std::nullopt);
+    });
+    PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
+      const auto *block = object.as<SBlockNode>();
+      if (!block)
+        return;
+      if (block->name_hint == "tt_device_stream_work") {
+        auto annotation_integer = [&](const ffi::Any &value,
+                                      const char *label) {
+          if (auto scalar = value.as<int64_t>())
+            return scalar.value();
+          if (auto integer = value.as<Integer>())
+            return integer.value()->value;
+          Fail(std::string(label) + " must be an integer");
+          return int64_t{0};
+        };
+        auto domain = block->annotations.Get("tt.core_domain");
+        auto owner = block->annotations.Get("tt.owner_slot");
+        auto work_group = block->annotations.Get("tt.work_group");
+        Check(domain.has_value() && owner.has_value() && work_group.has_value(),
+              "Device stream work requires core_domain, owner_slot and "
+              "work_group annotations");
+        VerifyDomain(Downcast<CoreDomain>(domain.value()), launch_grid,
+                     "Device stream work domain");
+        auto owner_string = owner.value().as<ffi::String>();
+        Check(owner_string.has_value() &&
+                  owner_string.value() ==
+                      func->GetAttr<ffi::String>(kKernelSlotAttr).value(),
+              "Device stream work owner disagrees with containing slot");
+        int64_t work_group_id =
+            annotation_integer(work_group.value(), "Device stream work group");
+        Check(work_group_id >= 0,
+              "Device stream work group must be a nonnegative integer");
+        auto role = block->annotations.Get("tt.communication_role");
+        auto sites = block->annotations.Get("tt.communication_sites");
+        Check(role.has_value() == sites.has_value(),
+              "Device communication role and site annotations must coexist");
+        if (role.has_value()) {
+          auto role_string = role.value().as<ffi::String>();
+          Check(role_string.has_value(),
+                "Device communication role must be a string");
+          ffi::String role_name = role_string.value();
+          Check(role_name == "source" || role_name == "destination",
+                "Device communication role must be source or destination");
+          auto site_array = sites.value().as<ffi::Array<ffi::Any>>();
+          Check(site_array.has_value() && !site_array.value().empty(),
+                "Device communication role requires at least one site");
+          std::set<int64_t> allowed_sites;
+          for (const ffi::Any &site_value : site_array.value()) {
+            int64_t site =
+                annotation_integer(site_value, "Device communication site");
+            Check(site >= 0 && allowed_sites.insert(site).second,
+                  "Device communication sites must be unique nonnegative IDs");
+          }
+          bool found_pipe = false;
+          PostOrderVisit(block->body, [&](const ffi::ObjectRef &nested) {
+            const auto *call = nested.as<CallNode>();
+            if (!call || (!call->op.same_as(dfb_pipe_send()) &&
+                          !call->op.same_as(dfb_pipe_recv()) &&
+                          !call->op.same_as(dfb_pipe_wait())))
+              return;
+            found_pipe = true;
+            if (role_name == "source")
+              Check(!call->op.same_as(dfb_pipe_recv()),
+                    "source communication role contains a receive");
+            else
+              Check(!call->op.same_as(dfb_pipe_send()),
+                    "destination communication role contains a send");
+            auto call_role = call->annotations.Get("tt.communication_role");
+            auto call_site = call->annotations.Get("tt.communication_site");
+            auto call_role_string = call_role.has_value()
+                                        ? call_role.value().as<StringImm>()
+                                        : ffi::Optional<StringImm>();
+            Check(call_role_string.has_value() && call_site.has_value() &&
+                      call_role_string.value()->value == role_name,
+                  "Pipe operation role annotation disagrees with its stream "
+                  "work region");
+            int64_t site =
+                annotation_integer(call_site.value(), "Pipe operation site");
+            Check(allowed_sites.count(site),
+                  "Pipe operation site is outside its stream work region");
+          });
+          Check(found_pipe,
+                "Device communication role region contains no Pipe operation");
+        }
+        return;
+      }
+      if (block->name_hint != "tt_device_core_work")
         return;
       CoreDomain instance_domain;
       auto domain_annotation = block->annotations.Get("tt.core_domain");

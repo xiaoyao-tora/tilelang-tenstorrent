@@ -13,8 +13,8 @@ namespace tvm {
 namespace tl {
 namespace tenstorrent {
 
-// Fold repeated flat device instructions into serial loops without changing
-// operation order, source provenance, or identity-bearing operands.
+// Fold repeated device statements into serial loops without changing operation
+// order, source provenance, or identity-bearing operands.
 tirx::Stmt CompactDeviceStatements(const tirx::Stmt &body);
 tirx::Stmt CompactDeviceStatementsRecursive(const tirx::Stmt &body);
 
