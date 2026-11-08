@@ -80,7 +80,7 @@ def test_distinct_buffer_variable_and_span_identities_are_not_merged():
     buffers = [tirx.decl_buffer((32, 32), name="same_name") for _ in range(8)]
     variables = [tirx.Var("same_name", "int32") for _ in range(8)]
     spans = [ir.Span(source, 1, 1, 1, 2) for _ in range(8)]
-    statements = [_call("tl.tt.dfb_wait", [variables[i], 1], {"buffer": buffers[i]}, spans[i]) for i in range(len(buffers))]
+    statements = [_call("tl.tt.dfb_wait", [variables[i]], {"buffer": buffers[i]}, spans[i]) for i in range(len(buffers))]
     original = _module(tirx.SeqStmt(statements))
     compact = compact_device_ir(original, force=True)
     assert not _nodes(compact["main"].body, tirx.For)
@@ -101,7 +101,7 @@ def _replace_compact_body(body):
 def test_expansion_rejects_integer_overflow(dtype, base, step):
     variable = tirx.Var("iteration", "int64")
     value = tirx.Add(tirx.IntImm(dtype, base), tirx.Mul(tirx.Cast(dtype, variable), tirx.IntImm(dtype, step)))
-    body = tirx.For(variable, 0, 2, tirx.ForKind.SERIAL, _call("tl.tt.dfb_wait", [value, 1]))
+    body = tirx.For(variable, 0, 2, tirx.ForKind.SERIAL, _call("tl.tt.dfb_wait", [value]))
     with pytest.raises((ValueError, tvm.error.TVMError), match="overflow"):
         expand_device_ir(_replace_compact_body(body))
 
@@ -109,13 +109,13 @@ def test_expansion_rejects_integer_overflow(dtype, base, step):
 @pytest.mark.parametrize("minimum,extent,kind", [(-1, 2, tirx.ForKind.SERIAL), (0, 0, tirx.ForKind.SERIAL), (0, 2, tirx.ForKind.PARALLEL)])
 def test_expansion_rejects_unsupported_loop_forms(minimum, extent, kind):
     variable = tirx.Var("iteration", "int32")
-    body = tirx.For(variable, minimum, extent, kind, _call("tl.tt.dfb_wait", [0, 1]))
+    body = tirx.For(variable, minimum, extent, kind, _call("tl.tt.dfb_wait", [0]))
     with pytest.raises((ValueError, tvm.error.TVMError), match="compact loops require"):
         expand_device_ir(_replace_compact_body(body))
 
 
 def test_nested_loop_budget_is_checked_before_expansion():
-    inner = tirx.For(tirx.Var("inner", "int32"), 0, 2001, tirx.ForKind.SERIAL, _call("tl.tt.dfb_wait", [0, 1]))
+    inner = tirx.For(tirx.Var("inner", "int32"), 0, 2001, tirx.ForKind.SERIAL, _call("tl.tt.dfb_wait", [0]))
     outer = tirx.For(tirx.Var("outer", "int32"), 0, 2001, tirx.ForKind.SERIAL, inner)
     with pytest.raises((ValueError, tvm.error.TVMError), match="budget"):
         expand_device_ir(_replace_compact_body(outer))
@@ -128,7 +128,7 @@ def test_expansion_rejects_empty_sequence_inside_large_loop():
 
 
 def test_unit_extent_nesting_cannot_bypass_expansion_limits():
-    body = _call("tl.tt.dfb_wait", [0, 1])
+    body = _call("tl.tt.dfb_wait", [0])
     for depth in range(66):
         body = tirx.For(tirx.Var(f"iteration_{depth}", "int32"), 0, 1, tirx.ForKind.SERIAL, body)
     with pytest.raises((ValueError, tvm.error.TVMError), match="nesting"):
@@ -137,7 +137,7 @@ def test_unit_extent_nesting_cannot_bypass_expansion_limits():
 
 def test_loop_variable_outside_an_affine_integer_is_rejected():
     variable = tirx.Var("iteration", "int32")
-    body = tirx.For(variable, 0, 2, tirx.ForKind.SERIAL, _call("tl.tt.dfb_wait", [variable, 1]))
+    body = tirx.For(variable, 0, 2, tirx.ForKind.SERIAL, _call("tl.tt.dfb_wait", [variable]))
     with pytest.raises((ValueError, tvm.error.TVMError), match="outside a generated affine"):
         expand_device_ir(_replace_compact_body(body))
 

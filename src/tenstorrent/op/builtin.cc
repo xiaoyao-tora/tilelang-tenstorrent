@@ -122,20 +122,20 @@ TIR_DEFINE_TT_BUILTIN(dfb_to_tensor_nd)
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TT_BUILTIN(dfb_reserve)
-    .set_num_inputs(2)
+    .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TT_BUILTIN(dfb_wait).set_num_inputs(2).set_attr<TCallEffectKind>(
+TIR_DEFINE_TT_BUILTIN(dfb_wait).set_num_inputs(1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TT_BUILTIN(dfb_copy_wait)
-    .set_num_inputs(2)
+    .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TT_BUILTIN(dfb_release)
-    .set_num_inputs(2)
+    .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

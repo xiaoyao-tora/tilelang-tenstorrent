@@ -120,6 +120,36 @@ def test_invalid_stream_capacity_rejected_by_verifier():
     )
 
 
+def test_lifecycle_operations_have_one_stream_operand():
+    mod = pipeline()
+    lifecycle = {
+        "tl.tt.dfb_reserve",
+        "tl.tt.dfb_wait",
+        "tl.tt.dfb_copy_wait",
+        "tl.tt.dfb_release",
+    }
+    calls = [stmt.value for slot in ("trisc", "ncrisc") for stmt in statements(mod, slot) if operation(stmt) in lifecycle]
+    assert calls and all(len(call.args) == 1 for call in calls)
+
+
+def test_legacy_lifecycle_transaction_count_rejected():
+    mod = pipeline()
+    body = statements(mod, "trisc")
+    index = next(i for i, stmt in enumerate(body) if operation(stmt) == "tl.tt.dfb_wait")
+    call = body[index].value
+    body[index] = tirx.Evaluate(
+        tirx.Call(
+            call.dtype,
+            call.op,
+            [*call.args, tirx.IntImm("int32", 1)],
+            call.annotations,
+            call.span,
+        )
+    )
+    replace_statements(mod, "trisc", body)
+    rejected(mod, "lifecycle operation requires one stream operand")
+
+
 @pytest.mark.parametrize(
     "name,match",
     [

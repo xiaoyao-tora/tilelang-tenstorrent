@@ -643,7 +643,7 @@ size_t MarkerArity(MarkerKind kind) {
   switch (kind) {
   case MarkerKind::kDFBReserve:
   case MarkerKind::kDFBWait:
-    return 2;
+    return 1;
   case MarkerKind::kDFBAdd:
     return 4;
   case MarkerKind::kTensorToDFB:
@@ -720,9 +720,9 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
         "Phase 2 trisc LogicalKernel must have kind `compute` and role `add`");
     VerifyMarkerSequence(
         ParseMarkers(func->body, symbol),
-        {{MarkerKind::kDFBReserve, {output_id, 1}},
-         {MarkerKind::kDFBWait, {input_a_id, 1}},
-         {MarkerKind::kDFBWait, {input_b_id, 1}},
+        {{MarkerKind::kDFBReserve, {output_id}},
+         {MarkerKind::kDFBWait, {input_a_id}},
+         {MarkerKind::kDFBWait, {input_b_id}},
          {MarkerKind::kDFBAdd,
           {input_a_id, input_b_id, output_id, plan.tile_count}}},
         symbol);
@@ -734,13 +734,13 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
           "Phase 2 ncrisc LogicalKernel must have kind `datamovement` and role "
           "`tensor_io`");
     VerifyMarkerSequence(ParseMarkers(func->body, symbol),
-                         {{MarkerKind::kDFBReserve, {input_a_id, 1}},
+                         {{MarkerKind::kDFBReserve, {input_a_id}},
                           {MarkerKind::kTensorToDFB,
                            {0, input_a_id, 0, 0, plan.rows, plan.cols}},
-                          {MarkerKind::kDFBReserve, {input_b_id, 1}},
+                          {MarkerKind::kDFBReserve, {input_b_id}},
                           {MarkerKind::kTensorToDFB,
                            {1, input_b_id, 0, 0, plan.rows, plan.cols}},
-                          {MarkerKind::kDFBWait, {output_id, 1}},
+                          {MarkerKind::kDFBWait, {output_id}},
                           {MarkerKind::kDFBToTensor,
                            {output_id, 2, 0, 0, plan.rows, plan.cols}}},
                          symbol);
@@ -2484,10 +2484,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
           values.Precision(call);
         } else if (call->op.same_as(dfb_reserve()) ||
                    call->op.same_as(dfb_wait())) {
-          Check(call->args.size() == 2 &&
-                    RequireStaticInteger(call->args[1], "transaction count") ==
-                        1,
-                "immutable DFB reserve/wait must request one transaction");
+          Check(call->args.size() == 1,
+                "immutable DFB reserve/wait requires one stream operand");
           int64_t id = id_at(0);
           if (call->op.same_as(dfb_reserve())) {
             Check(dfbs.at(id)->producer_slot == slot,
@@ -2501,9 +2499,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
             waited.insert(id);
           }
         } else if (pipeline.enabled && call->op.same_as(dfb_copy_wait())) {
-          Check(slot == "ncrisc" && call->args.size() == 2 &&
-                    RequireStaticInteger(call->args[1], "copy wait count") == 1,
-                "dfb_copy_wait requires ncrisc and one transaction");
+          Check(slot == "ncrisc" && call->args.size() == 1,
+                "dfb_copy_wait requires ncrisc and one stream operand");
           int64_t id = id_at(0);
           Check(copy_issues.count(id),
                 "dfb_copy_wait must follow its copy issue");
@@ -2513,9 +2510,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
             publish(id);
         } else if ((pipeline.enabled || value_program) &&
                    call->op.same_as(dfb_release())) {
-          Check(call->args.size() == 2 &&
-                    RequireStaticInteger(call->args[1], "release count") == 1,
-                "dfb_release must release one transaction");
+          Check(call->args.size() == 1,
+                "dfb_release requires one stream operand");
           int64_t id = id_at(0);
           Check(dfbs.at(id)->consumer_slot == slot,
                 "DFB release in wrong consumer slot");
@@ -3356,10 +3352,8 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
                    call->op.same_as(dfb_wait()) ||
                    call->op.same_as(dfb_release()) ||
                    call->op.same_as(dfb_copy_wait())) {
-          Check(call->args.size() == 2 &&
-                    RequireStaticInteger(call->args[1], "transaction count") ==
-                        1,
-                "Phase 6 DFB operation must request exactly one transaction");
+          Check(call->args.size() == 1,
+                "Phase 6 DFB lifecycle operation requires one stream operand");
           int64_t id = id_at(0);
           if (call->op.same_as(dfb_reserve())) {
             Check(dfbs.at(id)->producer_slot == slot,
@@ -4105,12 +4099,19 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       };
       if (call->op.same_as(dfb_reserve()) || call->op.same_as(dfb_wait()) ||
           call->op.same_as(dfb_release()) ||
-          call->op.same_as(dfb_copy_wait()) || call->op.same_as(dfb_load()))
+          call->op.same_as(dfb_copy_wait())) {
+        Check(call->args.size() == 1,
+              "current Device DFB lifecycle operation requires one stream "
+              "operand");
         check_dfb(0);
-      else if (call->op.same_as(tensor_to_dfb_nd()) ||
-               call->op.same_as(dfb_pipe_send()) ||
-               call->op.same_as(dfb_pipe_recv()) ||
-               call->op.same_as(dfb_pipe_wait()))
+      } else if (call->op.same_as(dfb_load())) {
+        Check(call->args.size() == 1,
+              "current Device dfb_load requires one stream operand");
+        check_dfb(0);
+      } else if (call->op.same_as(tensor_to_dfb_nd()) ||
+                 call->op.same_as(dfb_pipe_send()) ||
+                 call->op.same_as(dfb_pipe_recv()) ||
+                 call->op.same_as(dfb_pipe_wait()))
         check_dfb(1);
       else if (call->op.same_as(dfb_to_tensor_nd()) ||
                call->op.same_as(accumulator_materialize()) ||

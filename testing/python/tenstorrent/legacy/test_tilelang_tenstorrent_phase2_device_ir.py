@@ -14,25 +14,23 @@ from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase0_contract 
 )
 
 
-pytestmark = pytest.mark.skip(
-    reason="legacy v1/v2 per-Core marker schema; shared-grid v04 coverage lives in lower_shared_grid_v04"
-)
+pytestmark = pytest.mark.skip(reason="legacy v1/v2 per-Core marker schema; shared-grid v04 coverage lives in lower_shared_grid_v04")
 
 
 TARGET_CONFIG = {"kind": "tenstorrent", "arch": "wormhole_b0"}
 GOLDEN_MARKERS = {
     "trisc": (
-        ("tl.tt.dfb_reserve", (2, 1)),
-        ("tl.tt.dfb_wait", (0, 1)),
-        ("tl.tt.dfb_wait", (1, 1)),
+        ("tl.tt.dfb_reserve", (2,)),
+        ("tl.tt.dfb_wait", (0,)),
+        ("tl.tt.dfb_wait", (1,)),
         ("tl.tt.dfb_add", (0, 1, 2, 1)),
     ),
     "ncrisc": (
-        ("tl.tt.dfb_reserve", (0, 1)),
+        ("tl.tt.dfb_reserve", (0,)),
         ("tl.tt.tensor_to_dfb", (0, 0, 0, 0, 32, 32)),
-        ("tl.tt.dfb_reserve", (1, 1)),
+        ("tl.tt.dfb_reserve", (1,)),
         ("tl.tt.tensor_to_dfb", (1, 1, 0, 0, 32, 32)),
-        ("tl.tt.dfb_wait", (2, 1)),
+        ("tl.tt.dfb_wait", (2,)),
         ("tl.tt.dfb_to_tensor", (2, 2, 0, 0, 32, 32)),
     ),
     "brisc": (),

@@ -602,8 +602,8 @@ public:
       if (call->op.same_as(tensor_to_dfb_nd()) ||
           call->op.same_as(dfb_to_tensor_nd())) {
         size_t arg = call->op.same_as(tensor_to_dfb_nd()) ? 1 : 0;
-        scheduled.push_back(MakeDeviceCall(
-            dfb_copy_wait(), {call->args[arg], Integer(1)}, statement->span));
+        scheduled.push_back(MakeDeviceCall(dfb_copy_wait(), {call->args[arg]},
+                                           statement->span));
       }
     };
     auto resource_id = [](const CallNode *call) {
@@ -655,9 +655,8 @@ public:
           }
           scheduled.push_back(statement);
           if (input_copy) {
-            Stmt completion =
-                MakeDeviceCall(tenstorrent::dfb_copy_wait(),
-                               {Integer(id), Integer(1)}, statement->span);
+            Stmt completion = MakeDeviceCall(tenstorrent::dfb_copy_wait(),
+                                             {Integer(id)}, statement->span);
             if (pipeline_wait_policy_ == "conservative")
               scheduled.push_back(completion);
             else
@@ -667,8 +666,7 @@ public:
           outputs.push_back(statement);
           if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
             outputs.push_back(MakeDeviceCall(tenstorrent::dfb_copy_wait(),
-                                             {Integer(id), Integer(1)},
-                                             statement->span));
+                                             {Integer(id)}, statement->span));
         }
       }
       for (const Stmt &statement : completions) {
@@ -1164,8 +1162,7 @@ private:
       result.push_back(statement);
       for (int64_t id : releases[index])
         result.push_back(MakeDeviceCall(tenstorrent::dfb_release(),
-                                        {Integer(id), Integer(1)},
-                                        statement->span));
+                                        {Integer(id)}, statement->span));
     }
     *body = std::move(result);
   }
@@ -1239,12 +1236,12 @@ private:
   }
 
   void Wait(ffi::Array<Stmt> *body, int64_t id, const Span &span) {
-    body->push_back(MakeDeviceCall(tenstorrent::dfb_wait(),
-                                   {Integer(id), Integer(1)}, span));
+    body->push_back(
+        MakeDeviceCall(tenstorrent::dfb_wait(), {Integer(id)}, span));
   }
   void Reserve(ffi::Array<Stmt> *body, int64_t id, const Span &span) {
-    body->push_back(MakeDeviceCall(tenstorrent::dfb_reserve(),
-                                   {Integer(id), Integer(1)}, span));
+    body->push_back(
+        MakeDeviceCall(tenstorrent::dfb_reserve(), {Integer(id)}, span));
   }
 
   int64_t ReadValue(const Buffer &buffer) const {
@@ -1658,8 +1655,8 @@ private:
       }
       transfer_.push_back(MakeDeviceCall(dfb_to_tensor_nd(), args, call->span));
       if (transfers_)
-        transfer_.push_back(MakeDeviceCall(
-            dfb_copy_wait(), {Integer(output_id), Integer(1)}, call->span));
+        transfer_.push_back(
+            MakeDeviceCall(dfb_copy_wait(), {Integer(output_id)}, call->span));
     } else {
       output_id = Write(output->buffer, "trisc");
     }
@@ -1901,8 +1898,7 @@ private:
           MakeDeviceCall(tenstorrent::dfb_to_tensor_nd(), args, call->span));
       if (transfers_)
         transfer_.push_back(MakeDeviceCall(tenstorrent::dfb_copy_wait(),
-                                           {Integer(output_id), Integer(1)},
-                                           call->span));
+                                           {Integer(output_id)}, call->span));
     } else {
       ThrowMalformed("accumulator must materialize to shared DFB or Tensor");
     }
@@ -1973,8 +1969,7 @@ private:
           MakeDeviceCall(tenstorrent::tensor_to_dfb_nd(), args, call->span));
       if (transfers_)
         transfer_.push_back(MakeDeviceCall(tenstorrent::dfb_copy_wait(),
-                                           {Integer(id), Integer(1)},
-                                           call->span));
+                                           {Integer(id)}, call->span));
       return;
     }
     if (src->kind == "logical_dfb_candidate" && dst->kind == "tensor") {
@@ -2014,8 +2009,7 @@ private:
           MakeDeviceCall(tenstorrent::dfb_to_tensor_nd(), args, call->span));
       if (transfers_)
         transfer_.push_back(MakeDeviceCall(tenstorrent::dfb_copy_wait(),
-                                           {Integer(output), Integer(1)},
-                                           call->span));
+                                           {Integer(output)}, call->span));
       return;
     }
     ThrowUnsupported("Copy must connect Tensor and DFB; shared Copy requires "
