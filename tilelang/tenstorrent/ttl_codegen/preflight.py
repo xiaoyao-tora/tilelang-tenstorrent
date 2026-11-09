@@ -17,7 +17,6 @@ def preflight_ttl_mapping(mod: IRModule) -> None:
     issues: set[str] = set()
     required = (
         "tt.dfb_storage_groups",
-        "tt.communication_step_families",
         "tt.transport_families",
         "tt.kernel_order",
     )
@@ -40,8 +39,6 @@ def preflight_ttl_mapping(mod: IRModule) -> None:
 
     if has_control_flow:
         issues.add("shared Core/SCF control-flow emission is not implemented")
-    if attrs.get("tt.communication_step_families", []):
-        issues.add("body-driven communication step and Pipe transport emission is not implemented")
     try:
         resolve_current_function_groups(mod)
     except (KeyError, ResourceResolutionError) as error:

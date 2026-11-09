@@ -145,9 +145,10 @@ TVM_DLL const Op &dfb_pipe_wait();
 /*!
  * \brief Current record-level PipeNet delivery and completion operations.
  *
- * Arguments are (PipeNet ID, dense record index, transfer occurrence, local
- * logical DFB stream ID). One source operation covers the record's complete
- * destination range; each matching destination Core executes one receive.
+ * Arguments are (PipeNet ID, dense record index, local logical DFB stream ID).
+ * Structured control flow represents repeated executions. One source operation
+ * covers the record's complete destination range; each matching destination
+ * Core executes one receive.
  */
 TVM_DLL const Op &dfb_pipe_send_record();
 TVM_DLL const Op &dfb_pipe_recv_record();

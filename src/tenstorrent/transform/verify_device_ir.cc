@@ -3842,8 +3842,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       RequireModuleAttr<ffi::Array<PipeDescriptor>>(mod, "tt.transport_table");
   auto communication = mod->GetAttr<ffi::Array<CommunicationDescriptor>>(
       "tt.communication_table");
-  auto steps = RequireModuleAttr<ffi::Array<CommunicationStepDescriptor>>(
-      mod, "tt.communication_step_table");
   ffi::Array<ffi::String> order =
       RequireModuleAttr<ffi::Array<ffi::String>>(mod, kKernelOrderAttr);
   Check(order.size() == 3 && mod->functions.size() == 3,
@@ -3992,8 +3990,11 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   std::vector<std::vector<int64_t>> event_successors;
   ComputeValueVerifier compute_values(mod);
   std::vector<std::pair<int64_t, DataType>> value_exports;
-  std::vector<int64_t> step_ref_counts(steps.size(), 0);
-  std::vector<int64_t> step_ref_dynamic_counts(steps.size(), 0);
+  using RecordKey = std::pair<int64_t, int64_t>;
+  using RecordEndpointKey = std::tuple<int64_t, int64_t, int64_t, int64_t>;
+  std::map<RecordKey, int64_t> record_send_counts;
+  std::map<RecordEndpointKey, int64_t> record_receive_counts;
+  std::map<std::pair<int64_t, std::string>, int64_t> local_communication_counts;
   std::function<void(const Stmt &, std::vector<Call> *, std::vector<int64_t> *,
                      int64_t, int64_t, const ffi::Map<Var, PrimExpr> &,
                      int64_t)>
@@ -4073,14 +4074,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             if (expression.has_value())
               annotations.Set("tt.expression", concretize(Downcast<PrimExpr>(
                                                    expression.value())));
-            auto step_refs = annotations.Get("tt_communication_step_refs");
-            if (step_refs.has_value()) {
-              ffi::Array<PrimExpr> rewritten;
-              for (const PrimExpr &ref :
-                   Downcast<ffi::Array<PrimExpr>>(step_refs.value()))
-                rewritten.push_back(concretize(ref));
-              annotations.Set("tt_communication_step_refs", rewritten);
-            }
             if (!ffi::StructuralEqual()(annotations, concrete->annotations))
               concrete = Call(concrete->dtype, concrete->op, concrete->args,
                               annotations, concrete->span);
@@ -4153,7 +4146,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       else if (call->op.same_as(dfb_pipe_send_record()) ||
                call->op.same_as(dfb_pipe_recv_record()) ||
                call->op.same_as(dfb_pipe_wait_record()))
-        check_dfb(3);
+        check_dfb(2);
       else if (call->op.same_as(dfb_to_tensor_nd()) ||
                call->op.same_as(accumulator_materialize()) ||
                call->op.same_as(compute_value_store()))
@@ -4396,9 +4389,12 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
         Check(work_group_id >= 0,
               "Device stream work group must be a nonnegative integer");
         auto role = block->annotations.Get("tt.communication_role");
-        auto sites = block->annotations.Get("tt.communication_sites");
-        Check(role.has_value() == sites.has_value(),
-              "Device communication role and site annotations must coexist");
+        auto communication_ids = block->annotations.Get("tt.communication_ids");
+        auto pipe_net_ids = block->annotations.Get("tt.pipe_net_ids");
+        Check(role.has_value() == communication_ids.has_value() &&
+                  role.has_value() == pipe_net_ids.has_value(),
+              "Device communication role, communication IDs and PipeNet IDs "
+              "must coexist");
         if (role.has_value()) {
           auto role_string = role.value().as<ffi::String>();
           Check(role_string.has_value(),
@@ -4406,16 +4402,24 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
           ffi::String role_name = role_string.value();
           Check(role_name == "source" || role_name == "destination",
                 "Device communication role must be source or destination");
-          auto site_array = sites.value().as<ffi::Array<ffi::Any>>();
-          Check(site_array.has_value() && !site_array.value().empty(),
-                "Device communication role requires at least one site");
-          std::set<int64_t> allowed_sites;
-          for (const ffi::Any &site_value : site_array.value()) {
-            int64_t site =
-                annotation_integer(site_value, "Device communication site");
-            Check(site >= 0 && allowed_sites.insert(site).second,
-                  "Device communication sites must be unique nonnegative IDs");
-          }
+          auto read_ids = [&](const ffi::Any &value, const char *label) {
+            auto array = value.as<ffi::Array<ffi::Any>>();
+            Check(array.has_value() && !array.value().empty(),
+                  std::string(label) + " must be a nonempty array");
+            std::set<int64_t> ids;
+            for (const ffi::Any &item : array.value()) {
+              int64_t id = annotation_integer(item, label);
+              Check(id >= 0 && ids.insert(id).second,
+                    std::string(label) +
+                        " must contain unique nonnegative IDs");
+            }
+            return ids;
+          };
+          std::set<int64_t> allowed_communications =
+              read_ids(communication_ids.value(), "Device communication IDs");
+          std::set<int64_t> allowed_pipe_nets =
+              read_ids(pipe_net_ids.value(), "Device PipeNet IDs");
+          std::set<int64_t> found_communications, found_pipe_nets;
           bool found_pipe = false;
           PostOrderVisit(block->body, [&](const ffi::ObjectRef &nested) {
             const auto *call = nested.as<CallNode>();
@@ -4435,22 +4439,36 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               Check(!call->op.same_as(dfb_pipe_send()) &&
                         !call->op.same_as(dfb_pipe_send_record()),
                     "destination communication role contains a send");
-            auto call_role = call->annotations.Get("tt.communication_role");
-            auto call_site = call->annotations.Get("tt.communication_site");
-            auto call_role_string = call_role.has_value()
-                                        ? call_role.value().as<StringImm>()
-                                        : ffi::Optional<StringImm>();
-            Check(call_role_string.has_value() && call_site.has_value() &&
-                      call_role_string.value()->value == role_name,
-                  "Pipe operation role annotation disagrees with its stream "
-                  "work region");
-            int64_t site =
-                annotation_integer(call_site.value(), "Pipe operation site");
-            Check(allowed_sites.count(site),
-                  "Pipe operation site is outside its stream work region");
+            Check(
+                !call->annotations.count("tt.communication_role") &&
+                    !call->annotations.count("tt.communication_site") &&
+                    !call->annotations.count("tt.communication_occurrence") &&
+                    !call->annotations.count("tt.internal_communication_id") &&
+                    !call->annotations.count("tt_communication_step_refs"),
+                "final Pipe record operation carries transient planning "
+                "metadata");
+            if (call->op.same_as(dfb_pipe_send_record()) ||
+                call->op.same_as(dfb_pipe_recv_record()) ||
+                call->op.same_as(dfb_pipe_wait_record())) {
+              int64_t pipe_net =
+                  RequireStaticInteger(call->args[0], "stream-work PipeNet ID");
+              auto transport =
+                  std::find_if(transport_records.begin(),
+                               transport_records.end(), [&](const auto &item) {
+                                 return item.first.first == pipe_net;
+                               });
+              Check(transport != transport_records.end(),
+                    "stream-work operation references a missing PipeNet");
+              found_pipe_nets.insert(pipe_net);
+              found_communications.insert(transport->second->communication_id);
+            }
           });
           Check(found_pipe,
                 "Device communication role region contains no Pipe operation");
+          Check(found_communications == allowed_communications &&
+                    found_pipe_nets == allowed_pipe_nets,
+                "Device communication block summaries disagree with their "
+                "Pipe record operations");
         }
         return;
       }
@@ -4564,8 +4582,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
           int64_t ordinal = 0;
           std::map<std::pair<int64_t, int64_t>, bool> sent_transfers;
           std::set<std::pair<int64_t, int64_t>> received_transfers;
-          using RecordTransferKey =
-              std::tuple<int64_t, int64_t, int64_t, int64_t>;
+          using RecordTransferKey = std::tuple<int64_t, int64_t, int64_t>;
           std::map<RecordTransferKey, bool> sent_records;
           std::set<RecordTransferKey> received_records;
           std::map<int64_t, int64_t> next_producer_transaction;
@@ -4665,165 +4682,74 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 compute_values.AcquireDFB(resource, std::get<3>(key));
             }
           };
-          auto verify_step_refs = [&](const Call &call,
-                                      int64_t dynamic_multiplier) {
-            bool pipe_send = call->op.same_as(dfb_pipe_send());
-            bool pipe_recv = call->op.same_as(dfb_pipe_recv());
-            bool pipe_wait = call->op.same_as(dfb_pipe_wait());
+          auto verify_communication_call = [&](const Call &call,
+                                               int64_t dynamic_multiplier) {
             bool record_send = call->op.same_as(dfb_pipe_send_record());
             bool record_recv = call->op.same_as(dfb_pipe_recv_record());
             bool record_wait = call->op.same_as(dfb_pipe_wait_record());
             bool local_copy = call->op.same_as(dfb_local_copy());
             bool gather_copy = call->op.same_as(dfb_gather_copy());
             bool local_reduce = call->op.same_as(dfb_collective_reduce());
-            bool communication_op = pipe_send || pipe_recv || pipe_wait ||
-                                    record_send || record_recv || record_wait ||
-                                    local_copy || gather_copy || local_reduce;
-            auto attribute =
-                call->annotations.Get("tt_communication_step_refs");
-            Check(communication_op == attribute.has_value(),
-                  communication_op
-                      ? "communication operation is missing step refs"
-                      : "non-communication operation carries step refs");
-            if (!communication_op)
+            Check(!call->annotations.count("tt_communication_step_refs"),
+                  "final Device operation retains communication step refs");
+            if (record_send || record_recv || record_wait) {
+              Check(
+                  call->args.size() == 3,
+                  "Pipe record operation requires PipeNet, record and stream");
+              int64_t pipe_net = id(call, 0);
+              int64_t record = id(call, 1);
+              auto transport = transport_records.find({pipe_net, record});
+              Check(transport != transport_records.end(),
+                    "Pipe record operation references missing transport");
+              CoreCoord source = transport->second->src_coord;
+              if (record_send) {
+                Check(source->x == x && source->y == y,
+                      "Pipe record send executes outside its source Core");
+                Check(record_send_counts[{pipe_net, record}] <=
+                          std::numeric_limits<int64_t>::max() -
+                              dynamic_multiplier,
+                      "Pipe record send multiplicity overflows");
+                record_send_counts[{pipe_net, record}] += dynamic_multiplier;
+              } else if (record_recv) {
+                Check(x >= transport->second->dst_begin->x &&
+                          x < transport->second->dst_end->x &&
+                          y >= transport->second->dst_begin->y &&
+                          y < transport->second->dst_end->y,
+                      "Pipe record receive executes outside its destination "
+                      "range");
+                RecordEndpointKey endpoint{pipe_net, record, x, y};
+                Check(record_receive_counts[endpoint] <=
+                          std::numeric_limits<int64_t>::max() -
+                              dynamic_multiplier,
+                      "Pipe record receive multiplicity overflows");
+                record_receive_counts[endpoint] += dynamic_multiplier;
+              }
               return;
-            auto refs = attribute.value().as<ffi::Array<PrimExpr>>();
-            Check(
-                refs.has_value() && !refs.value().empty(),
-                "communication step refs must be a nonempty expression array");
-            Check(((pipe_wait || record_wait) && refs.value().size() <= 2) ||
-                      (!pipe_wait && !record_wait && refs.value().size() == 1),
-                  "communication operation has the wrong number of step refs");
-            std::set<int64_t> unique;
-            for (size_t ref_index = 0; ref_index < refs.value().size();
-                 ++ref_index) {
-              int64_t ref = RequireStaticInteger(refs.value()[ref_index],
-                                                 "communication step ref");
-              Check(ref >= 0 && ref < static_cast<int64_t>(steps.size()) &&
-                        unique.insert(ref).second,
-                    "communication operation has an invalid or duplicate step "
-                    "ref");
-              const CommunicationStepDescriptor &step = steps[ref];
-              Check(step.defined() && step->step_id == ref &&
-                        step->owner_slot == owner,
-                    "communication step ref has the wrong identity or owner");
-              ++step_ref_counts[ref];
-              Check(step_ref_dynamic_counts[ref] <=
-                        std::numeric_limits<int64_t>::max() -
-                            dynamic_multiplier,
-                    "communication step dynamic multiplicity overflows");
-              step_ref_dynamic_counts[ref] += dynamic_multiplier;
-              auto coord_is = [&](const ffi::Optional<CoreCoord> &coord) {
-                return coord.has_value() && coord.value()->x == x &&
-                       coord.value()->y == y;
-              };
-              if (record_send || record_recv || record_wait) {
-                int64_t pipe_net = id(call, 0);
-                int64_t record = id(call, 1);
-                int64_t occurrence = id(call, 2);
-                int64_t resource = id(call, 3);
-                Check(step->pipe_net_id == pipe_net &&
-                          step->record_index == record &&
-                          step->occurrence == occurrence,
-                      "Pipe record operation and step use different record "
-                      "identities");
-                auto transport = transport_records.find({pipe_net, record});
-                Check(transport != transport_records.end(),
-                      "Pipe record operation references missing transport");
-                Check(
-                    step->communication_id ==
-                        transport->second->communication_id,
-                    "Pipe record operation has the wrong parent communication");
-                if (record_send) {
-                  Check(step->kind == "send" && coord_is(step->source_core) &&
-                            !step->destination_core.has_value() &&
-                            step->source_dfb_id == resource &&
-                            step->destination_dfb_id < 0,
-                        "Pipe record send disagrees with its communication "
-                        "step");
-                } else if (record_recv) {
-                  Check(step->kind == "receive" &&
-                            coord_is(step->destination_core) &&
-                            step->destination_dfb_id == resource,
-                        "Pipe record receive disagrees with its communication "
-                        "step");
-                } else if (ref_index == 0) {
-                  auto role = call->annotations.Get("tt.communication_role");
-                  Check(role.has_value() && role.value().as<StringImm>(),
-                        "Pipe record wait has no communication role");
-                  bool source =
-                      Downcast<StringImm>(role.value())->value == "source";
-                  Check(step->kind == "completion" &&
-                            (source ? coord_is(step->source_core) &&
-                                          !step->destination_core.has_value() &&
-                                          step->source_dfb_id == resource
-                                    : coord_is(step->destination_core) &&
-                                          step->destination_dfb_id == resource),
-                        "Pipe record wait disagrees with its completion step");
-                } else {
-                  Check(step->kind == "publish" &&
-                            coord_is(step->destination_core) &&
-                            step->destination_dfb_id == resource,
-                        "Pipe record wait disagrees with its publication step");
-                }
-                continue;
-              }
-              if (pipe_send || pipe_recv || pipe_wait) {
-                int64_t transfer = id(call, 0);
-                int64_t resource = id(call, 1);
-                Check(
-                    as_const_int(step->parameter) &&
-                        *as_const_int(step->parameter) == transfer,
-                    "transport operation and step use different transfer IDs");
-                if (pipe_send) {
-                  Check(step->kind == "send" && coord_is(step->source_core) &&
-                            step->source_dfb_id == resource,
-                        "Pipe send disagrees with its communication step");
-                } else if (pipe_recv) {
-                  Check(step->kind == "receive" &&
-                            coord_is(step->destination_core) &&
-                            step->destination_dfb_id == resource,
-                        "Pipe receive disagrees with its communication step");
-                } else if (ref_index == 0) {
-                  Check(step->kind == "completion" &&
-                            ((coord_is(step->source_core) &&
-                              step->source_dfb_id == resource) ||
-                             (coord_is(step->destination_core) &&
-                              step->destination_dfb_id == resource)),
-                        "Pipe wait disagrees with its completion step");
-                } else {
-                  Check(step->kind == "publish" &&
-                            coord_is(step->destination_core) &&
-                            step->destination_dfb_id == resource,
-                        "Pipe wait disagrees with its publication step");
-                }
-                continue;
-              }
-              int64_t source = local_reduce ? id(call, 1) : id(call, 0);
-              int64_t destination = local_reduce ? id(call, 2) : id(call, 1);
-              PrimExpr parameter = local_copy    ? PrimExpr(Integer(0))
-                                   : gather_copy ? call->args[2]
-                                                 : call->args[3];
-              ffi::String kind =
-                  Downcast<StringImm>(
-                      call->annotations.at("tt.communication_step_kind"))
-                      ->value;
-              int64_t site = Downcast<Integer>(
-                                 call->annotations.at("tt.communication_site"))
-                                 ->value;
-              int64_t occurrence =
-                  Downcast<Integer>(
-                      call->annotations.at("tt.communication_occurrence"))
-                      ->value;
-              Check(step->kind == kind && step->communication_id == site &&
-                        step->occurrence == occurrence &&
-                        coord_is(step->source_core) &&
-                        coord_is(step->destination_core) &&
-                        step->source_dfb_id == source &&
-                        step->destination_dfb_id == destination &&
-                        ffi::StructuralEqual()(step->parameter, parameter),
-                    "local communication operation disagrees with its step");
             }
+            if (!(local_copy || gather_copy || local_reduce))
+              return;
+            auto site = call->annotations.Get("tt.communication_site");
+            auto occurrence =
+                call->annotations.Get("tt.communication_occurrence");
+            auto kind = call->annotations.Get("tt.communication_local_kind");
+            Check(site.has_value() && occurrence.has_value() &&
+                      kind.has_value() && kind.value().as<StringImm>(),
+                  "local communication operation has no semantic identity");
+            int64_t communication_id = Downcast<Integer>(site.value())->value;
+            Check(communication.has_value() && communication_id >= 0 &&
+                      communication_id <
+                          static_cast<int64_t>(communication.value().size()),
+                  "local communication operation references a missing "
+                  "communication");
+            ffi::String kind_name = Downcast<StringImm>(kind.value())->value;
+            Check((local_reduce && kind_name == "local_reduce") ||
+                      (!local_reduce && kind_name == "local_copy"),
+                  "local communication operation has the wrong semantic kind");
+            auto key = std::make_pair(communication_id, std::string(kind_name));
+            Check(local_communication_counts[key] <=
+                      std::numeric_limits<int64_t>::max() - dynamic_multiplier,
+                  "local communication multiplicity overflows");
+            local_communication_counts[key] += dynamic_multiplier;
           };
           for (size_t call_index = 0; call_index < calls.size(); ++call_index) {
             const Call &call = calls[call_index];
@@ -4836,7 +4762,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               event_successors[previous->second].push_back(event);
             last_slot_event[slot] = event;
             try {
-              verify_step_refs(call, call_multipliers[call_index]);
+              verify_communication_call(call, call_multipliers[call_index]);
               if (call->op.same_as(accumulator_init())) {
                 int64_t accumulator = id(call, 0);
                 Check(current_accumulators.count(accumulator),
@@ -5042,7 +4968,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                         "Pipe completion has no matching send or receive");
                 }
               } else if (call->op.same_as(dfb_pipe_send_record())) {
-                int64_t resource = id(call, 3);
+                int64_t resource = id(call, 2);
                 const DFBDescriptor &descriptor = dfb_table.at(resource);
                 bool forwarding =
                     owner == descriptor->producer_slot &&
@@ -5056,31 +4982,31 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 } else {
                   use(resource);
                 }
-                RecordTransferKey record{id(call, 0), id(call, 1), id(call, 2),
-                                         resource};
+                RecordTransferKey record{id(call, 0), id(call, 1), resource};
                 Check(sent_records.emplace(record, forwarding).second,
                       "Pipe record is sent more than once in one Core work "
                       "item");
               } else if (call->op.same_as(dfb_pipe_recv_record())) {
-                int64_t resource = id(call, 3);
+                int64_t resource = id(call, 2);
                 state(producer_key(resource));
-                RecordTransferKey record{id(call, 0), id(call, 1), id(call, 2),
-                                         resource};
+                RecordTransferKey record{id(call, 0), id(call, 1), resource};
                 Check(received_records.insert(record).second,
                       "Pipe record is received more than once in one Core work "
                       "item");
               } else if (call->op.same_as(dfb_pipe_wait_record())) {
-                int64_t resource = id(call, 3);
-                RecordTransferKey record{id(call, 0), id(call, 1), id(call, 2),
-                                         resource};
+                int64_t resource = id(call, 2);
+                RecordTransferKey record{id(call, 0), id(call, 1), resource};
                 auto sent = sent_records.find(record);
                 if (sent != sent_records.end() && sent->second) {
                   forwarding_completions[producer_key(resource)].push_back(
                       event);
+                  sent_records.erase(sent);
                 } else if (received_records.count(record)) {
                   produce(resource, event);
+                  received_records.erase(record);
                 } else if (sent != sent_records.end()) {
                   use(resource);
+                  sent_records.erase(sent);
                 } else {
                   Check(
                       false,
@@ -5122,6 +5048,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               Fail(OperationContext(func, Evaluate(call)) + error.what());
             }
           }
+          Check(sent_records.empty() && received_records.empty(),
+                "Pipe record issue is missing a matching completion wait");
         }
       }
     });
@@ -5297,49 +5225,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             "communication kind and selected algorithm disagree");
     }
   }
-  for (size_t index = 0; index < steps.size(); ++index) {
-    const CommunicationStepDescriptor &step = steps[index];
-    Check(step.defined() && step->step_id == static_cast<int64_t>(index),
-          "communication step IDs must be dense and deterministic");
-    Check(communication.has_value() && step->communication_id >= 0 &&
-              step->communication_id <
-                  static_cast<int64_t>(communication.value().size()),
-          "communication step references a missing site");
-    Check(step->owner_slot == "trisc" || step->owner_slot == "ncrisc" ||
-              step->owner_slot == "brisc",
-          "communication step has an invalid owner slot");
-    Check(step->kind == "send" || step->kind == "receive" ||
-              step->kind == "completion" || step->kind == "publish" ||
-              step->kind == "local_copy" || step->kind == "local_reduce",
-          "communication step has an unknown kind");
-    bool transport_step = step->kind == "send" || step->kind == "receive" ||
-                          step->kind == "completion" || step->kind == "publish";
-    Check(
-        (transport_step && step->pipe_net_id >= 0 && step->record_index >= 0) ||
-            (!transport_step && step->pipe_net_id == -1 &&
-             step->record_index == -1),
-        "communication step has an invalid Pipe record identity");
-    if (transport_step) {
-      auto record =
-          transport_records.find({step->pipe_net_id, step->record_index});
-      Check(record != transport_records.end(),
-            "communication step references a missing Pipe record");
-      Check(record->second->communication_id == step->communication_id,
-            "communication step and Pipe record have different parents");
-    }
-    Check(
-        step_ref_counts[index] == 1,
-        "communication step must be referenced by exactly one body operation");
-    for (const Integer &dependency : step->dependencies)
-      Check(dependency->value >= 0 && dependency->value < step->step_id,
-            "communication step dependency must reference an earlier step");
-    if (step->source_dfb_id >= 0)
-      Check(dfb_table.count(step->source_dfb_id),
-            "communication step source DFB is missing");
-    if (step->destination_dfb_id >= 0)
-      Check(dfb_table.count(step->destination_dfb_id),
-            "communication step destination DFB is missing");
-  }
   if (communication.has_value()) {
     using TransferPair = std::tuple<int64_t, int64_t, int64_t, int64_t>;
     for (const CommunicationDescriptor &entry : communication.value()) {
@@ -5369,118 +5254,70 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             "communication occurrence count");
       Check(occurrence_count > 0,
             "communication occurrence domain must be nonempty");
-
-      std::map<int64_t, std::vector<CommunicationStepDescriptor>> by_occurrence;
-      for (const CommunicationStepDescriptor &step : steps)
-        if (step->communication_id == entry->communication_id)
-          by_occurrence[step->occurrence].push_back(step);
-      Check(!by_occurrence.empty() &&
-                occurrence_count % static_cast<int64_t>(by_occurrence.size()) ==
-                    0,
-            "communication steps and enclosing loops do not cover every site "
-            "occurrence");
-      int64_t static_occurrences = by_occurrence.size();
-      int64_t dynamic_multiplier = occurrence_count / static_occurrences;
-      for (int64_t occurrence = 0; occurrence < static_occurrences;
-           ++occurrence) {
-        Check(by_occurrence.count(occurrence),
-              "communication occurrence IDs must be dense");
-        std::map<std::string, int64_t> kinds;
-        std::set<TransferPair> sends, receives;
-        std::set<std::pair<int64_t, int64_t>> source_records;
-        for (const CommunicationStepDescriptor &step :
-             by_occurrence.at(occurrence)) {
-          Check(step_ref_dynamic_counts[step->step_id] == dynamic_multiplier,
-                "communication step dynamic multiplicity disagrees with its "
-                "occurrence relation");
-          ++kinds[std::string(step->kind)];
-          if (step->kind != "send" && step->kind != "receive")
-            continue;
-          Check(step->source_core.has_value(),
-                "transport step is missing source coordinates");
-          CoreCoord source = step->source_core.value();
-          if (step->kind == "send") {
-            Check(!step->destination_core.has_value(),
-                  "record-level send must not name one destination Core");
-            auto record =
-                transport_records.find({step->pipe_net_id, step->record_index});
-            Check(record != transport_records.end() &&
-                      ffi::StructuralEqual()(record->second->src_coord, source),
-                  "record-level send disagrees with its transport record");
-            Check(source_records.insert({step->pipe_net_id, step->record_index})
-                      .second,
-                  "communication occurrence has a duplicate record send");
-            for (int64_t dx = record->second->dst_begin->x;
-                 dx < record->second->dst_end->x; ++dx)
-              for (int64_t dy = record->second->dst_begin->y;
-                   dy < record->second->dst_end->y; ++dy) {
-                Check(dx != source->x || dy != source->y,
-                      "record-level send has a loopback destination");
-                Check(sends.insert({source->x, source->y, dx, dy}).second,
-                      "communication occurrence has a duplicate transport "
-                      "endpoint");
-              }
-          } else {
-            Check(step->destination_core.has_value(),
-                  "receive step is missing destination coordinates");
-            CoreCoord destination = step->destination_core.value();
-            Check((!collective || (source->x >= bx && source->x < ex &&
-                                   source->y >= by && source->y < ey)) &&
-                      destination->x >= bx && destination->x < ex &&
-                      destination->y >= by && destination->y < ey &&
-                      (source->x != destination->x ||
-                       source->y != destination->y),
-                  "transport step has an invalid or loopback group endpoint");
-            Check(receives
-                      .insert({source->x, source->y, destination->x,
-                               destination->y})
-                      .second,
-                  "communication occurrence has a duplicate receive endpoint");
+      std::set<TransferPair> actual;
+      bool has_transport = false;
+      for (const auto &[key, record] : transport_records) {
+        if (record->communication_id != entry->communication_id)
+          continue;
+        has_transport = true;
+        Check(record_send_counts[key] == occurrence_count,
+              "Pipe record send multiplicity disagrees with communication "
+              "occurrence extent");
+        CoreCoord source = record->src_coord;
+        for (int64_t dx = record->dst_begin->x; dx < record->dst_end->x; ++dx)
+          for (int64_t dy = record->dst_begin->y; dy < record->dst_end->y;
+               ++dy) {
+            Check(dx != source->x || dy != source->y,
+                  "Pipe record has a loopback destination");
+            Check(actual.insert({source->x, source->y, dx, dy}).second,
+                  "communication has a duplicate transport endpoint");
+            Check(record_receive_counts[{key.first, key.second, dx, dy}] ==
+                      occurrence_count,
+                  "Pipe record receive multiplicity disagrees with "
+                  "communication occurrence extent");
           }
-        }
-        Check(sends == receives,
-              "communication send/receive endpoint coverage disagrees");
-        Check(kinds["completion"] ==
-                      static_cast<int64_t>(sends.size() +
-                                           source_records.size()) &&
-                  kinds["publish"] == static_cast<int64_t>(sends.size()),
-              "communication completion/publication coverage is incomplete");
-
-        if (entry->kind == "all_gather") {
-          int64_t axis =
-              RequireStaticInteger(entry->parameter, "all_gather axis");
-          Check(axis == 0 || axis == 1,
-                "all_gather axis must be normalized to zero or one");
-          std::set<TransferPair> expected;
-          for (int64_t sx = bx; sx < ex; ++sx)
-            for (int64_t sy = by; sy < ey; ++sy)
-              for (int64_t dx = bx; dx < ex; ++dx)
-                for (int64_t dy = by; dy < ey; ++dy)
-                  if (sx != dx || sy != dy)
-                    expected.insert({sx, sy, dx, dy});
-          Check(sends == expected &&
-                    kinds["local_copy"] == group_size * group_size &&
-                    kinds["local_reduce"] == 0,
-                "direct all_gather does not cover every source/destination "
-                "contribution");
-        } else if (entry->kind == "all_reduce") {
-          const auto *reduction = entry->parameter.as<StringImmNode>();
-          Check(reduction &&
-                    (reduction->value == "sum" || reduction->value == "max" ||
-                     reduction->value == "min"),
-                "all_reduce has an unsupported reduction operation");
-          std::set<TransferPair> expected;
-          for (int64_t x = bx; x < ex; ++x)
-            for (int64_t y = by; y < ey; ++y)
-              if (x != bx || y != by) {
-                expected.insert({x, y, bx, by});
-                expected.insert({bx, by, x, y});
-              }
-          Check(sends == expected && kinds["local_copy"] == 1 &&
-                    kinds["local_reduce"] == group_size - 1,
-                "direct all_reduce has incomplete gather/reduce/broadcast "
-                "coverage");
-        }
+      }
+      int64_t local_copies =
+          local_communication_counts[{entry->communication_id, "local_copy"}];
+      int64_t local_reductions =
+          local_communication_counts[{entry->communication_id, "local_reduce"}];
+      if (entry->kind == "transfer") {
+        Check(has_transport && local_copies == 0 && local_reductions == 0,
+              "direct transfer has an incomplete or unexpected local plan");
+      } else if (entry->kind == "all_gather") {
+        int64_t axis =
+            RequireStaticInteger(entry->parameter, "all_gather axis");
+        Check(axis == 0 || axis == 1,
+              "all_gather axis must be normalized to zero or one");
+        std::set<TransferPair> expected;
+        for (int64_t sx = bx; sx < ex; ++sx)
+          for (int64_t sy = by; sy < ey; ++sy)
+            for (int64_t dx = bx; dx < ex; ++dx)
+              for (int64_t dy = by; dy < ey; ++dy)
+                if (sx != dx || sy != dy)
+                  expected.insert({sx, sy, dx, dy});
+        Check(actual == expected &&
+                  local_copies == occurrence_count * group_size * group_size &&
+                  local_reductions == 0,
+              "direct all_gather does not cover every source/destination "
+              "contribution");
+      } else if (entry->kind == "all_reduce") {
+        const auto *reduction = entry->parameter.as<StringImmNode>();
+        Check(reduction &&
+                  (reduction->value == "sum" || reduction->value == "max" ||
+                   reduction->value == "min"),
+              "all_reduce has an unsupported reduction operation");
+        std::set<TransferPair> expected;
+        for (int64_t x = bx; x < ex; ++x)
+          for (int64_t y = by; y < ey; ++y)
+            if (x != bx || y != by) {
+              expected.insert({x, y, bx, by});
+              expected.insert({bx, by, x, y});
+            }
+        Check(actual == expected && local_copies == occurrence_count &&
+                  local_reductions == occurrence_count * (group_size - 1),
+              "direct all_reduce has incomplete gather/reduce/broadcast "
+              "coverage");
       }
     }
   }

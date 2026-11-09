@@ -232,12 +232,9 @@ Stmt MakeDeviceCall(const Op &op, ffi::Array<PrimExpr> args, const Span &span) {
 }
 
 Stmt MakeCommunicationDeviceCall(const Op &op, ffi::Array<PrimExpr> args,
-                                 int64_t site, int64_t occurrence,
-                                 const ffi::String &role, const Span &span) {
+                                 int64_t communication_id, const Span &span) {
   ffi::Map<ffi::String, ffi::ObjectRef> annotations{
-      {"tt.communication_site", Integer(site)},
-      {"tt.communication_occurrence", Integer(occurrence)},
-      {"tt.communication_role", StringImm(role)}};
+      {"tt.internal_communication_id", Integer(communication_id)}};
   return Evaluate(
       Call(DataType::Void(), op, std::move(args), annotations, span), span);
 }
@@ -256,7 +253,7 @@ bool IsRecordPipeOperation(const CallNode *call) {
 
 size_t PipeStreamOperand(const CallNode *call) {
   if (IsRecordPipeOperation(call))
-    return 3;
+    return 2;
   if (IsPointPipeOperation(call))
     return 1;
   ThrowMalformed("operation is not a Device Pipe operation");
@@ -2112,13 +2109,14 @@ private:
     PlanPipe(endpoint);
   }
 
-  Stmt MakeCollectiveStepCall(const Op &op, ffi::Array<PrimExpr> args,
-                              int64_t site, int64_t occurrence,
-                              const ffi::String &kind, const Span &span) const {
+  Stmt MakeCollectiveLocalCall(const Op &op, ffi::Array<PrimExpr> args,
+                               int64_t site, int64_t occurrence,
+                               const ffi::String &kind,
+                               const Span &span) const {
     ffi::Map<ffi::String, ffi::ObjectRef> annotations{
         {"tt.communication_site", Integer(site)},
         {"tt.communication_occurrence", Integer(occurrence)},
-        {"tt.communication_step_kind", StringImm(kind)},
+        {"tt.communication_local_kind", StringImm(kind)},
         {"tt.core_x", Integer(core_x_)},
         {"tt.core_y", Integer(core_y_)}};
     return Evaluate(
@@ -2204,7 +2202,7 @@ private:
           input = Read(temporary, "trisc");
         }
         Wait(&compute_, input, call->span);
-        compute_.push_back(MakeCollectiveStepCall(
+        compute_.push_back(MakeCollectiveLocalCall(
             tenstorrent::dfb_gather_copy(),
             {Integer(input), Integer(output), Integer(axis),
              Integer(source_rank), Integer(group_size)},
@@ -2253,7 +2251,7 @@ private:
     Reserve(&compute_, output, call->span);
     int64_t local = Read(source->buffer, "trisc");
     Wait(&compute_, local, call->span);
-    compute_.push_back(MakeCollectiveStepCall(
+    compute_.push_back(MakeCollectiveLocalCall(
         tenstorrent::dfb_local_copy(), {Integer(local), Integer(output)}, site,
         occurrence, "local_copy", call->span));
     for (int64_t sy = by; sy < ey; ++sy)
@@ -2270,7 +2268,7 @@ private:
             call->span);
         int64_t input = Read(temporary, "trisc");
         Wait(&compute_, input, call->span);
-        compute_.push_back(MakeCollectiveStepCall(
+        compute_.push_back(MakeCollectiveLocalCall(
             tenstorrent::dfb_collective_reduce(),
             {Integer(output), Integer(input), Integer(output), call->args[6]},
             site, occurrence, "local_reduce", call->span));
@@ -2381,19 +2379,13 @@ private:
     }
     int64_t site = record[0]->value, record_index = record[1]->value;
     auto *body = send && !forward ? &pipe_ : &transfer_;
-    ffi::String role =
-        send ? ffi::String("source") : ffi::String("destination");
-    body->push_back(
-        MakeCommunicationDeviceCall(send ? tenstorrent::dfb_pipe_send_record()
-                                         : tenstorrent::dfb_pipe_recv_record(),
-                                    {Integer(site), Integer(record_index),
-                                     Integer(occurrence), Integer(id)},
-                                    site, occurrence, role, call->span));
-    body->push_back(
-        MakeCommunicationDeviceCall(tenstorrent::dfb_pipe_wait_record(),
-                                    {Integer(site), Integer(record_index),
-                                     Integer(occurrence), Integer(id)},
-                                    site, occurrence, role, call->span));
+    body->push_back(MakeCommunicationDeviceCall(
+        send ? tenstorrent::dfb_pipe_send_record()
+             : tenstorrent::dfb_pipe_recv_record(),
+        {Integer(site), Integer(record_index), Integer(id)}, site, call->span));
+    body->push_back(MakeCommunicationDeviceCall(
+        tenstorrent::dfb_pipe_wait_record(),
+        {Integer(site), Integer(record_index), Integer(id)}, site, call->span));
   }
 
   std::vector<Call> *collected_calls_{nullptr};
@@ -2621,7 +2613,7 @@ public:
     } else if (call->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
                call->op.same_as(tenstorrent::dfb_pipe_recv_record()) ||
                call->op.same_as(tenstorrent::dfb_pipe_wait_record())) {
-      shift(3);
+      shift(2);
     } else if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()) ||
                call->op.same_as(tenstorrent::dfb_reserve()) ||
                call->op.same_as(tenstorrent::dfb_wait()) ||
@@ -2679,7 +2671,7 @@ public:
         !call->op.same_as(tenstorrent::dfb_pipe_recv_record()) &&
         !call->op.same_as(tenstorrent::dfb_pipe_wait_record()))
       return call;
-    if (call->args.size() != 4 || !as_const_int(call->args[0]) ||
+    if (call->args.size() != 3 || !as_const_int(call->args[0]) ||
         !as_const_int(call->args[1]))
       ThrowMalformed("pre-materialization Pipe record identity is not static");
     PlannedPipeRecordKey key{*as_const_int(call->args[0]),
@@ -2714,13 +2706,15 @@ class DuplicateGenerationWaitRemover : public StmtExprMutator {
   std::set<int64_t> waited_;
 };
 
-class StreamIdentityAnnotationRemover : public StmtExprMutator {
+class TransientDeviceAnnotationRemover : public StmtExprMutator {
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
-    if (!call->annotations.count("tt.stream_identity"))
+    if (!call->annotations.count("tt.stream_identity") &&
+        !call->annotations.count("tt.internal_communication_id"))
       return call;
     auto annotations = call->annotations;
     annotations.erase("tt.stream_identity");
+    annotations.erase("tt.internal_communication_id");
     return Call(call->dtype, call->op, call->args, annotations, call->span);
   }
 };
@@ -2750,173 +2744,6 @@ class DeviceCallExpressionSimplifier : public StmtExprMutator {
   }
 
   arith::Analyzer analyzer_;
-};
-
-using TransferStepKey =
-    std::tuple<int64_t, std::string, int64_t, int64_t, std::string>;
-using RecordStepKey = std::tuple<int64_t, int64_t, int64_t, std::string,
-                                 int64_t, int64_t, std::string>;
-using LocalStepKey = std::tuple<int64_t, int64_t, std::string, int64_t, int64_t,
-                                int64_t, int64_t>;
-
-class CommunicationStepRefAttacher : public StmtExprMutator {
-public:
-  CommunicationStepRefAttacher(
-      const ffi::Array<CommunicationStepDescriptor> &steps,
-      ffi::String owner_slot, int64_t core_x, int64_t core_y)
-      : owner_slot_(std::move(owner_slot)), core_x_(core_x), core_y_(core_y) {
-    for (const CommunicationStepDescriptor &step : steps) {
-      std::string kind = step->kind;
-      if (kind == "send" || kind == "receive" || kind == "completion" ||
-          kind == "publish") {
-        if (step->record_index < 0)
-          ThrowMalformed("transport step has no Pipe record index");
-        CoreCoord coord;
-        if (kind == "send") {
-          coord = step->source_core.value();
-        } else if (kind == "receive" || kind == "publish") {
-          coord = step->destination_core.value();
-        } else {
-          if (step->dependencies.size() != 1)
-            ThrowMalformed("transport completion requires one dependency");
-          const CommunicationStepDescriptor &dependency =
-              steps[step->dependencies[0]->value];
-          coord = dependency->kind == "send" ? step->source_core.value()
-                                             : step->destination_core.value();
-        }
-        RecordStepKey key{step->pipe_net_id,
-                          step->record_index,
-                          step->occurrence,
-                          std::string(step->owner_slot),
-                          coord->x,
-                          coord->y,
-                          kind};
-        if (!record_steps_.emplace(key, step->step_id).second)
-          ThrowMalformed("duplicate transport step identity");
-        continue;
-      }
-      if (!step->source_core.has_value() || !step->destination_core.has_value())
-        ThrowMalformed("local communication step requires Core coordinates");
-      LocalStepKey key{
-          step->communication_id,
-          step->occurrence,
-          kind,
-          step->source_core.value()->x,
-          step->source_core.value()->y,
-          step->source_dfb_id,
-          step->destination_dfb_id,
-      };
-      if (!local_steps_.emplace(key, step->step_id).second)
-        ThrowMalformed("duplicate local communication step identity");
-    }
-  }
-
-  PrimExpr VisitExpr_(const CallNode *op) final {
-    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
-    ffi::Array<PrimExpr> refs;
-    auto static_arg = [&](size_t index, const char *label) {
-      if (index >= call->args.size() || !as_const_int(call->args[index]))
-        ThrowMalformed(std::string(label) + " must be a static integer before "
-                                            "shared-body parameterization");
-      return *as_const_int(call->args[index]);
-    };
-    auto transfer_ref = [&](int64_t transfer, const char *kind) {
-      TransferStepKey key{transfer, std::string(owner_slot_), core_x_, core_y_,
-                          kind};
-      auto found = transfer_steps_.find(key);
-      if (found == transfer_steps_.end())
-        ThrowMalformed("Device transport operation has no matching step");
-      refs.push_back(Integer(found->second));
-    };
-    auto record_ref = [&](int64_t pipe_net, int64_t record, int64_t occurrence,
-                          const char *kind) {
-      RecordStepKey key{pipe_net, record,  occurrence, std::string(owner_slot_),
-                        core_x_,  core_y_, kind};
-      auto found = record_steps_.find(key);
-      if (found == record_steps_.end())
-        ThrowMalformed("Device Pipe record operation has no matching step");
-      refs.push_back(Integer(found->second));
-    };
-    if (call->op.same_as(dfb_pipe_send())) {
-      transfer_ref(static_arg(0, "Pipe transfer ID"), "send");
-    } else if (call->op.same_as(dfb_pipe_recv())) {
-      transfer_ref(static_arg(0, "Pipe transfer ID"), "receive");
-    } else if (call->op.same_as(dfb_pipe_wait())) {
-      int64_t transfer = static_arg(0, "Pipe transfer ID");
-      transfer_ref(transfer, "completion");
-      TransferStepKey publish{transfer, std::string(owner_slot_), core_x_,
-                              core_y_, "publish"};
-      auto found = transfer_steps_.find(publish);
-      if (found != transfer_steps_.end())
-        refs.push_back(Integer(found->second));
-    } else if (call->op.same_as(dfb_pipe_send_record())) {
-      record_ref(static_arg(0, "PipeNet ID"),
-                 static_arg(1, "Pipe record index"),
-                 static_arg(2, "transfer occurrence"), "send");
-    } else if (call->op.same_as(dfb_pipe_recv_record())) {
-      record_ref(static_arg(0, "PipeNet ID"),
-                 static_arg(1, "Pipe record index"),
-                 static_arg(2, "transfer occurrence"), "receive");
-    } else if (call->op.same_as(dfb_pipe_wait_record())) {
-      int64_t pipe_net = static_arg(0, "PipeNet ID");
-      int64_t record = static_arg(1, "Pipe record index");
-      int64_t occurrence = static_arg(2, "transfer occurrence");
-      record_ref(pipe_net, record, occurrence, "completion");
-      auto role = call->annotations.Get("tt.communication_role");
-      if (!role.has_value() || !role.value().as<StringImm>())
-        ThrowMalformed("Pipe record wait has no communication role");
-      if (Downcast<StringImm>(role.value())->value == "destination") {
-        RecordStepKey publish{
-            pipe_net, record,  occurrence, std::string(owner_slot_),
-            core_x_,  core_y_, "publish"};
-        auto found = record_steps_.find(publish);
-        if (found == record_steps_.end())
-          ThrowMalformed("destination Pipe record wait has no publish step");
-        refs.push_back(Integer(found->second));
-      }
-    } else if (call->op.same_as(dfb_local_copy()) ||
-               call->op.same_as(dfb_gather_copy()) ||
-               call->op.same_as(dfb_collective_reduce())) {
-      auto site = call->annotations.Get("tt.communication_site");
-      auto occurrence = call->annotations.Get("tt.communication_occurrence");
-      auto kind = call->annotations.Get("tt.communication_step_kind");
-      if (!site.has_value() || !occurrence.has_value() || !kind.has_value())
-        ThrowMalformed("local communication operation has no step identity");
-      int64_t source = call->op.same_as(dfb_collective_reduce())
-                           ? static_arg(1, "local reduction source")
-                           : static_arg(0, "local copy source");
-      int64_t destination = call->op.same_as(dfb_collective_reduce())
-                                ? static_arg(2, "local reduction destination")
-                                : static_arg(1, "local copy destination");
-      LocalStepKey key{
-          Downcast<Integer>(site.value())->value,
-          Downcast<Integer>(occurrence.value())->value,
-          std::string(Downcast<StringImm>(kind.value())->value),
-          core_x_,
-          core_y_,
-          source,
-          destination,
-      };
-      auto found = local_steps_.find(key);
-      if (found == local_steps_.end())
-        ThrowMalformed("local communication operation has no matching step");
-      refs.push_back(Integer(found->second));
-    }
-    if (refs.empty())
-      return call;
-    auto annotations = call->annotations;
-    if (annotations.count("tt_communication_step_refs"))
-      ThrowMalformed("communication step refs were attached more than once");
-    annotations.Set("tt_communication_step_refs", refs);
-    return Call(call->dtype, call->op, call->args, annotations, call->span);
-  }
-
-private:
-  ffi::String owner_slot_;
-  int64_t core_x_, core_y_;
-  std::map<TransferStepKey, int64_t> transfer_steps_;
-  std::map<RecordStepKey, int64_t> record_steps_;
-  std::map<LocalStepKey, int64_t> local_steps_;
 };
 
 using StorageLocalKey = std::tuple<int64_t, int64_t, int64_t>;
@@ -3039,7 +2866,7 @@ BuildStorageSchedule(const std::array<std::vector<DeviceCoreBody>, 3> &bodies,
   std::map<TransferKey, bool> sends;
   std::set<TransferKey> receives;
   using RecordTransferKey =
-      std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
+      std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>;
   std::map<RecordTransferKey, bool> record_sends;
   std::set<RecordTransferKey> record_receives;
 
@@ -3131,13 +2958,11 @@ BuildStorageSchedule(const std::array<std::vector<DeviceCoreBody>, 3> &bodies,
             result.producers[key(resource)] = event;
         } else if (call->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
                    call->op.same_as(tenstorrent::dfb_pipe_recv_record())) {
-          int64_t communication = static_arg(call, 0);
+          int64_t pipe_net = static_arg(call, 0);
           int64_t record = static_arg(call, 1);
-          int64_t occurrence = static_arg(call, 2);
-          int64_t resource = static_arg(call, 3);
-          RecordTransferKey transfer_key{core_body.x,   core_body.y,
-                                         communication, record,
-                                         occurrence,    resource};
+          int64_t resource = static_arg(call, 2);
+          RecordTransferKey transfer_key{core_body.x, core_body.y, pipe_net,
+                                         record, resource};
           if (call->op.same_as(tenstorrent::dfb_pipe_send_record())) {
             const DFBDescriptor &descriptor = descriptors.at(resource);
             bool forwarding = slot == descriptor->producer_slot &&
@@ -3147,13 +2972,11 @@ BuildStorageSchedule(const std::array<std::vector<DeviceCoreBody>, 3> &bodies,
             record_receives.insert(transfer_key);
           }
         } else if (call->op.same_as(tenstorrent::dfb_pipe_wait_record())) {
-          int64_t communication = static_arg(call, 0);
+          int64_t pipe_net = static_arg(call, 0);
           int64_t record = static_arg(call, 1);
-          int64_t occurrence = static_arg(call, 2);
-          int64_t resource = static_arg(call, 3);
-          RecordTransferKey transfer_key{core_body.x,   core_body.y,
-                                         communication, record,
-                                         occurrence,    resource};
+          int64_t resource = static_arg(call, 2);
+          RecordTransferKey transfer_key{core_body.x, core_body.y, pipe_net,
+                                         record, resource};
           auto sent = record_sends.find(transfer_key);
           if (sent != record_sends.end() && sent->second)
             forwarding_completions[key(resource)].push_back(event);
@@ -3576,7 +3399,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     storage_groups = PlanNonPipelineStorageGroups(dfbs, shared_bodies,
                                                   resource_storage_keys);
   std::map<int64_t, PipeEndpoint> senders, receivers;
-  std::unordered_map<int64_t, bool> forwarding_transfers;
   std::map<PlannedPipeRecordKey, int64_t> record_payloads;
   std::map<PlannedPipeRecordKey, PipeEndpoint> ordered_record_sources;
   for (const PipeEndpoint &endpoint : endpoints) {
@@ -3645,7 +3467,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
         sender.occurrence, CoreCoord(r[3]->value, r[4]->value),
         CoreCoord(sender.x, sender.y), sender.dfb_id, receiver->second.dfb_id,
         1, sender.span));
-    forwarding_transfers.emplace(id, sender.producer_forwarding);
   }
   ffi::Array<CommunicationDescriptor> communications;
   auto normalized_topology =
@@ -3685,204 +3506,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
           entry->contract, entry->occurrence_extents, entry->source_span));
     }
   }
-  ffi::Array<CommunicationStepDescriptor> communication_steps;
-  std::unordered_map<int64_t, int64_t> incoming_completion;
-  auto add_step = [&](int64_t communication_id, int64_t pipe_net_id,
-                      int64_t record_index, int64_t occurrence,
-                      ffi::String kind, ffi::Optional<CoreCoord> source_core,
-                      ffi::Optional<CoreCoord> destination_core,
-                      int64_t source_dfb, int64_t destination_dfb,
-                      ffi::String owner_slot, ffi::Array<Integer> dependencies,
-                      PrimExpr parameter, Span span) {
-    int64_t id = communication_steps.size();
-    communication_steps.push_back(CommunicationStepDescriptor(
-        id, communication_id, pipe_net_id, record_index, occurrence,
-        std::move(kind), std::move(source_core), std::move(destination_core),
-        source_dfb, destination_dfb, std::move(owner_slot),
-        std::move(dependencies), std::move(parameter), std::move(span)));
-    return id;
-  };
-  using RecordOccurrenceKey = std::tuple<int64_t, int64_t, int64_t>;
-  std::set<RecordOccurrenceKey> record_send_steps;
-  std::map<RecordOccurrenceKey, ffi::String> record_source_owners;
-  std::map<RecordOccurrenceKey, int64_t> record_source_dfbs;
-  for (const PipeTransferDescriptor &transfer : transfers) {
-    ffi::String source_owner =
-        forwarding_transfers.at(transfer->transfer_id) ? "ncrisc" : "brisc";
-    RecordOccurrenceKey record_key{
-        transfer->pipe_net_id, transfer->record_index, transfer->occurrence};
-    if (!record_send_steps.count(record_key)) {
-      int64_t send =
-          add_step(transfer->communication_id, transfer->pipe_net_id,
-                   transfer->record_index, transfer->occurrence, "send",
-                   transfer->src_coord, std::nullopt, transfer->source_dfb_id,
-                   -1, source_owner, {}, Integer(transfer->record_index),
-                   transfer->source_span);
-      add_step(transfer->communication_id, transfer->pipe_net_id,
-               transfer->record_index, transfer->occurrence, "completion",
-               transfer->src_coord, std::nullopt, transfer->source_dfb_id, -1,
-               source_owner, {Integer(send)}, Integer(transfer->record_index),
-               transfer->source_span);
-      record_send_steps.insert(record_key);
-      record_source_owners.emplace(record_key, source_owner);
-      record_source_dfbs.emplace(record_key, transfer->source_dfb_id);
-    } else if (record_source_owners.at(record_key) != source_owner ||
-               record_source_dfbs.at(record_key) != transfer->source_dfb_id) {
-      ThrowMalformed(
-          "one Pipe record occurrence has inconsistent source ownership");
-    }
-    int64_t receive = add_step(
-        transfer->communication_id, transfer->pipe_net_id,
-        transfer->record_index, transfer->occurrence, "receive",
-        transfer->src_coord, transfer->dst_coord, transfer->source_dfb_id,
-        transfer->destination_dfb_id, "ncrisc", {},
-        Integer(transfer->record_index), transfer->source_span);
-    int64_t completed = add_step(
-        transfer->communication_id, transfer->pipe_net_id,
-        transfer->record_index, transfer->occurrence, "completion",
-        transfer->src_coord, transfer->dst_coord, transfer->source_dfb_id,
-        transfer->destination_dfb_id, "ncrisc", {Integer(receive)},
-        Integer(transfer->record_index), transfer->source_span);
-    int64_t publish = add_step(
-        transfer->communication_id, transfer->pipe_net_id,
-        transfer->record_index, transfer->occurrence, "publish",
-        transfer->src_coord, transfer->dst_coord, transfer->source_dfb_id,
-        transfer->destination_dfb_id, "ncrisc", {Integer(completed)},
-        Integer(transfer->record_index), transfer->source_span);
-    incoming_completion[transfer->destination_dfb_id] = publish;
-  }
-  std::unordered_map<int64_t, int64_t> last_output_step;
-  for (const DeviceCoreBody &core_body : shared_bodies[0]) {
-    PostOrderVisit(core_body.body, [&](const ffi::ObjectRef &object) {
-      const auto *node = object.as<CallNode>();
-      if (!node)
-        return;
-      Call call = ffi::GetRef<Call>(node);
-      auto site_attr = call->annotations.Get("tt.communication_site");
-      if (!site_attr.has_value())
-        return;
-      int64_t site = Downcast<Integer>(site_attr.value())->value;
-      int64_t occurrence =
-          Downcast<Integer>(call->annotations.at("tt.communication_occurrence"))
-              ->value;
-      ffi::String kind = Downcast<StringImm>(
-                             call->annotations.at("tt.communication_step_kind"))
-                             ->value;
-      CoreCoord core(
-          Downcast<Integer>(call->annotations.at("tt.core_x"))->value,
-          Downcast<Integer>(call->annotations.at("tt.core_y"))->value);
-      int64_t source = -1, destination = -1;
-      PrimExpr parameter = Integer(0);
-      if (call->op.same_as(dfb_local_copy())) {
-        source = *as_const_int(call->args[0]);
-        destination = *as_const_int(call->args[1]);
-      } else if (call->op.same_as(dfb_gather_copy())) {
-        source = *as_const_int(call->args[0]);
-        destination = *as_const_int(call->args[1]);
-        parameter = call->args[2];
-      } else if (call->op.same_as(dfb_collective_reduce())) {
-        source = *as_const_int(call->args[1]);
-        destination = *as_const_int(call->args[2]);
-        parameter = call->args[3];
-      } else {
-        return;
-      }
-      ffi::Array<Integer> dependencies;
-      auto incoming = incoming_completion.find(source);
-      if (incoming != incoming_completion.end())
-        dependencies.push_back(Integer(incoming->second));
-      auto previous = last_output_step.find(destination);
-      if (previous != last_output_step.end())
-        dependencies.push_back(Integer(previous->second));
-      int64_t step =
-          add_step(site, -1, -1, occurrence, kind, core, core, source,
-                   destination, "trisc", dependencies, parameter, call->span);
-      last_output_step[destination] = step;
-    });
-  }
-  auto step_phase = [](const CommunicationStepDescriptor &step) {
-    if (step->kind == "send" || step->kind == "receive")
-      return 0;
-    if (step->kind == "completion")
-      return 1;
-    if (step->kind == "publish")
-      return 2;
-    return 3;
-  };
-  auto step_less = [&](size_t lhs, size_t rhs) {
-    const auto &a = communication_steps[lhs];
-    const auto &b = communication_steps[rhs];
-    auto dependency_kind = [&](const CommunicationStepDescriptor &step) {
-      return step->dependencies.empty()
-                 ? ffi::String("")
-                 : communication_steps[step->dependencies[0]->value]->kind;
-    };
-    auto coordinate = [](const ffi::Optional<CoreCoord> &coord, bool x) {
-      return coord.has_value() ? (x ? coord.value()->x : coord.value()->y) : -1;
-    };
-    return std::make_tuple(a->communication_id, a->pipe_net_id, step_phase(a),
-                           a->kind, a->owner_slot, dependency_kind(a),
-                           a->dependencies.size(), a->occurrence,
-                           a->record_index, coordinate(a->source_core, true),
-                           coordinate(a->source_core, false),
-                           coordinate(a->destination_core, true),
-                           coordinate(a->destination_core, false), a->step_id) <
-           std::make_tuple(b->communication_id, b->pipe_net_id, step_phase(b),
-                           b->kind, b->owner_slot, dependency_kind(b),
-                           b->dependencies.size(), b->occurrence,
-                           b->record_index, coordinate(b->source_core, true),
-                           coordinate(b->source_core, false),
-                           coordinate(b->destination_core, true),
-                           coordinate(b->destination_core, false), b->step_id);
-  };
-  std::vector<int64_t> indegree(communication_steps.size(), 0);
-  std::vector<std::vector<size_t>> successors(communication_steps.size());
-  for (size_t step = 0; step < communication_steps.size(); ++step) {
-    for (const Integer &dependency : communication_steps[step]->dependencies) {
-      if (dependency->value < 0 ||
-          dependency->value >= static_cast<int64_t>(communication_steps.size()))
-        ThrowMalformed("communication step dependency is out of range");
-      ++indegree[step];
-      successors[dependency->value].push_back(step);
-    }
-  }
-  std::set<size_t, decltype(step_less)> ready(step_less);
-  for (size_t step = 0; step < communication_steps.size(); ++step)
-    if (!indegree[step])
-      ready.insert(step);
-  std::vector<size_t> step_order;
-  step_order.reserve(communication_steps.size());
-  while (!ready.empty()) {
-    size_t step = *ready.begin();
-    ready.erase(ready.begin());
-    step_order.push_back(step);
-    for (size_t successor : successors[step])
-      if (!--indegree[successor])
-        ready.insert(successor);
-  }
-  if (step_order.size() != communication_steps.size())
-    ThrowMalformed("communication step dependency graph contains a cycle");
-  std::vector<int64_t> remapped_steps(communication_steps.size(), -1);
-  for (size_t next = 0; next < step_order.size(); ++next)
-    remapped_steps[step_order[next]] = next;
-  ffi::Array<CommunicationStepDescriptor> ordered_steps;
-  for (size_t next = 0; next < step_order.size(); ++next) {
-    const auto &step = communication_steps[step_order[next]];
-    ffi::Array<Integer> dependencies;
-    for (const Integer &dependency : step->dependencies) {
-      int64_t remapped = remapped_steps[dependency->value];
-      if (remapped < 0 || remapped >= static_cast<int64_t>(next))
-        ThrowMalformed("communication family ordering violates dependency");
-      dependencies.push_back(Integer(remapped));
-    }
-    ordered_steps.push_back(CommunicationStepDescriptor(
-        next, step->communication_id, step->pipe_net_id, step->record_index,
-        step->occurrence, step->kind, step->source_core, step->destination_core,
-        step->source_dfb_id, step->destination_dfb_id, step->owner_slot,
-        dependencies, step->parameter, step->source_span));
-  }
-  communication_steps = std::move(ordered_steps);
-
   ffi::Map<ffi::String, Integer> materialized_streams = storage_groups;
   if (pipeline_extent) {
     materialized_streams = {};
@@ -3910,16 +3533,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       core_body.body = remap_streams(core_body.body);
     }
 
-  ffi::Array<CommunicationStepDescriptor> stream_steps;
-  for (const CommunicationStepDescriptor &step : communication_steps)
-    stream_steps.push_back(CommunicationStepDescriptor(
-        step->step_id, step->communication_id, step->pipe_net_id,
-        step->record_index, step->occurrence, step->kind, step->source_core,
-        step->destination_core, stream_id(step->source_dfb_id),
-        stream_id(step->destination_dfb_id), step->owner_slot,
-        step->dependencies, step->parameter, step->source_span));
-  communication_steps = std::move(stream_steps);
-
   ffi::Array<PipeDescriptor> stream_pipes;
   for (const PipeDescriptor &pipe : pipes)
     stream_pipes.push_back(PipeDescriptor(
@@ -3945,11 +3558,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   const std::array<ffi::String, 3> slots = {"trisc", "ncrisc", "brisc"};
   for (size_t index = 0; index < slots.size(); ++index) {
     const ffi::String &slot = slots[index];
-    for (DeviceCoreBody &core_body : shared_bodies[index]) {
-      CommunicationStepRefAttacher attach(communication_steps, slot,
-                                          core_body.x, core_body.y);
-      core_body.body = attach(core_body.body);
-    }
     bool compute = slot == "trisc";
     ffi::Array<Integer> tensor_indices;
     for (int64_t tensor : shared_tensor_indices[index])
@@ -3957,7 +3565,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     Stmt slot_body = ParameterizeDeviceCoreStatements(shared_bodies[index], gx,
                                                       gy, slot, frontend->span);
     slot_body = DeviceCallExpressionSimplifier()(slot_body);
-    slot_body = StreamIdentityAnnotationRemover()(slot_body);
+    slot_body = TransientDeviceAnnotationRemover()(slot_body);
     PrimFunc func = MakeSlotFunction(
         frontend, target, shared_domain, operation, slot,
         compute ? "compute" : "datamovement",
@@ -3978,9 +3586,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                              : effect == 2 ? "output"
                                            : "input");
   auto tensors = BuildTensorTable(frontend, metadata, tensor_effects, true);
-  bool repeated_transfers = std::any_of(
-      endpoints.begin(), endpoints.end(),
-      [](const PipeEndpoint &endpoint) { return endpoint.occurrence != 0; });
   ffi::Map<ffi::String, ffi::Any> attrs{
       {"tt.ir_stage", ffi::String("device")},
       {kTargetArchAttr, arch},
@@ -3991,7 +3596,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       {kDFBStorageGroupsAttr, stream_plan.descriptors},
       {"tt.stream_operands", Integer(1)},
       {"tt.communication_table", communications},
-      {"tt.communication_step_table", communication_steps},
       {"tt.transport_table", pipes},
       {kKernelOrderAttr, order}};
   if (!accumulators.empty())

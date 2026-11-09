@@ -74,12 +74,10 @@ DFB_STORAGE_GROUPS_ATTR = "tt.dfb_storage_groups"
 DFB_STORAGE_GROUP_RELATIONS_ATTR = "tt.dfb_storage_group_relations"
 ACCUMULATOR_FAMILIES_ATTR = "tt.accumulator_families"
 COMPUTE_VALUE_FAMILIES_ATTR = "tt.compute_value_families"
-COMMUNICATION_STEP_FAMILIES_ATTR = "tt.communication_step_families"
 TRANSPORT_FAMILIES_ATTR = "tt.transport_families"
 PIPE_TABLE_ATTR = "tt.pipe_table"
 PIPE_TRANSFER_TABLE_ATTR = "tt.pipe_transfer_table"
 COMMUNICATION_TABLE_ATTR = "tt.communication_table"
-COMMUNICATION_STEP_TABLE_ATTR = "tt.communication_step_table"
 TRANSPORT_TABLE_ATTR = "tt.transport_table"
 KERNEL_ORDER_ATTR = "tt.kernel_order"
 KERNEL_SLOT_ATTR = "tt.kernel_slot"
@@ -371,46 +369,6 @@ class CommunicationDescriptor(Node):
             parameter,
             contract,
             list(occurrence_extents),
-            source_span,
-        )
-
-
-@tvm_ffi.register_object("tl.tenstorrent.CommunicationStepDescriptor")
-class CommunicationStepDescriptor(Node):
-    """One algorithm step keyed by communication, Pipe record and occurrence."""
-
-    def __init__(
-        self,
-        step_id,
-        communication_id,
-        pipe_net_id,
-        record_index,
-        occurrence,
-        kind,
-        source_core,
-        destination_core,
-        source_dfb_id,
-        destination_dfb_id,
-        owner_slot,
-        dependencies=(),
-        parameter=0,
-        source_span=None,
-    ):
-        self.__init_handle_by_constructor__(
-            _ffi_api.CommunicationStepDescriptor,
-            int(step_id),
-            int(communication_id),
-            int(pipe_net_id),
-            int(record_index),
-            int(occurrence),
-            kind,
-            source_core,
-            destination_core,
-            int(source_dfb_id),
-            int(destination_dfb_id),
-            owner_slot,
-            list(dependencies),
-            _expr(parameter),
             source_span,
         )
 
@@ -754,9 +712,7 @@ __all__ = (
     "COMPUTE_VALUE_TABLE_ATTR",
     "ComputeRequirements",
     "CommunicationDescriptor",
-    "CommunicationStepDescriptor",
     "COMMUNICATION_TABLE_ATTR",
-    "COMMUNICATION_STEP_TABLE_ATTR",
     "ACCUMULATOR_TABLE_ATTR",
     "COMPUTE_REQUIREMENTS_ATTR",
     "COMPUTE_REGION_REQUIREMENTS_ATTR",

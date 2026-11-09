@@ -640,7 +640,7 @@ void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
     annotations.Set("tt.work_group", work_group.value());
   if (block_name == "tt_device_stream_work") {
     bool sends = false, receives = false;
-    std::set<int64_t> sites;
+    std::set<int64_t> communication_ids, pipe_net_ids;
     PostOrderVisit(body, [&](const ffi::ObjectRef &object) {
       const auto *node = object.as<CallNode>();
       if (!node)
@@ -649,12 +649,21 @@ void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
                node->op.same_as(tenstorrent::dfb_pipe_send_record());
       receives |= node->op.same_as(tenstorrent::dfb_pipe_recv()) ||
                   node->op.same_as(tenstorrent::dfb_pipe_recv_record());
-      auto site = node->annotations.Get("tt.communication_site");
-      if (site.has_value()) {
-        auto integer = site.value().as<Integer>();
+      auto communication =
+          node->annotations.Get("tt.internal_communication_id");
+      if (communication.has_value()) {
+        auto integer = communication.value().as<Integer>();
         if (!integer.has_value())
-          Invalid("communication site annotation must be an integer");
-        sites.insert(integer.value()->value);
+          Invalid("internal communication ID must be an integer");
+        communication_ids.insert(integer.value()->value);
+      }
+      if (node->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
+          node->op.same_as(tenstorrent::dfb_pipe_recv_record()) ||
+          node->op.same_as(tenstorrent::dfb_pipe_wait_record())) {
+        const int64_t *pipe_net = as_const_int(node->args[0]);
+        if (!pipe_net)
+          Invalid("PipeNet ID must be static before Core parameterization");
+        pipe_net_ids.insert(*pipe_net);
       }
     });
     if (sends && receives)
@@ -662,12 +671,15 @@ void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
     if (sends || receives) {
       annotations.Set("tt.communication_role",
                       ffi::String(sends ? "source" : "destination"));
-      ffi::Array<Integer> site_array;
-      for (int64_t site : sites)
-        site_array.push_back(Integer(site));
-      if (site_array.empty())
-        Invalid("communication role region has no communication site");
-      annotations.Set("tt.communication_sites", site_array);
+      ffi::Array<Integer> communication_array, pipe_net_array;
+      for (int64_t communication : communication_ids)
+        communication_array.push_back(Integer(communication));
+      for (int64_t pipe_net : pipe_net_ids)
+        pipe_net_array.push_back(Integer(pipe_net));
+      if (communication_array.empty() || pipe_net_array.empty())
+        Invalid("communication role region has no communication or PipeNet ID");
+      annotations.Set("tt.communication_ids", communication_array);
+      annotations.Set("tt.pipe_net_ids", pipe_net_array);
     }
   }
   SBlock work({}, {}, {}, block_name, body, std::nullopt, {}, {}, annotations,
@@ -1028,7 +1040,7 @@ std::vector<size_t> DFBOperandPositions(const Call &call) {
   if (call->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
       call->op.same_as(tenstorrent::dfb_pipe_recv_record()) ||
       call->op.same_as(tenstorrent::dfb_pipe_wait_record()))
-    return {3};
+    return {2};
   if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
     return {0};
   if (call->op.same_as(tenstorrent::gemm_update()))

@@ -678,65 +678,6 @@ CompactCurrentValues(const ffi::Array<ComputeValueDescriptor> &descriptors) {
   return result;
 }
 
-ffi::Array<DeviceIRDescriptorFamily> CompactCurrentSteps(
-    const ffi::Array<CommunicationStepDescriptor> &descriptors) {
-  std::vector<FamilyBuilder> builders;
-  std::unordered_map<std::string, size_t> groups;
-  for (size_t position = 0; position < descriptors.size(); ++position) {
-    const CommunicationStepDescriptor &descriptor = descriptors[position];
-    Check(descriptor.defined(), "undefined current communication step");
-    const auto *parameter = descriptor->parameter.as<IntImmNode>();
-    std::ostringstream key;
-    key << descriptor->communication_id << '|' << descriptor->kind << '|'
-        << descriptor->owner_slot << '|' << descriptor->source_core.has_value()
-        << '|' << descriptor->destination_core.has_value() << '|'
-        << descriptor->dependencies.size() << '|' << (parameter != nullptr)
-        << '|' << SpanKey(descriptor->source_span);
-    if (!parameter)
-      key << '|' << ffi::StructuralHash()(descriptor->parameter);
-    for (const Integer &dependency : descriptor->dependencies) {
-      Check(dependency->value >= 0 &&
-                dependency->value < static_cast<int64_t>(descriptors.size()),
-            "communication step dependency is out of range");
-      key << '|' << descriptors[dependency->value]->kind;
-    }
-    auto [found, inserted] = groups.emplace(key.str(), builders.size());
-    if (inserted) {
-      FamilyBuilder builder;
-      builder.prototype = descriptor;
-      builders.push_back(std::move(builder));
-    }
-    FamilyBuilder &builder = builders[found->second];
-    builder.positions.push_back(builder.positions.size());
-    builder.fields["step_id"].push_back(descriptor->step_id);
-    builder.fields["pipe_net_id"].push_back(descriptor->pipe_net_id);
-    builder.fields["record_index"].push_back(descriptor->record_index);
-    builder.fields["occurrence"].push_back(descriptor->occurrence);
-    builder.fields["source_dfb_id"].push_back(descriptor->source_dfb_id);
-    builder.fields["destination_dfb_id"].push_back(
-        descriptor->destination_dfb_id);
-    if (parameter)
-      builder.fields["parameter"].push_back(parameter->value);
-    if (descriptor->source_core.has_value()) {
-      builder.fields["source_x"].push_back(descriptor->source_core.value()->x);
-      builder.fields["source_y"].push_back(descriptor->source_core.value()->y);
-    }
-    if (descriptor->destination_core.has_value()) {
-      builder.fields["destination_x"].push_back(
-          descriptor->destination_core.value()->x);
-      builder.fields["destination_y"].push_back(
-          descriptor->destination_core.value()->y);
-    }
-    for (size_t index = 0; index < descriptor->dependencies.size(); ++index)
-      builder.fields["dependency." + std::to_string(index)].push_back(
-          descriptor->dependencies[index]->value);
-  }
-  ffi::Array<DeviceIRDescriptorFamily> result;
-  for (const FamilyBuilder &builder : builders)
-    result.push_back(builder.Finish());
-  return result;
-}
-
 ffi::Array<DeviceIRDescriptorFamily>
 CompactCurrentTransports(const ffi::Array<PipeDescriptor> &descriptors) {
   std::vector<FamilyBuilder> builders;
@@ -1082,56 +1023,6 @@ IRModule ShiftCurrentComputeIDs(
   return result;
 }
 
-std::vector<CommunicationStepDescriptor>
-RestoreCurrentSteps(const DeviceIRDescriptorFamily &family,
-                    const CommunicationStepDescriptor &prototype) {
-  Check(family->source_parts.empty(),
-        "communication-step family cannot have source string parts");
-  std::set<std::string> names{"step_id",       "pipe_net_id",
-                              "record_index",  "occurrence",
-                              "source_dfb_id", "destination_dfb_id"};
-  bool parameter_column = prototype->parameter.as<IntImmNode>() != nullptr;
-  if (parameter_column)
-    names.insert("parameter");
-  if (prototype->source_core.has_value()) {
-    names.insert("source_x");
-    names.insert("source_y");
-  }
-  if (prototype->destination_core.has_value()) {
-    names.insert("destination_x");
-    names.insert("destination_y");
-  }
-  for (size_t index = 0; index < prototype->dependencies.size(); ++index)
-    names.insert("dependency." + std::to_string(index));
-  DecodedFields fields = ReadFields(family, names);
-  std::vector<CommunicationStepDescriptor> result;
-  result.reserve(family->positions->count);
-  for (int64_t row = 0; row < family->positions->count; ++row) {
-    ffi::Optional<CoreCoord> source = std::nullopt;
-    ffi::Optional<CoreCoord> destination = std::nullopt;
-    if (prototype->source_core.has_value())
-      source =
-          CoreCoord(fields.at("source_x")[row], fields.at("source_y")[row]);
-    if (prototype->destination_core.has_value())
-      destination = CoreCoord(fields.at("destination_x")[row],
-                              fields.at("destination_y")[row]);
-    ffi::Array<Integer> dependencies;
-    for (size_t index = 0; index < prototype->dependencies.size(); ++index)
-      dependencies.push_back(
-          Integer(fields.at("dependency." + std::to_string(index))[row]));
-    result.emplace_back(
-        fields.at("step_id")[row], prototype->communication_id,
-        fields.at("pipe_net_id")[row], fields.at("record_index")[row],
-        fields.at("occurrence")[row], prototype->kind, source, destination,
-        fields.at("source_dfb_id")[row], fields.at("destination_dfb_id")[row],
-        prototype->owner_slot, dependencies,
-        parameter_column ? PrimExpr(Integer(fields.at("parameter")[row]))
-                         : prototype->parameter,
-        prototype->source_span);
-  }
-  return result;
-}
-
 std::vector<PipeDescriptor>
 RestoreCurrentTransports(const DeviceIRDescriptorFamily &family,
                          const PipeDescriptor &prototype) {
@@ -1299,9 +1190,8 @@ IRModule ExpandDeviceTables(IRModule mod) {
 bool HasCurrentDeviceFamilies(const IRModule &mod) {
   if (!mod->attrs.defined())
     return false;
-  for (const char *key :
-       {kDFBFamiliesAttr, kAccumulatorFamiliesAttr, kComputeValueFamiliesAttr,
-        kCommunicationStepFamiliesAttr, kTransportFamiliesAttr})
+  for (const char *key : {kDFBFamiliesAttr, kAccumulatorFamiliesAttr,
+                          kComputeValueFamiliesAttr, kTransportFamiliesAttr})
     if (mod->attrs->dict.count(key))
       return true;
   return false;
@@ -1317,16 +1207,12 @@ IRModule ParameterizeCurrentDeviceTables(IRModule mod) {
       mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr);
   auto values =
       mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(kComputeValueTableAttr);
-  auto steps = mod->GetAttr<ffi::Array<CommunicationStepDescriptor>>(
-      "tt.communication_step_table");
   auto transports =
       mod->GetAttr<ffi::Array<PipeDescriptor>>("tt.transport_table");
   bool stream_operands =
       mod->GetAttr<Integer>("tt.stream_operands").value_or(Integer(0))->value ==
       1;
   Check(dfbs.has_value(), "current Device IR is missing tt.dfb_table");
-  Check(steps.has_value(),
-        "current Device IR is missing tt.communication_step_table");
   Check(transports.has_value(),
         "current Device IR is missing tt.transport_table");
   auto expanded_accumulator_local_ids =
@@ -1476,9 +1362,6 @@ IRModule ParameterizeCurrentDeviceTables(IRModule mod) {
     mod = WithoutAttr(mod, kInternalDFBTransactionRelationsAttr);
   if (mod->attrs->dict.count(kPipelineRelationsAttr))
     mod = WithoutAttr(mod, kPipelineRelationsAttr);
-  mod = WithAttr(mod, kCommunicationStepFamiliesAttr,
-                 CompactCurrentSteps(steps.value()));
-  mod = WithoutAttr(mod, "tt.communication_step_table");
   mod = WithAttr(mod, kTransportFamiliesAttr,
                  CompactCurrentTransports(transports.value()));
   mod = WithoutAttr(mod, "tt.transport_table");
@@ -1507,17 +1390,14 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
       kAccumulatorFamiliesAttr);
   auto values = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
       kComputeValueFamiliesAttr);
-  auto steps = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
-      kCommunicationStepFamiliesAttr);
   auto transports = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
       kTransportFamiliesAttr);
   auto storage_groups = mod->GetAttr<ffi::Array<DFBStorageGroupDescriptor>>(
       kDFBStorageGroupsAttr);
   auto storage_relations = mod->GetAttr<ffi::Array<DFBStorageGroupRelation>>(
       kDFBStorageGroupRelationsAttr);
-  Check(steps.has_value() && transports.has_value(),
-        "current Device family representation requires step and transport "
-        "families");
+  Check(transports.has_value(),
+        "current Device family representation requires transport families");
   Check(storage_groups.has_value(),
         "current Device representation requires typed logical streams");
   if (stream_operands) {
@@ -1530,7 +1410,6 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
           "storage relations");
   }
   Check(!mod->attrs->dict.count(kDFBTableAttr) &&
-            !mod->attrs->dict.count("tt.communication_step_table") &&
             !mod->attrs->dict.count("tt.transport_table") &&
             (!accumulators.has_value() ||
              !mod->attrs->dict.count(kAccumulatorTableAttr)) &&
@@ -1541,7 +1420,6 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
   int64_t accumulator_count =
       accumulators.has_value() ? TableSize(accumulators.value()) : 0;
   int64_t value_count = values.has_value() ? TableSize(values.value()) : 0;
-  int64_t step_count = TableSize(steps.value());
   int64_t transport_count = TableSize(transports.value());
   CurrentComputeExpansion compute =
       ExpandCurrentComputeInstances(accumulators, values);
@@ -1551,8 +1429,6 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
   Check(dfb_count <= kExpansionBudget - accumulator_count &&
             dfb_count + accumulator_count <= kExpansionBudget - value_count &&
             dfb_count + accumulator_count + value_count <=
-                kExpansionBudget - step_count &&
-            dfb_count + accumulator_count + value_count + step_count <=
                 kExpansionBudget - transport_count,
         "current Device family expansion exceeds the bounded proof budget");
   ffi::Map<ffi::String, Integer> expanded_groups;
@@ -1626,13 +1502,6 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
                                           }));
     mod = WithoutAttr(mod, kDFBFamiliesAttr);
   }
-  mod = WithAttr(mod, "tt.communication_step_table",
-                 ExpandCurrentTable<CommunicationStepDescriptor>(
-                     steps.value(), step_count, RestoreCurrentSteps,
-                     [](const CommunicationStepDescriptor &descriptor) {
-                       return descriptor->step_id;
-                     }));
-  mod = WithoutAttr(mod, kCommunicationStepFamiliesAttr);
   mod =
       WithAttr(mod, "tt.transport_table",
                ExpandTable<PipeDescriptor>(transports.value(), transport_count,

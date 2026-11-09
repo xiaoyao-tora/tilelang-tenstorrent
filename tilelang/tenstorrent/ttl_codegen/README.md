@@ -54,8 +54,9 @@ collective source record into per-destination `ttl.copy` operations.
 Transport families carry a dense `pipe_net_id`, a parent `communication_id`,
 and a dense per-PipeNet `record_index`; Codegen uses those indices directly for
 `PipeNetRecordsAttr` without coordinate-based renumbering. Record operations
-also carry the transfer occurrence and local logical DFB stream ID needed to preserve
-loop execution and resolve the selected `ttl.copy` block operand.
+carry only the selected PipeNet record and local logical DFB stream. Structured
+control flow represents repeated execution; the final Device body is the
+communication schedule and does not persist a duplicate step table.
 
 The pinned finalizer can recolor many static logical DFB declarations into at
 most the target's physical CB-index capacity; therefore logical storage-group

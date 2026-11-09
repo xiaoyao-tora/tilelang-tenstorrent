@@ -54,7 +54,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   RegisterMetadataPrinter<ComputeRequirements>();
   RegisterMetadataPrinter<NormalizedTopologyDescriptor>();
   RegisterMetadataPrinter<CommunicationDescriptor>();
-  RegisterMetadataPrinter<CommunicationStepDescriptor>();
   RegisterMetadataPrinter<DFBStorageGroupDescriptor>();
   RegisterMetadataPrinter<DFBStorageGroupRelation>();
   RegisterMetadataPrinter<PipeTransferDescriptor>();
@@ -143,52 +142,6 @@ void CommunicationDescriptorNode::RegisterReflection() {
       .def_ro("occurrence_extents",
               &CommunicationDescriptorNode::occurrence_extents)
       .def_ro("source_span", &CommunicationDescriptorNode::source_span);
-}
-
-CommunicationStepDescriptor::CommunicationStepDescriptor(
-    int64_t step_id, int64_t communication_id, int64_t pipe_net_id,
-    int64_t record_index, int64_t occurrence, ffi::String kind,
-    ffi::Optional<CoreCoord> source_core,
-    ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
-    int64_t destination_dfb_id, ffi::String owner_slot,
-    ffi::Array<Integer> dependencies, PrimExpr parameter, Span source_span) {
-  auto node = ffi::make_object<CommunicationStepDescriptorNode>();
-  node->step_id = step_id;
-  node->communication_id = communication_id;
-  node->pipe_net_id = pipe_net_id;
-  node->record_index = record_index;
-  node->occurrence = occurrence;
-  node->kind = std::move(kind);
-  node->source_core = std::move(source_core);
-  node->destination_core = std::move(destination_core);
-  node->source_dfb_id = source_dfb_id;
-  node->destination_dfb_id = destination_dfb_id;
-  node->owner_slot = std::move(owner_slot);
-  node->dependencies = std::move(dependencies);
-  node->parameter = std::move(parameter);
-  node->source_span = std::move(source_span);
-  data_ = std::move(node);
-}
-
-void CommunicationStepDescriptorNode::RegisterReflection() {
-  ffi::reflection::ObjectDef<CommunicationStepDescriptorNode>()
-      .def_ro("step_id", &CommunicationStepDescriptorNode::step_id)
-      .def_ro("communication_id",
-              &CommunicationStepDescriptorNode::communication_id)
-      .def_ro("pipe_net_id", &CommunicationStepDescriptorNode::pipe_net_id)
-      .def_ro("record_index", &CommunicationStepDescriptorNode::record_index)
-      .def_ro("occurrence", &CommunicationStepDescriptorNode::occurrence)
-      .def_ro("kind", &CommunicationStepDescriptorNode::kind)
-      .def_ro("source_core", &CommunicationStepDescriptorNode::source_core)
-      .def_ro("destination_core",
-              &CommunicationStepDescriptorNode::destination_core)
-      .def_ro("source_dfb_id", &CommunicationStepDescriptorNode::source_dfb_id)
-      .def_ro("destination_dfb_id",
-              &CommunicationStepDescriptorNode::destination_dfb_id)
-      .def_ro("owner_slot", &CommunicationStepDescriptorNode::owner_slot)
-      .def_ro("dependencies", &CommunicationStepDescriptorNode::dependencies)
-      .def_ro("parameter", &CommunicationStepDescriptorNode::parameter)
-      .def_ro("source_span", &CommunicationStepDescriptorNode::source_span);
 }
 
 bool IsSupportedAccumulatorDTypeTriple(DataType input, DataType accumulation,
@@ -747,7 +700,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   TensorDescriptorNode::RegisterReflection();
   NormalizedTopologyDescriptorNode::RegisterReflection();
   CommunicationDescriptorNode::RegisterReflection();
-  CommunicationStepDescriptorNode::RegisterReflection();
   DFBDescriptorNode::RegisterReflection();
   DFBStorageGroupDescriptorNode::RegisterReflection();
   PipeDescriptorNode::RegisterReflection();
@@ -812,21 +764,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(group_end), std::move(parameter),
                  std::move(contract), std::move(occurrence_extents),
                  std::move(source_span));
-           })
-      .def("tl.tenstorrent.CommunicationStepDescriptor",
-           [](int64_t step_id, int64_t communication_id, int64_t pipe_net_id,
-              int64_t record_index, int64_t occurrence, ffi::String kind,
-              ffi::Optional<CoreCoord> source_core,
-              ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
-              int64_t destination_dfb_id, ffi::String owner_slot,
-              ffi::Array<Integer> dependencies, PrimExpr parameter,
-              Span source_span) {
-             return CommunicationStepDescriptor(
-                 step_id, communication_id, pipe_net_id, record_index,
-                 occurrence, std::move(kind), std::move(source_core),
-                 std::move(destination_core), source_dfb_id, destination_dfb_id,
-                 std::move(owner_slot), std::move(dependencies),
-                 std::move(parameter), std::move(source_span));
            })
       .def("tl.tenstorrent.OperationIdentity",
            [](ffi::String operation_id, Span source_span) {

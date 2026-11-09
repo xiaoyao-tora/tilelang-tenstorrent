@@ -23,7 +23,6 @@ MODULE_ATTRS = {
     "tt.dfb_storage_groups",
     "tt.stream_operands",
     "tt.communication_table",
-    "tt.communication_step_families",
     "tt.transport_families",
     "tt.kernel_order",
 }
@@ -83,7 +82,6 @@ def test_backend_context_lowers_minimal_frontend_to_device_ir(monkeypatch):
     assert len(lowered.attrs["tt.tensor_table"]) == 1
     assert not lowered.attrs["tt.dfb_storage_groups"]
     assert not lowered.attrs["tt.communication_table"]
-    assert not lowered.attrs["tt.communication_step_families"]
     assert not lowered.attrs["tt.transport_families"]
 
     functions = {str(func.attrs["tt.kernel_slot"]): func for func in lowered.functions.values()}

@@ -256,6 +256,7 @@ def interpret(mod, inputs, seed=0):
     mod = D.expand_current_device_tables(mod)
     tensors = [np.array(value, copy=True) for value in inputs]
     values, dfbs, deliveries, accumulators = {}, {}, {}, {}
+    record_deliveries, record_receive_cursors = {}, {}
     pending = {}
     occupied = set()
     groups = {int(group.storage_group_id): int(group.storage_group_id) for group in mod.attrs.get("tt.dfb_storage_groups", [])}
@@ -319,8 +320,11 @@ def interpret(mod, inputs, seed=0):
                 continue
             if name == "tl.tt.dfb_pipe_recv" and args[0] not in deliveries:
                 continue
-            if name == "tl.tt.dfb_pipe_recv_record" and tuple(args[:3]) not in deliveries:
-                continue
+            if name == "tl.tt.dfb_pipe_recv_record":
+                key = tuple(args[:2])
+                cursor = record_receive_cursors.get((index, key), 0)
+                if cursor >= len(record_deliveries.get(key, ())):
+                    continue
             if name == "tl.tt.dfb_reserve":
                 group = groups.get(args[0], args[0])
                 if sum(groups.get(resource, resource) == group for resource in occupied) >= int(dfb_info[args[0]].block_count):
@@ -355,9 +359,13 @@ def interpret(mod, inputs, seed=0):
             elif name == "tl.tt.dfb_pipe_recv":
                 dfbs[args[1]] = deliveries[args[0]].copy()
             elif name == "tl.tt.dfb_pipe_send_record":
-                deliveries[tuple(args[:3])] = dfbs[args[3]].copy()
+                record_deliveries.setdefault(tuple(args[:2]), []).append(dfbs[args[2]].copy())
             elif name == "tl.tt.dfb_pipe_recv_record":
-                dfbs[args[3]] = deliveries[tuple(args[:3])].copy()
+                key = tuple(args[:2])
+                cursor_key = (index, key)
+                cursor = record_receive_cursors.get(cursor_key, 0)
+                dfbs[args[2]] = record_deliveries[key][cursor].copy()
+                record_receive_cursors[cursor_key] = cursor + 1
             elif name in ("tl.tt.compute_value", "tl.tt.dfb_compute"):
                 attrs = call.annotations
                 kind = str(attrs["tt.compute_kind"].value)
