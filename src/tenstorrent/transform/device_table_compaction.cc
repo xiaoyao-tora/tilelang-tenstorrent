@@ -929,6 +929,12 @@ public:
     } else if (call->op.same_as(compute_value_store()) ||
                call->op.same_as(compute_value_load())) {
       shift(0, value_offsets_, "compute value");
+    } else if (call->op.same_as(compute_value_state_init()) ||
+               call->op.same_as(compute_value_state_yield())) {
+      shift(1, value_offsets_, "loop-state value");
+    } else if (call->op.same_as(compute_value_state_input()) ||
+               call->op.same_as(compute_value_state_result())) {
+      shift(0, value_offsets_, "loop-state value");
     }
     ffi::Map<ffi::String, ffi::ObjectRef> annotations = call->annotations;
     auto value_inputs = annotations.Get("tt.value_inputs");

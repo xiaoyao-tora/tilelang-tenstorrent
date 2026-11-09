@@ -275,10 +275,37 @@ def test_loop_carried_fragment_snapshots_are_extent_invariant():
     trisc_functions = [
         next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc") for mod in modules
     ]
-    assert all(any(call.op.name == "tl.tt.compute_value_store" for call in calls(function.body)) for function in trisc_functions)
+    expected_state_ops = {
+        "tl.tt.compute_value_state_init",
+        "tl.tt.compute_value_state_input",
+        "tl.tt.compute_value_state_yield",
+        "tl.tt.compute_value_state_result",
+    }
+    assert all(expected_state_ops <= {call.op.name for call in calls(function.body)} for function in trisc_functions)
     assert len({_body_counts(function)["evaluate"] for function in trisc_functions}) == 1
     script_sizes = [len(function.script()) for function in trisc_functions]
     assert max(script_sizes) - min(script_sizes) <= 1
+
+
+def test_loop_state_yield_requires_a_matching_initialized_state():
+    mod = ir.load_json(ir.save_json(lower(make_loop_carried_fragment_update(2))))
+    changed = False
+
+    def corrupt(call):
+        nonlocal changed
+        if changed or call.op.name != "tl.tt.compute_value_state_yield":
+            return None
+        changed = True
+        args = list(call.args)
+        args[0] = tirx.IntImm("int32", 99)
+        return tirx.Call(call.dtype, call.op, args, call.annotations, call.span)
+
+    for global_var, function in list(mod.functions.items()):
+        body = tirx.stmt_functor.ir_transform(function.body, None, corrupt, ["tirx.Call"])
+        mod.update_func(global_var, function.with_body(body))
+    assert changed
+    with pytest.raises(ValueError, match="loop state used before initialization"):
+        transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 def test_single_slot_in_place_update_uses_logical_streams():
@@ -952,7 +979,7 @@ def test_flash_attention_core_and_kv_repetition_remain_parameterized():
         (2, 8, 1),
         (2, 8, 1),
     ]
-    assert [len(mod.attrs["tt.dfb_storage_groups"]) for mod in modules] == [15, 16, 16]
+    assert [len(mod.attrs["tt.dfb_storage_groups"]) for mod in modules] == [14, 14, 14]
     for mod in modules:
         assert "tt.storage_group_statements_specialized" not in mod.attrs
         assert not _dynamic_dfb_operands(mod)
@@ -995,9 +1022,9 @@ def test_stateful_loop_compaction_absorbs_the_terminal_steady_state_period():
             else None
         ),
     )
-    assert [int(loop.extent) for loop in compact_loops] == [2, 3]
-    assert sum(call.op.name == "tl.tt.compute_value_gemm" for call in calls(trisc.body)) == 6
-    assert _body_counts(trisc)["if"] > 0
+    assert [int(loop.extent) for loop in compact_loops] == [7]
+    assert sum(call.op.name == "tl.tt.compute_value_gemm" for call in calls(trisc.body)) == 4
+    assert sum("state_" in call.op.name for call in calls(trisc.body)) == 6
     assert not _dynamic_dfb_operands(mod)
 
 
@@ -1022,7 +1049,7 @@ def test_mixed_precision_flash_uses_full_fp32_accumulation():
     requirements = trisc.attrs["tt.compute_requirements"]
     assert str(requirements.destination_width) == "bits32_required"
     assert str(requirements.matmul_full_fp32) == "required"
-    assert len(mod.attrs["tt.dfb_storage_groups"]) == 17
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == 16
 
 
 def test_all_bf16_flash_uses_bf16_constants_and_destination():
@@ -1051,4 +1078,4 @@ def test_all_bf16_flash_uses_bf16_constants_and_destination():
     requirements = trisc.attrs["tt.compute_requirements"]
     assert str(requirements.destination_width) == "bits16_required"
     assert str(requirements.matmul_full_fp32) == "forbidden"
-    assert len(mod.attrs["tt.dfb_storage_groups"]) == 15
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == 14

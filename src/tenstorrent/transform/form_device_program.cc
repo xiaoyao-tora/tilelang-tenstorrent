@@ -278,6 +278,13 @@ struct SerialIterationContext {
   size_t iteration_resource_begin;
 };
 
+struct LoopCarriedValuePlan {
+  int64_t state_id;
+  int64_t entry_value;
+  Buffer buffer;
+  Span span;
+};
+
 class DeviceExpressionRewriter : public StmtExprMutator {
 public:
   explicit DeviceExpressionRewriter(
@@ -874,18 +881,41 @@ public:
         ThrowUnsupported("serial loop extent exceeds 1024");
       bool previous_materialization = stable_loop_materializations_;
       stable_loop_materializations_ = true;
+      std::vector<LoopCarriedValuePlan> loop_states;
+      if (extent > 1)
+        loop_states =
+            FindLoopCarriedValuePlans(ffi::GetRef<For>(loop), minimum);
+      std::vector<int64_t> invariant_waits =
+          FindLoopInvariantWaits(ffi::GetRef<For>(loop), minimum);
+      for (int64_t resource : invariant_waits)
+        compute_.push_back(
+            MakeDeviceCall(dfb_wait(), {Integer(resource)}, loop->span));
+      suppressed_compute_waits_.insert(invariant_waits.begin(),
+                                       invariant_waits.end());
+      for (const LoopCarriedValuePlan &state : loop_states)
+        compute_.push_back(MakeDeviceCall(
+            compute_value_state_init(),
+            {Integer(state.state_id), Integer(state.entry_value)}, state.span));
       size_t loop_resource_begin = resources_.size();
       for (int64_t i = 0; i < extent; ++i) {
         size_t iteration_resource_begin = resources_.size();
         if (i)
           serial_iterations_.push_back(
               {values_.size(), loop_resource_begin, iteration_resource_begin});
+        for (const LoopCarriedValuePlan &state : loop_states)
+          DefineLoopStateInput(state);
         StaticIterationSubstituter substitute(
             loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + i));
         PlanImpl(substitute(loop->body));
+        for (const LoopCarriedValuePlan &state : loop_states)
+          YieldLoopState(state);
         if (i)
           serial_iterations_.pop_back();
       }
+      for (const LoopCarriedValuePlan &state : loop_states)
+        DefineLoopStateResult(state);
+      for (int64_t resource : invariant_waits)
+        suppressed_compute_waits_.erase(resource);
       stable_loop_materializations_ = previous_materialization;
       return;
     }
@@ -1143,6 +1173,12 @@ private:
           use_value(*as_const_int(call->args[0]));
         if (call->op.same_as(compute_value_store()))
           use_value(*as_const_int(call->args[0]));
+        if (call->op.same_as(compute_value_state_input()) ||
+            call->op.same_as(compute_value_state_result()))
+          use_value(*as_const_int(call->args[0]));
+        if (call->op.same_as(compute_value_state_init()) ||
+            call->op.same_as(compute_value_state_yield()))
+          use_value(*as_const_int(call->args[1]));
         auto value_inputs = call->annotations.Get("tt.value_inputs");
         if (value_inputs.has_value())
           for (const Integer &input :
@@ -1285,12 +1321,147 @@ private:
   }
 
   void Wait(ffi::Array<Stmt> *body, int64_t id, const Span &span) {
+    if (body == &compute_ && suppressed_compute_waits_.count(id))
+      return;
     body->push_back(
         MakeDeviceCall(tenstorrent::dfb_wait(), {Integer(id)}, span));
   }
   void Reserve(ffi::Array<Stmt> *body, int64_t id, const Span &span) {
     body->push_back(
         MakeDeviceCall(tenstorrent::dfb_reserve(), {Integer(id)}, span));
+  }
+
+  std::vector<int64_t> FindLoopInvariantWaits(const For &loop,
+                                              int64_t minimum) {
+    size_t resource_begin = resources_.size();
+    GeneralDataflowPlanner probe(*this);
+    TransferKeys probe_transfers;
+    if (transfers_) {
+      probe_transfers = *transfers_;
+      probe.transfers_ = &probe_transfers;
+    }
+    size_t statement_begin = probe.compute_.size();
+    StaticIterationSubstituter first(loop->loop_var,
+                                     IntImm(loop->loop_var.dtype(), minimum));
+    probe.PlanImpl(first(loop->body));
+    std::set<int64_t> resources;
+    for (size_t index = statement_begin; index < probe.compute_.size();
+         ++index) {
+      const auto *evaluate = probe.compute_[index].as<EvaluateNode>();
+      const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+      if (!call || !call->op.same_as(dfb_wait()) || call->args.size() != 1)
+        continue;
+      const int64_t *resource = as_const_int(call->args[0]);
+      if (resource && *resource >= 0 &&
+          *resource < static_cast<int64_t>(resource_begin))
+        resources.insert(*resource);
+    }
+    return {resources.begin(), resources.end()};
+  }
+
+  std::vector<LoopCarriedValuePlan> FindLoopCarriedValuePlans(const For &loop,
+                                                              int64_t minimum) {
+    struct Candidate {
+      int64_t entry_value;
+      int64_t first_value;
+      Buffer buffer;
+    };
+    size_t resource_begin = resources_.size();
+    auto entry_values = current_values_;
+    TransferKeys probe_transfers;
+    GeneralDataflowPlanner probe(*this);
+    if (transfers_) {
+      probe_transfers = *transfers_;
+      probe.transfers_ = &probe_transfers;
+    }
+    StaticIterationSubstituter first(loop->loop_var,
+                                     IntImm(loop->loop_var.dtype(), minimum));
+    probe.PlanImpl(first(loop->body));
+
+    std::vector<Candidate> candidates;
+    for (const auto &[buffer_var, entry_value] : entry_values) {
+      auto current = probe.current_values_.find(buffer_var);
+      if (current == probe.current_values_.end() ||
+          current->second == entry_value)
+        continue;
+      int64_t next_value = current->second;
+      bool borrows_loop_resource = std::any_of(
+          probe.value_dfb_sources_[next_value].begin(),
+          probe.value_dfb_sources_[next_value].end(), [&](int64_t resource) {
+            return resource >= static_cast<int64_t>(resource_begin);
+          });
+      if (!borrows_loop_resource)
+        continue;
+      int64_t accumulator = probe.values_[next_value]->accumulator_id;
+      if (accumulator >= 0 &&
+          accumulator < static_cast<int64_t>(probe.accumulators_.size())) {
+        int64_t before =
+            accumulator < static_cast<int64_t>(accumulators_.size())
+                ? accumulators_[accumulator].full_k_tiles
+                : 0;
+        if (probe.accumulators_[accumulator].full_k_tiles > before)
+          continue;
+      }
+      candidates.push_back(
+          {entry_value, next_value, values_[entry_value]->buffer});
+    }
+    if (candidates.empty())
+      return {};
+
+    size_t second_resource_begin = probe.resources_.size();
+    probe.serial_iterations_.push_back(
+        {probe.values_.size(), resource_begin, second_resource_begin});
+    StaticIterationSubstituter second(
+        loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + 1));
+    probe.PlanImpl(second(loop->body));
+    probe.serial_iterations_.pop_back();
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto &left, const auto &right) {
+                return left.entry_value < right.entry_value;
+              });
+    std::vector<LoopCarriedValuePlan> result;
+    for (const Candidate &candidate : candidates) {
+      auto snapshot = probe.materialized_values_.find(candidate.first_value);
+      if (snapshot == probe.materialized_values_.end() ||
+          snapshot->second < static_cast<int64_t>(second_resource_begin))
+        continue;
+      result.push_back(
+          {next_loop_state_id_++, candidate.entry_value, candidate.buffer,
+           probe.resources_[snapshot->second].metadata->source_span});
+    }
+    return result;
+  }
+
+  int64_t DefineLoopStateInput(const LoopCarriedValuePlan &state) {
+    int64_t previous = ReadValue(state.buffer, state.span,
+                                 /*snapshot_loop_carry=*/false);
+    int64_t value = DefineValue(state.buffer, values_[previous]->accumulator_id,
+                                state.span);
+    value_roots_[value] = value_roots_[previous];
+    compute_.push_back(MakeDeviceCall(compute_value_state_input(),
+                                      {Integer(value), Integer(state.state_id)},
+                                      state.span));
+    return value;
+  }
+
+  void YieldLoopState(const LoopCarriedValuePlan &state) {
+    int64_t value = ReadValue(state.buffer, state.span,
+                              /*snapshot_loop_carry=*/false);
+    compute_.push_back(MakeDeviceCall(compute_value_state_yield(),
+                                      {Integer(state.state_id), Integer(value)},
+                                      state.span));
+  }
+
+  void DefineLoopStateResult(const LoopCarriedValuePlan &state) {
+    int64_t previous = ReadValue(state.buffer, state.span,
+                                 /*snapshot_loop_carry=*/false);
+    int64_t value = DefineValue(state.buffer, values_[previous]->accumulator_id,
+                                state.span);
+    value_roots_[value] = value_roots_[previous];
+    compute_.push_back(MakeDeviceCall(compute_value_state_result(),
+                                      {Integer(value), Integer(state.state_id)},
+                                      state.span));
   }
 
   int64_t ReadValue(const Buffer &buffer, const Span &span,
@@ -1852,7 +2023,11 @@ private:
         const CallNode *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
         if (call->op.same_as(compute_value()) ||
             call->op.same_as(compute_value_gemm()) ||
-            call->op.same_as(compute_precision())) {
+            call->op.same_as(compute_precision()) ||
+            call->op.same_as(compute_value_state_init()) ||
+            call->op.same_as(compute_value_state_input()) ||
+            call->op.same_as(compute_value_state_yield()) ||
+            call->op.same_as(compute_value_state_result())) {
           result.push_back(stmt);
           continue;
         }
@@ -2525,7 +2700,9 @@ private:
   std::unordered_map<int64_t, int64_t> collective_occurrences_;
   int64_t generated_collective_buffers_{0};
   std::unordered_set<int64_t> observable_resources_;
+  std::set<int64_t> suppressed_compute_waits_;
   bool has_producer_forwarding_{false};
+  int64_t next_loop_state_id_{0};
   TransferKeys *transfers_;
   int64_t core_x_, core_y_, grid_x_{1}, grid_y_{1};
   std::vector<PipeEndpoint> endpoints_;

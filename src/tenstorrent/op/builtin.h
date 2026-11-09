@@ -103,6 +103,12 @@ TVM_DLL const Op &compute_value();
 TVM_DLL const Op &compute_value_load();
 TVM_DLL const Op &compute_value_store();
 TVM_DLL const Op &compute_value_gemm();
+// Abstract compute-local loop state. These operations carry no DFB identity;
+// TTL Codegen maps them to scf.for iter_args and scf.yield.
+TVM_DLL const Op &compute_value_state_init();
+TVM_DLL const Op &compute_value_state_input();
+TVM_DLL const Op &compute_value_state_yield();
+TVM_DLL const Op &compute_value_state_result();
 // Schema v5: init(id), update(lhs, rhs, id, transpose_a, transpose_b),
 // materialize(id, output_dfb). Current shared-grid Device IR interprets id in
 // the current Core; versioned legacy schemas retain their global IDs.

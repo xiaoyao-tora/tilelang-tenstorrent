@@ -147,6 +147,10 @@ bool IsCurrentDeviceOp(const std::string &op_name) {
       "tl.tt.compute_value_load",
       "tl.tt.compute_value_store",
       "tl.tt.compute_value_gemm",
+      "tl.tt.compute_value_state_init",
+      "tl.tt.compute_value_state_input",
+      "tl.tt.compute_value_state_yield",
+      "tl.tt.compute_value_state_result",
       "tl.tt.tensor_to_dfb_nd",
       "tl.tt.dfb_to_tensor_nd",
       "tl.tt.dfb_reserve",
@@ -1759,6 +1763,7 @@ public:
     active_dfb_transactions_.clear();
     published_dfb_transactions_.clear();
     released_dfb_transactions_.clear();
+    loop_states_.clear();
     current_core_x_ = x;
     current_core_y_ = y;
     for (const auto &[id, value] : values_) {
@@ -1785,6 +1790,49 @@ public:
         RequireStaticInteger(call->args[0], "compute precision mode");
     Check(mode == 0 || mode == 1, "compute precision mode must be 0 or 1");
     ++precision_epoch_;
+  }
+  void LoopState(const Call &call) {
+    Check(current_device_ && call->args.size() == 2 &&
+              call->annotations.empty(),
+          "compute-value loop state requires current Device IR and two "
+          "operands without annotations");
+    auto integer = [&](size_t index, const char *label) {
+      return RequireStaticInteger(arith::Analyzer().Simplify(call->args[index]),
+                                  label);
+    };
+    bool init = call->op.same_as(compute_value_state_init());
+    bool yield = call->op.same_as(compute_value_state_yield());
+    bool input = call->op.same_as(compute_value_state_input());
+    bool result = call->op.same_as(compute_value_state_result());
+    Check(init || yield || input || result, "invalid compute-value loop state");
+    int64_t state = integer(init || yield ? 0 : 1, "loop state ID");
+    int64_t value = integer(init || yield ? 1 : 0, "loop state value ID");
+    Check(state >= 0, "loop state ID must be nonnegative");
+    if (init) {
+      Read(value);
+      Check(loop_states_.emplace(state, value).second,
+            "loop state initialized more than once");
+      return;
+    }
+    auto current = loop_states_.find(state);
+    Check(current != loop_states_.end(),
+          "loop state used before initialization");
+    if (yield) {
+      Read(value);
+      current->second = value;
+      return;
+    }
+    int64_t previous = current->second;
+    const ComputeValueDescriptor &entry = values_.at(value);
+    Check(entry->previous_value_id == previous,
+          "loop-state value predecessor disagrees with current state");
+    value_k_[value] = value_k_.at(previous);
+    sources_[value] = {};
+    source_transactions_[value] = {};
+    Define(value);
+    current->second = value;
+    if (result)
+      loop_states_.erase(current);
   }
   void CheckOwner(int64_t id) const {
     Check(owners_.count(id) && owners_.at(id).same_as(function_),
@@ -2123,6 +2171,7 @@ private:
   std::map<int64_t, std::set<DFBTransaction>> source_transactions_;
   std::map<DFBTransaction, std::set<int64_t>> dfb_roots_;
   std::map<int64_t, int64_t> active_dfb_transactions_;
+  std::map<int64_t, int64_t> loop_states_;
   std::map<int64_t, int64_t> published_dfb_transactions_;
   std::set<DFBTransaction> released_dfb_transactions_;
   std::map<int64_t, int64_t> pipeline_iterations_;
@@ -5079,6 +5128,11 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                   compute_values.Gemm(call, dfb_table);
                 else if (call->op.same_as(compute_value_store()))
                   compute_values.Store(call, dfb_table);
+                else if (call->op.same_as(compute_value_state_init()) ||
+                         call->op.same_as(compute_value_state_input()) ||
+                         call->op.same_as(compute_value_state_yield()) ||
+                         call->op.same_as(compute_value_state_result()))
+                  compute_values.LoopState(call);
                 else if (call->op.same_as(dfb_to_tensor_nd())) {
                   int64_t resource = id(call, 0);
                   int64_t tensor = RequireStaticInteger(
