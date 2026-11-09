@@ -1491,6 +1491,33 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
     args.Set(0, Integer(virtual_ids.at(id)));
   }
   auto attrs = call->annotations;
+  if (local_output) {
+    int64_t output = static_integer(call->args[0], "compute output ID");
+    const ComputeValueDescriptor &descriptor = values.at(output);
+    if (!attrs.count("tt.compute_dtype"))
+      attrs.Set("tt.compute_dtype",
+                StringImm(descriptor->dtype == DataType::Float(32)
+                              ? "float32"
+                              : "bfloat16"));
+    if (!attrs.count("tt.compute_tile_shape"))
+      attrs.Set("tt.compute_tile_shape", descriptor->compute_tile_shape);
+    if (!attrs.count("tt.logical_domain"))
+      attrs.Set("tt.logical_domain", descriptor->logical_shape);
+    if (!attrs.count("tt.value_input_shapes")) {
+      ffi::Array<ffi::Array<PrimExpr>> value_shapes;
+      if (auto value_inputs = attrs.Get("tt.value_inputs")) {
+        auto input_ids = value_inputs.value().as<ffi::Array<PrimExpr>>();
+        Check(input_ids.has_value(), "invalid tt.value_inputs");
+        for (const PrimExpr &input : input_ids.value()) {
+          int64_t id = static_integer(input, "compute value input ID");
+          Check(values.count(id),
+                "compute value references missing descriptor");
+          value_shapes.push_back(values.at(id)->logical_shape);
+        }
+      }
+      attrs.Set("tt.value_input_shapes", value_shapes);
+    }
+  }
   auto input_attr = attrs.Get("tt.value_inputs");
   auto maps_attr = attrs.Get("tt.value_access_maps");
   auto shapes_attr = attrs.Get("tt.value_input_shapes");

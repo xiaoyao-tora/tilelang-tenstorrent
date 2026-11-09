@@ -218,7 +218,18 @@ def interpret_values(mod, tensors):
                 )
                 kind = str(attrs["tt.compute_kind"].value)
                 result = current_dfb(args[1]) if kind == "copy" else expression(attrs["tt.expression"], maps)
-                shape = tuple(map(int, attrs["tt.logical_domain"]))
+                shape = (
+                    tuple(
+                        map(
+                            int,
+                            descriptors[args[0]].logical_shape
+                            if hasattr(descriptors[args[0]], "logical_shape")
+                            else attrs["tt.logical_domain"],
+                        )
+                    )
+                    if name == "tl.tt.compute_value"
+                    else tuple(map(int, attrs["tt.logical_domain"]))
+                )
                 result = np.broadcast_to(result, shape).copy()
                 if name == "tl.tt.compute_value":
                     assert args[0] not in values, "An immutable value was redefined"
@@ -369,7 +380,18 @@ def interpret(mod, inputs, seed=0):
             elif name in ("tl.tt.compute_value", "tl.tt.dfb_compute"):
                 attrs = call.annotations
                 kind = str(attrs["tt.compute_kind"].value)
-                domain = tuple(map(int, attrs["tt.logical_domain"]))
+                domain = (
+                    tuple(
+                        map(
+                            int,
+                            value_info[args[0]].logical_shape
+                            if hasattr(value_info[args[0]], "logical_shape")
+                            else attrs["tt.logical_domain"],
+                        )
+                    )
+                    if name == "tl.tt.compute_value"
+                    else tuple(map(int, attrs["tt.logical_domain"]))
+                )
                 if kind == "transpose":
                     result = dfbs[args[1]].swapaxes(-1, -2)
                 elif kind == "reduce":

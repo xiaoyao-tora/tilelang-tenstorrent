@@ -153,7 +153,15 @@ def test_same_buffer_identity_and_broadcast_accesses_are_rejected():
 def test_current_device_tirx_parses_and_reverifies():
     from tvm.script import from_source
 
-    mod = lower(single_slot_in_place)
+    mod = lower(make_loop_carried_fragment_update(2))
+    derived = {
+        "tt.compute_dtype",
+        "tt.compute_tile_shape",
+        "tt.logical_domain",
+    }
+    value_calls = [call for function in mod.functions.values() for call in calls(function.body) if call.op.name == "tl.tt.compute_value"]
+    assert value_calls
+    assert all(derived.isdisjoint(call.annotations) for call in value_calls)
     source = D.device_ir_to_tirx(mod)
     assert "tt__compute_kind" in source
     assert "tt.compute_kind=" not in source

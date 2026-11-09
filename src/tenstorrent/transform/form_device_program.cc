@@ -2820,12 +2820,19 @@ class DuplicateGenerationWaitRemover : public StmtExprMutator {
 class TransientDeviceAnnotationRemover : public StmtExprMutator {
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    bool derived_compute_value = call->op.same_as(compute_value());
     if (!call->annotations.count("tt.stream_identity") &&
-        !call->annotations.count("tt.internal_communication_id"))
+        !call->annotations.count("tt.internal_communication_id") &&
+        !derived_compute_value)
       return call;
     auto annotations = call->annotations;
     annotations.erase("tt.stream_identity");
     annotations.erase("tt.internal_communication_id");
+    if (derived_compute_value) {
+      annotations.erase("tt.compute_dtype");
+      annotations.erase("tt.compute_tile_shape");
+      annotations.erase("tt.logical_domain");
+    }
     return Call(call->dtype, call->op, call->args, annotations, call->span);
   }
 };
