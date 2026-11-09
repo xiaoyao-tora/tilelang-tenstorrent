@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/creator.h>
 #include <tvm/ir/module.h>
 #include <tvm/ir/op.h>
@@ -864,6 +865,22 @@ void Expand(const Stmt &body, AffineReader::Bindings *bindings,
       Expand(loop.value()->body, bindings, output);
     }
     bindings->erase(variable);
+  } else if (auto branch = body.as<IfThenElse>()) {
+    ffi::Map<Var, PrimExpr> replacements;
+    for (const auto &[variable, value] : *bindings)
+      replacements.Set(variable,
+                       IntImm(variable.dtype(), value, variable->span));
+    PrimExpr condition = Substitute(branch.value()->condition, replacements);
+    condition = arith::Analyzer().Simplify(condition);
+    if (const int64_t *selected = as_const_int(condition)) {
+      if (*selected)
+        Expand(branch.value()->then_case, bindings, output);
+      else if (branch.value()->else_case.has_value())
+        Expand(branch.value()->else_case.value(), bindings, output);
+    } else {
+      AffineReader reader(*bindings);
+      output->push_back(Downcast<Stmt>(reader.Rewrite(body)));
+    }
   } else {
     AffineReader reader(*bindings);
     output->push_back(Downcast<Stmt>(reader.Rewrite(body)));
@@ -872,7 +889,8 @@ void Expand(const Stmt &body, AffineReader::Bindings *bindings,
 } // namespace
 
 static Stmt CompactDeviceStatementsImpl(const Stmt &body,
-                                        bool semantic_core_locals) {
+                                        bool semantic_core_locals,
+                                        bool allow_dfb_variants = false) {
   auto sequence = body.as<SeqStmt>();
   if (!sequence.has_value() || sequence.value()->seq.size() < 2)
     return body;
@@ -903,6 +921,7 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
   for (size_t begin = 0; begin < count;) {
     size_t best_length = 0, best_repeats = 0, best_saving = 0;
     std::vector<std::vector<int64_t>> best_steps;
+    std::vector<bool> best_dfb_variants;
     const auto &candidates = positions.at(info[begin].hash);
     auto next = std::upper_bound(candidates.begin(), candidates.end(), begin);
     size_t attempts = 0;
@@ -920,6 +939,7 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
       if (!same_block(begin, begin + length, length))
         continue;
       std::vector<std::vector<int64_t>> steps(length);
+      std::vector<bool> dfb_variants(length, false);
       bool valid = true;
       for (size_t j = 0; j < length && valid; ++j) {
         const auto &first = info[begin + j].integers;
@@ -927,7 +947,7 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
         if (first.size() != second.size() ||
             !SameSkeleton(statements[begin + j], statements[begin + length + j],
                           semantic_core_locals) ||
-            (semantic_core_locals &&
+            (semantic_core_locals && !allow_dfb_variants &&
              !SameDFBOperands(statements[begin + j],
                               statements[begin + length + j])) ||
             (semantic_core_locals &&
@@ -936,6 +956,9 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
           valid = false;
           break;
         }
+        dfb_variants[j] = allow_dfb_variants &&
+                          !SameDFBOperands(statements[begin + j],
+                                           statements[begin + length + j]);
         for (size_t k = 0; k < first.size(); ++k) {
           __int128 step = __int128{second[k]->value} - first[k]->value;
           if (step < std::numeric_limits<int64_t>::min() ||
@@ -955,6 +978,10 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
              same_block(begin, begin + repeats * length, length)) {
         valid = true;
         for (size_t j = 0; j < length && valid; ++j) {
+          if (dfb_variants[j]) {
+            valid = false;
+            break;
+          }
           const auto &first = info[begin + j].integers;
           const auto &current = info[begin + repeats * length + j].integers;
           if (first.size() != current.size() ||
@@ -983,12 +1010,17 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
           break;
         ++repeats;
       }
-      size_t saving = length * (repeats - 1) - 1;
+      size_t variant_count =
+          std::count(dfb_variants.begin(), dfb_variants.end(), true);
+      size_t raw_saving = length * (repeats - 1) - 1;
+      size_t saving =
+          raw_saving > variant_count ? raw_saving - variant_count : 0;
       if (saving > best_saving) {
         best_saving = saving;
         best_length = length;
         best_repeats = repeats;
         best_steps = std::move(steps);
+        best_dfb_variants = std::move(dfb_variants);
       }
     }
     if (!best_length) {
@@ -998,6 +1030,12 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
     Var iteration("tt_compact_iteration", DataType::Int(64));
     ffi::Array<Stmt> loop_body;
     for (size_t j = 0; j < best_length; ++j) {
+      if (best_dfb_variants[j]) {
+        loop_body.push_back(IfThenElse(
+            EQ(iteration, IntImm(DataType::Int(64), 0)), statements[begin + j],
+            statements[begin + best_length + j]));
+        continue;
+      }
       AffineWriter writer(best_steps[j], iteration);
       loop_body.push_back(
           Downcast<Stmt>(writer.Rewrite(statements[begin + j])));
@@ -1137,7 +1175,8 @@ static Stmt ExtendGeneratedCompactLoops(const Stmt &body) {
 }
 
 Stmt CompactDeviceStatements(const Stmt &body) {
-  return CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/false);
+  return CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/false,
+                                     /*allow_dfb_variants=*/false);
 }
 
 namespace {
@@ -1149,7 +1188,12 @@ public:
 private:
   Stmt VisitStmt_(const ForNode *op) final {
     For loop = ffi::GetRef<For>(op);
-    Stmt body = CompactDeviceStatementsImpl(op->body, semantic_core_locals_);
+    bool generated_compact_loop =
+        semantic_core_locals_ &&
+        std::string(op->loop_var->name_hint).rfind("tt_compact_iteration", 0) ==
+            0;
+    Stmt body = CompactDeviceStatementsImpl(op->body, semantic_core_locals_,
+                                            generated_compact_loop);
     if (semantic_core_locals_)
       body = ExtendGeneratedCompactLoops(body);
     body = NestedDeviceStatementCompactor(semantic_core_locals_)(body);
@@ -1171,7 +1215,8 @@ Stmt CompactDeviceStatementsRecursive(const Stmt &body) {
 
 static Stmt CompactGeneratedDeviceStatementsRecursive(const Stmt &body) {
   Stmt compact =
-      CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/true);
+      CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/true,
+                                  /*allow_dfb_variants=*/false);
   compact = ExtendGeneratedCompactLoops(compact);
   NestedDeviceStatementCompactor nested(/*semantic_core_locals=*/true);
   return nested(compact);

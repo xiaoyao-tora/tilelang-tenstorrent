@@ -987,8 +987,9 @@ def test_stateful_loop_compaction_absorbs_the_terminal_steady_state_period():
             else None
         ),
     )
-    assert [int(loop.extent) for loop in compact_loops] == [3]
-    assert sum(call.op.name == "tl.tt.compute_value_gemm" for call in calls(trisc.body)) == 8
+    assert [int(loop.extent) for loop in compact_loops] == [2, 3]
+    assert sum(call.op.name == "tl.tt.compute_value_gemm" for call in calls(trisc.body)) == 6
+    assert _body_counts(trisc)["if"] > 0
     assert not _dynamic_dfb_operands(mod)
 
 
