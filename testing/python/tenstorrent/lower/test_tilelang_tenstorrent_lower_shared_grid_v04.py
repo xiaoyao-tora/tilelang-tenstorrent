@@ -162,6 +162,8 @@ def test_current_device_tirx_parses_and_reverifies():
     value_calls = [call for function in mod.functions.values() for call in calls(function.body) if call.op.name == "tl.tt.compute_value"]
     assert value_calls
     assert all(derived.isdisjoint(call.annotations) for call in value_calls)
+    optional_arrays = {"tt.input_shapes", "tt.value_inputs", "tt.value_input_shapes"}
+    assert all(all(key not in call.annotations or len(call.annotations[key]) for key in optional_arrays) for call in value_calls)
     source = D.device_ir_to_tirx(mod)
     assert "tt__compute_kind" in source
     assert "tt.compute_kind=" not in source

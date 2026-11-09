@@ -69,7 +69,7 @@ def test_future_value_reference_is_rejected():
 
     def edit(call):
         nonlocal changed
-        if not changed and call.op.name == "tl.tt.compute_value" and len(call.annotations["tt.value_inputs"]):
+        if not changed and call.op.name == "tl.tt.compute_value" and len(call.annotations.get("tt.value_inputs", [])):
             changed = True
             attrs = dict(call.annotations)
             attrs["tt.value_inputs"] = [tirx.IntImm("int64", future)]

@@ -52,7 +52,7 @@ def test_cross_core_value_operand_is_rejected_without_mutation():
 
     def edit(call):
         nonlocal changed
-        if changed or call.op.name != "tl.tt.compute_value" or not len(call.annotations["tt.value_inputs"]):
+        if changed or call.op.name != "tl.tt.compute_value" or not len(call.annotations.get("tt.value_inputs", [])):
             return None
         changed = True
         remote = next(identifier for identifier, core in owners.items() if core == 1)
@@ -219,7 +219,7 @@ def test_pipeline_value_cannot_resurrect_released_previous_epoch():
 
     def edit(call):
         nonlocal first, changed
-        if call.op.name != "tl.tt.compute_value" or not len(call.annotations["tt.value_inputs"]):
+        if call.op.name != "tl.tt.compute_value" or not len(call.annotations.get("tt.value_inputs", [])):
             return None
         if first is None:
             first = int(call.args[0])

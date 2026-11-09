@@ -3009,6 +3009,21 @@ class TransientDeviceAnnotationRemover : public StmtExprMutator {
       annotations.erase("tt.compute_dtype");
       annotations.erase("tt.compute_tile_shape");
       annotations.erase("tt.logical_domain");
+      auto input_shapes = annotations.Get("tt.input_shapes")
+                              .value_or(ffi::Array<ffi::Array<PrimExpr>>())
+                              .as<ffi::Array<ffi::Array<PrimExpr>>>();
+      if (input_shapes.has_value() && input_shapes.value().empty())
+        annotations.erase("tt.input_shapes");
+      auto value_inputs = annotations.Get("tt.value_inputs")
+                              .value_or(ffi::Array<PrimExpr>())
+                              .as<ffi::Array<PrimExpr>>();
+      if (value_inputs.has_value() && value_inputs.value().empty())
+        annotations.erase("tt.value_inputs");
+      auto value_shapes = annotations.Get("tt.value_input_shapes")
+                              .value_or(ffi::Array<ffi::Array<PrimExpr>>())
+                              .as<ffi::Array<ffi::Array<PrimExpr>>>();
+      if (value_shapes.has_value() && value_shapes.value().empty())
+        annotations.erase("tt.value_input_shapes");
     }
     return Call(call->dtype, call->op, call->args, annotations, call->span);
   }

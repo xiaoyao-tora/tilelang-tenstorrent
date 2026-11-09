@@ -106,7 +106,7 @@ def test_value_geometry_proof_ids_cannot_be_used_as_real_dfbs():
 
     def edit(call):
         nonlocal changed
-        if changed or call.op.name != "tl.tt.compute_value" or not len(call.annotations["tt.value_inputs"]):
+        if changed or call.op.name != "tl.tt.compute_value" or not len(call.annotations.get("tt.value_inputs", [])):
             return None
         changed = True
         attrs = dict(call.annotations)

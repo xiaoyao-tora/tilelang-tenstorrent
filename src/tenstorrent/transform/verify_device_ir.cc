@@ -1521,6 +1521,10 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
       }
       attrs.Set("tt.value_input_shapes", value_shapes);
     }
+    if (!attrs.count("tt.value_inputs"))
+      attrs.Set("tt.value_inputs", ffi::Array<PrimExpr>());
+    if (!attrs.count("tt.input_shapes"))
+      attrs.Set("tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>());
   }
   auto input_attr = attrs.Get("tt.value_inputs");
   auto maps_attr = attrs.Get("tt.value_access_maps");
