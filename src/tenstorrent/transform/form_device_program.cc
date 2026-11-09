@@ -266,9 +266,16 @@ struct ResourceVersion {
   ffi::String producer;
   ffi::String consumer;
   ffi::Optional<TensorBacking> backing;
+  ffi::String storage_identity;
   int64_t generation{0};
   int64_t pool{-1};
   int64_t iteration{-1};
+};
+
+struct SerialIterationContext {
+  size_t value_begin;
+  size_t loop_resource_begin;
+  size_t iteration_resource_begin;
 };
 
 class DeviceExpressionRewriter : public StmtExprMutator {
@@ -476,8 +483,10 @@ public:
     if (id < 0 || id >= static_cast<int64_t>(resources_.size()))
       ThrowMalformed("resource storage identity index is out of range");
     const ResourceVersion &resource = resources_[id];
-    return std::string(resource.metadata->buffer_id) + "|" +
-           std::string(resource.producer) + "|" +
+    const ffi::String &identity = resource.storage_identity.empty()
+                                      ? resource.metadata->buffer_id
+                                      : resource.storage_identity;
+    return std::string(identity) + "|" + std::string(resource.producer) + "|" +
            std::string(resource.consumer);
   }
   bool ResourceIsLive(int64_t id) const { return live_.count(id) != 0; }
@@ -863,11 +872,21 @@ public:
           RequirePositiveStaticInteger(loop->extent, "serial loop extent");
       if (extent > 1024)
         ThrowUnsupported("serial loop extent exceeds 1024");
+      bool previous_materialization = stable_loop_materializations_;
+      stable_loop_materializations_ = true;
+      size_t loop_resource_begin = resources_.size();
       for (int64_t i = 0; i < extent; ++i) {
+        size_t iteration_resource_begin = resources_.size();
+        if (i)
+          serial_iterations_.push_back(
+              {values_.size(), loop_resource_begin, iteration_resource_begin});
         StaticIterationSubstituter substitute(
             loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + i));
         PlanImpl(substitute(loop->body));
+        if (i)
+          serial_iterations_.pop_back();
       }
+      stable_loop_materializations_ = previous_materialization;
       return;
     }
     if (const auto *branch = stmt.as<IfThenElseNode>()) {
@@ -1274,7 +1293,8 @@ private:
         MakeDeviceCall(tenstorrent::dfb_reserve(), {Integer(id)}, span));
   }
 
-  int64_t ReadValue(const Buffer &buffer) const {
+  int64_t ReadValue(const Buffer &buffer, const Span &span,
+                    bool snapshot_loop_carry = true) {
     auto found = current_values_.find(buffer->data);
     if (found == current_values_.end())
       ThrowMalformed("fragment read-before-definition for buffer '" +
@@ -1283,11 +1303,28 @@ private:
       ThrowUnsupported("T.Pipelined fragment '" + std::string(buffer->name) +
                        "' carries a value across iterations; bounded prefetch "
                        "requires independently initialized fragment values");
-    const Buffer &defined = values_[found->second]->buffer;
+    int64_t value = found->second;
+    const Buffer &defined = values_[value]->buffer;
     if (defined->dtype != buffer->dtype ||
         !ffi::StructuralEqual()(defined->shape, buffer->shape))
       ThrowMalformed("fragment alias must preserve shape and dtype");
-    return found->second;
+    for (auto context = serial_iterations_.rbegin();
+         snapshot_loop_carry && context != serial_iterations_.rend();
+         ++context) {
+      if (value >= static_cast<int64_t>(context->value_begin))
+        continue;
+      bool borrows_loop_resource = std::any_of(
+          value_dfb_sources_[value].begin(), value_dfb_sources_[value].end(),
+          [&](int64_t resource) {
+            return resource >=
+                       static_cast<int64_t>(context->loop_resource_begin) &&
+                   resource <
+                       static_cast<int64_t>(context->iteration_resource_begin);
+          });
+      if (borrows_loop_resource)
+        return SnapshotLoopCarriedValue(value, span);
+    }
+    return value;
   }
 
   int64_t DefineValue(const Buffer &buffer, int64_t accumulator,
@@ -1300,6 +1337,7 @@ private:
         id, buffer, version, previous, accumulator,
         RequireSourceSpan(span, frontend_->span, "compute value")));
     value_roots_.push_back({});
+    value_dfb_sources_.push_back({});
     if (accumulator >= 0)
       value_roots_.back().insert(accumulator);
     current_values_[buffer->data] = id;
@@ -1309,22 +1347,56 @@ private:
   int64_t
   MakeValueStorage(const Buffer &buffer, const Span &span,
                    ffi::Optional<TensorBacking> backing = std::nullopt) {
-    Buffer storage = decl_buffer(buffer->shape, buffer->dtype,
-                                 buffer->name + "_materialized", "shared",
-                                 std::nullopt, span);
+    int64_t id = resources_.size();
+    int64_t site_id = id;
+    ffi::String storage_identity;
+    if (stable_loop_materializations_) {
+      auto source = metadata_.find(buffer);
+      Span fallback = source == metadata_.end() ? buffer->span
+                                                : source->second->source_span;
+      Span source_span =
+          RequireSourceSpan(span, fallback, "compute materialization site");
+      std::string site_key =
+          source == metadata_.end()
+              ? "synthetic." + std::string(buffer->name) + "." +
+                    std::to_string(buffer->dtype.code()) + "." +
+                    std::to_string(buffer->dtype.bits()) + "." +
+                    std::to_string(buffer->dtype.lanes()) + "." +
+                    std::to_string(buffer->shape.size())
+              : std::string(source->second->buffer_id);
+      site_key += "|";
+      if (source_span->source_name.defined())
+        site_key += std::string(source_span->source_name->name);
+      site_key += ":" + std::to_string(source_span->line) + ":" +
+                  std::to_string(source_span->column) + ":" +
+                  std::to_string(source_span->end_line) + ":" +
+                  std::to_string(source_span->end_column) + "|" +
+                  (backing.has_value() ? "tensor" : "local");
+      site_id =
+          materialization_sites_
+              .emplace(site_key,
+                       static_cast<int64_t>(materialization_sites_.size()))
+              .first->second;
+      storage_identity =
+          "compute.materialization.site." + std::to_string(site_id);
+    }
+    Buffer storage =
+        decl_buffer(buffer->shape, buffer->dtype,
+                    buffer->name + "_materialized_" + std::to_string(site_id),
+                    "shared", std::nullopt, span);
     ffi::Array<PrimExpr> grid;
     for (const PrimExpr &extent : buffer->shape)
       grid.push_back(Integer((RequirePositiveStaticInteger(
                                   extent, "compute materialization extent") +
                               31) /
                              32));
-    int64_t id = resources_.size();
     TTBufferMetadata metadata(
         "compute.materialization." + std::to_string(id), storage,
         "logical_dfb_candidate", std::nullopt, {Integer(32), Integer(32)}, grid,
         "interleaved", std::nullopt, Integer(1), std::nullopt, std::nullopt,
         "inferred", "inferred", "inferred", "inferred", span);
     resources_.push_back({metadata, "trisc", "", backing});
+    resources_.back().storage_identity = storage_identity;
     resources_.back().generation = generations_[buffer->data]++;
     return id;
   }
@@ -1343,9 +1415,36 @@ private:
     return id;
   }
 
+  int64_t SnapshotLoopCarriedValue(int64_t old, const Span &span) {
+    int64_t storage = MaterializeValue(old, span);
+    const Buffer buffer = values_[old]->buffer;
+    int64_t value = DefineValue(buffer, values_[old]->accumulator_id, span);
+    value_roots_[value] = value_roots_[old];
+    value_dfb_sources_[value].insert(storage);
+    ffi::Map<ffi::String, ffi::ObjectRef> attrs{
+        {"tt.compute_kind", StringImm("elementwise")},
+        {"tt.compute_dtype",
+         StringImm(buffer->dtype == DataType::Float(32) ? "float32"
+                                                        : "bfloat16")},
+        {"tt.compute_tile_shape",
+         ffi::Array<PrimExpr>{Integer(32), Integer(32)}},
+        {"tt.logical_domain", buffer->shape},
+        {"tt.expression",
+         Call(buffer->dtype, dfb_load(), {Integer(storage)}, {}, span)},
+        {"tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>{buffer->shape}},
+        {"tt.value_inputs", ffi::Array<Integer>()},
+        {"tt.value_input_shapes", ffi::Array<ffi::Array<PrimExpr>>()}};
+    Wait(&compute_, storage, span);
+    compute_.push_back(
+        Evaluate(Call(DataType::Void(), compute_value(),
+                      {Integer(value), Integer(storage)}, attrs, span),
+                 span));
+    return value;
+  }
+
   int64_t ReadDFBOperand(const Buffer &buffer, const Span &span) {
     if (buffer.scope() == "local.fragment")
-      return MaterializeValue(ReadValue(buffer), span);
+      return MaterializeValue(ReadValue(buffer, span), span);
     return Read(buffer, "trisc");
   }
 
@@ -1444,10 +1543,13 @@ private:
         Downcast<Integer>(call->annotations.at("tt.transpose_a"))->value;
     int64_t tb =
         Downcast<Integer>(call->annotations.at("tt.transpose_b"))->value;
-    int64_t old = ReadValue(buffer);
+    int64_t old = ReadValue(buffer, call->span, /*snapshot_loop_carry=*/false);
     int64_t value = DefineValue(buffer, accumulator, call->span);
     value_roots_[value] = value_roots_[old];
     value_roots_[value].insert(accumulator);
+    value_dfb_sources_[value] = value_dfb_sources_[old];
+    value_dfb_sources_[value].insert(a);
+    value_dfb_sources_[value].insert(b);
     if (lhs->buffer->dtype != state.input_dtype ||
         rhs->buffer->dtype != state.input_dtype)
       ThrowMalformed("GEMM inputs disagree with accumulator dtype contract");
@@ -1508,6 +1610,7 @@ private:
       int64_t value =
           DefineValue(buffer, values_[old]->accumulator_id, call->span);
       value_roots_[value] = value_roots_[old];
+      value_dfb_sources_[value].insert(dfb);
       ffi::Map<ffi::String, ffi::ObjectRef> attrs{
           {"tt.compute_kind", StringImm("elementwise")},
           {"tt.compute_dtype",
@@ -1579,6 +1682,7 @@ private:
         dfb_inputs, local_inputs;
     bool dfb_only = kind == "gemm" || kind == "transpose" || kind == "reduce";
     std::unordered_set<int64_t> roots;
+    std::unordered_set<int64_t> dfb_sources;
     for (size_t index = 1; index < call->args.size(); ++index) {
       BufferRegion input =
           NormalizeToAccessRegion(call->args[index], kAccessRead).region;
@@ -1588,11 +1692,13 @@ private:
       for (const Range &range : input->region)
         input_shape.push_back(range->extent);
       if (input->buffer.scope() == "local.fragment" && !dfb_only) {
-        int64_t value = ReadValue(input->buffer);
+        int64_t value = ReadValue(input->buffer, call->span);
         local_inputs.emplace(input->buffer, value);
         value_inputs.push_back(Integer(value));
         value_shapes.push_back(input_shape);
         roots.insert(value_roots_[value].begin(), value_roots_[value].end());
+        dfb_sources.insert(value_dfb_sources_[value].begin(),
+                           value_dfb_sources_[value].end());
       } else {
         int64_t id = ReadDFBOperand(input->buffer, call->span);
         dfb_inputs.emplace(input->buffer, id);
@@ -1600,6 +1706,7 @@ private:
         dfb_shapes.push_back(input_shape);
         const auto &input_roots = dfb_roots_[id];
         roots.insert(input_roots.begin(), input_roots.end());
+        dfb_sources.insert(id);
         Wait(&compute_, id, call->span);
       }
     }
@@ -1657,6 +1764,8 @@ private:
                                          {Integer(value), Integer(storage)},
                                          load_attrs, call->span),
                                     call->span));
+        materialized_values_[value] = storage;
+        value_dfb_sources_[value].insert(storage);
         return;
       }
       ffi::Array<PrimExpr> args{Integer(value)};
@@ -1665,6 +1774,7 @@ private:
       compute_.push_back(Evaluate(
           Call(DataType::Void(), compute_value(), args, attrs, call->span),
           call->span));
+      value_dfb_sources_[value] = std::move(dfb_sources);
       return;
     }
     int64_t output_id;
@@ -2398,11 +2508,15 @@ private:
   bool has_accumulator_compute_{false};
   bool precision_regions_{false};
   int precision_mode_{-1};
+  bool stable_loop_materializations_{false};
   ffi::Array<ComputeValueDescriptor> values_;
   std::vector<std::unordered_set<int64_t>> value_roots_;
+  std::vector<std::unordered_set<int64_t>> value_dfb_sources_;
   std::unordered_map<int64_t, std::unordered_set<int64_t>> dfb_roots_;
   std::unordered_map<Var, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       current_values_;
+  std::map<std::string, int64_t> materialization_sites_;
+  std::vector<SerialIterationContext> serial_iterations_;
   std::unordered_map<int64_t, int64_t> materialized_values_;
   std::vector<AccumulatorLifetime> accumulators_;
   std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
@@ -2638,13 +2752,10 @@ public:
         call->op.same_as(tenstorrent::dfb_pipe_wait_record());
     if (annotate_streams_ && stream_lifecycle &&
         !referenced_resources.empty()) {
-      std::string identity;
-      for (int64_t resource : referenced_resources) {
-        if (!identity.empty())
-          identity += ",";
-        identity += std::to_string(resource);
-      }
-      annotations.Set("tt.stream_identity", StringImm(identity));
+      ffi::Array<Integer> identity;
+      for (int64_t resource : referenced_resources)
+        identity.push_back(Integer(resource));
+      annotations.Set("tt.stream_identity", identity);
     }
     return Call(call->dtype, call->op, args, annotations, op->span);
   }
@@ -3074,46 +3185,53 @@ ffi::Map<ffi::String, Integer> PlanNonPipelineStorageGroups(
       int64_t capacity = RequirePositiveStaticInteger(
           descriptors.at(resource)->block_count, "DFB storage capacity");
       bool assigned = false;
-      if (!schedule.repeated_resources.count(resource)) {
-        for (size_t group_index : local_groups) {
-          Group &group = groups[group_index];
-          if (group.capacity != capacity)
+      bool repeated = schedule.repeated_resources.count(resource);
+      for (size_t group_index : local_groups) {
+        Group &group = groups[group_index];
+        if (group.capacity != capacity)
+          continue;
+        bool same_repetition = std::all_of(
+            group.resources.begin(), group.resources.end(), [&](int64_t value) {
+              return schedule.repeated_resources.count(value) == repeated;
+            });
+        if (!same_repetition)
+          continue;
+        if (repeated) {
+          bool closed = releases.count(resource) && reserves.count(resource);
+          for (int64_t value : group.resources)
+            closed &= releases.count(value) && reserves.count(value);
+          if (!closed)
             continue;
-          bool valid_order =
-              std::all_of(group.resources.begin(), group.resources.end(),
-                          [&](int64_t previous) {
-                            return fifo_ordered(previous, resource);
-                          });
-          if (!valid_order)
+        }
+        bool valid_order = std::all_of(
+            group.resources.begin(), group.resources.end(),
+            [&](int64_t previous) { return fifo_ordered(previous, resource); });
+        if (!valid_order)
+          continue;
+        std::vector<std::pair<int64_t, int64_t>> added_edges;
+        if (group.resources.size() >= static_cast<size_t>(capacity)) {
+          int64_t previous = group.resources[group.resources.size() - capacity];
+          auto old_releases = releases.find(previous);
+          auto next_reserves = reserves.find(resource);
+          if (old_releases == releases.end() || next_reserves == reserves.end())
             continue;
-          std::vector<std::pair<int64_t, int64_t>> added_edges;
-          if (group.resources.size() >= static_cast<size_t>(capacity)) {
-            int64_t previous =
-                group.resources[group.resources.size() - capacity];
-            auto old_releases = releases.find(previous);
-            auto next_reserves = reserves.find(resource);
-            if (old_releases == releases.end() ||
-                next_reserves == reserves.end())
-              continue;
-            for (const auto &[core, release] : old_releases->second) {
-              auto reserve = next_reserves->second.find(core);
-              if (reserve != next_reserves->second.end()) {
-                schedule.successors[release].push_back(reserve->second);
-                added_edges.emplace_back(release, reserve->second);
-              }
-            }
-            if (!IsAcyclic(schedule.successors)) {
-              for (auto it = added_edges.rbegin(); it != added_edges.rend();
-                   ++it)
-                schedule.successors[it->first].pop_back();
-              continue;
+          for (const auto &[core, release] : old_releases->second) {
+            auto reserve = next_reserves->second.find(core);
+            if (reserve != next_reserves->second.end()) {
+              schedule.successors[release].push_back(reserve->second);
+              added_edges.emplace_back(release, reserve->second);
             }
           }
-          group.resources.push_back(resource);
-          assignments.Set(std::to_string(resource), Integer(group.id));
-          assigned = true;
-          break;
+          if (!IsAcyclic(schedule.successors)) {
+            for (auto it = added_edges.rbegin(); it != added_edges.rend(); ++it)
+              schedule.successors[it->first].pop_back();
+            continue;
+          }
         }
+        group.resources.push_back(resource);
+        assignments.Set(std::to_string(resource), Integer(group.id));
+        assigned = true;
+        break;
       }
       if (!assigned) {
         int64_t group_id = groups.size();

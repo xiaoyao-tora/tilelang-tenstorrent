@@ -1418,7 +1418,8 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
                            const ComputeValueTable &values,
                            const std::set<int64_t> &defined,
                            const BoundVars *bound_vars = nullptr,
-                           int64_t core_x = -1, int64_t core_y = -1) {
+                           int64_t core_x = -1, int64_t core_y = -1,
+                           bool allow_stream_inplace = false) {
   arith::Analyzer analyzer;
   auto static_integer = [&](const PrimExpr &value, const char *label) {
     PrimExpr bound = value;
@@ -1494,7 +1495,7 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
   auto maps_attr = attrs.Get("tt.value_access_maps");
   auto shapes_attr = attrs.Get("tt.value_input_shapes");
   if (!local_output && !input_attr.has_value() && !shapes_attr.has_value()) {
-    VerifyGeneralCompute(call, dfbs, bound_vars);
+    VerifyGeneralCompute(call, dfbs, bound_vars, allow_stream_inplace);
     return;
   }
   Check(input_attr.has_value() && shapes_attr.has_value(),
@@ -1570,7 +1571,7 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
   }
   VerifyGeneralCompute(
       Call(call->dtype, dfb_compute(), args, attrs, call->span), proof,
-      bound_vars);
+      bound_vars, allow_stream_inplace);
 }
 
 class ComputeValueVerifier {
@@ -1729,6 +1730,7 @@ public:
     stored_values_.clear();
     dfb_roots_.clear();
     active_dfb_transactions_.clear();
+    published_dfb_transactions_.clear();
     released_dfb_transactions_.clear();
     current_core_x_ = x;
     current_core_y_ = y;
@@ -1788,6 +1790,9 @@ public:
   void AcquireDFB(int64_t id, int64_t transaction) {
     active_dfb_transactions_[id] = transaction;
   }
+  void PublishDFB(int64_t id, int64_t transaction) {
+    published_dfb_transactions_[id] = transaction;
+  }
   void ReleaseDFB(int64_t id, int64_t transaction) {
     released_dfb_transactions_.insert({id, transaction});
     auto active = active_dfb_transactions_.find(id);
@@ -1815,7 +1820,7 @@ public:
                                         "compute value input ID"));
     }
     VerifyValueExpression(call, dfbs, values_, defined_, &bound_loop_vars_,
-                          current_core_x_, current_core_y_);
+                          current_core_x_, current_core_y_, current_device_);
     std::set<int64_t> roots;
     std::map<int64_t, int64_t> completed_k;
     auto inputs = call->annotations.Get("tt.value_inputs");
@@ -1846,7 +1851,8 @@ public:
       Check(active_dfb_transactions_.count(input),
             "compute value reads DFB without an active acquisition");
       source_transactions.insert({input, active_dfb_transactions_.at(input)});
-      auto found = dfb_roots_.find(input);
+      DFBTransaction transaction{input, active_dfb_transactions_.at(input)};
+      auto found = dfb_roots_.find(transaction);
       if (found != dfb_roots_.end()) {
         for (int64_t root : found->second) {
           roots.insert(root);
@@ -1897,20 +1903,28 @@ public:
                   RequireStaticInteger(arith::Analyzer().Simplify(input),
                                        "compute value input ID") ==
                   entry->previous_value_id;
-          // Reentry is an identity load of the exact preceding version's
-          // completed snapshot, never an untyped relabeling across DST modes.
-          if (precision_regions_ && call->args.size() == 2) {
-            int64_t source = static_integer(call->args[1], "reentry DFB");
-            auto expression = call->annotations.Get("tt.expression");
-            const auto *load = expression.has_value()
-                                   ? expression.value().as<CallNode>()
-                                   : nullptr;
-            reads_previous |=
-                stored_values_.count(source) &&
-                stored_values_.at(source) == entry->previous_value_id && load &&
-                load->op.same_as(dfb_load()) && load->args.size() == 1 &&
-                static_integer(load->args[0], "reentry DFB") == source;
-          }
+          // An exact completed DFB snapshot may carry the preceding value
+          // across a structured-loop iteration or precision boundary.
+          auto expression = call->annotations.Get("tt.expression");
+          if (expression.has_value())
+            PostOrderVisit(Downcast<PrimExpr>(expression.value()),
+                           [&](const ffi::ObjectRef &object) {
+                             const auto *load = object.as<CallNode>();
+                             if (!load || !load->op.same_as(dfb_load()) ||
+                                 load->args.size() != 1)
+                               return;
+                             int64_t source = static_integer(
+                                 load->args[0], "compute-value snapshot DFB");
+                             Check(active_dfb_transactions_.count(source),
+                                   "compute-value snapshot has no active "
+                                   "transaction");
+                             DFBTransaction transaction{
+                                 source, active_dfb_transactions_.at(source)};
+                             reads_previous |=
+                                 stored_values_.count(transaction) &&
+                                 stored_values_.at(transaction) ==
+                                     entry->previous_value_id;
+                           });
           Check(
               reads_previous,
               "accumulator elementwise update must read its previous version");
@@ -1931,7 +1945,9 @@ public:
                     input->second == occurrence->second,
                 "compute value crosses pipeline iterations after release");
         }
-      dfb_roots_[output] = roots;
+      Check(published_dfb_transactions_.count(output),
+            "DFB provenance output has no active transaction");
+      dfb_roots_[{output, published_dfb_transactions_.at(output)}] = roots;
     }
     return sources;
   }
@@ -2025,22 +2041,24 @@ public:
           "compute value materialization must preserve dtype");
     VerifyTileGrid(value->buffer->shape, dfbs.at(id)->block_shape_in_tiles,
                    "compute value store");
-    stored_values_[id] = value->value_id;
+    Check(published_dfb_transactions_.count(id),
+          "compute value store has no active output transaction");
+    DFBTransaction transaction{id, published_dfb_transactions_.at(id)};
+    stored_values_[transaction] = value->value_id;
     for (const auto &[root, count] : value_k_.at(value->value_id)) {
       Check(count == accumulators_.at(root)->full_k_tiles,
             "GEMM materialization precedes complete K reduction");
-      dfb_roots_[id].insert(root);
+      dfb_roots_[transaction].insert(root);
     }
     return sources_.at(value->value_id);
   }
   void Export(int64_t id, DataType dtype) const {
-    auto found = dfb_roots_.find(id);
-    if (found == dfb_roots_.end())
-      return;
-    for (int64_t root : found->second)
-      Check(accumulators_.at(root)->output_dtype == dtype,
-            "GEMM final output dtype disagrees with accumulator capability "
-            "registry");
+    for (const auto &[transaction, roots] : dfb_roots_)
+      if (transaction.first == id)
+        for (int64_t root : roots)
+          Check(accumulators_.at(root)->output_dtype == dtype,
+                "GEMM final output dtype disagrees with accumulator capability "
+                "registry");
   }
   void Finish() const {
     if (!enabled_)
@@ -2064,7 +2082,7 @@ private:
   bool precision_regions_{false};
   int64_t precision_epoch_{0};
   std::map<int64_t, int64_t> value_epochs_;
-  std::map<int64_t, int64_t> stored_values_;
+  std::map<DFBTransaction, int64_t> stored_values_;
   PrimFunc function_;
   std::map<int64_t, PrimFunc> owners_;
   std::map<int64_t, PrimFunc> accumulator_owners_;
@@ -2076,8 +2094,9 @@ private:
   std::map<int64_t, std::map<int64_t, int64_t>> value_k_;
   std::map<int64_t, std::set<int64_t>> sources_;
   std::map<int64_t, std::set<DFBTransaction>> source_transactions_;
-  std::map<int64_t, std::set<int64_t>> dfb_roots_;
+  std::map<DFBTransaction, std::set<int64_t>> dfb_roots_;
   std::map<int64_t, int64_t> active_dfb_transactions_;
+  std::map<int64_t, int64_t> published_dfb_transactions_;
   std::set<DFBTransaction> released_dfb_transactions_;
   std::map<int64_t, int64_t> pipeline_iterations_;
   BoundVars bound_loop_vars_;
@@ -4671,6 +4690,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             if (partial)
               producer->second = event;
             entry.produced = true;
+            if (compute_values.Enabled())
+              compute_values.PublishDFB(resource, std::get<3>(key));
             const DFBDescriptor &descriptor = dfb_table.at(resource);
             if (descriptor->producer_slot == owner &&
                 descriptor->consumer_slot == owner) {

@@ -199,6 +199,80 @@ def straight_line_in_place_reuse(
         T.copy(value, C)
 
 
+def make_stateful_serial_update(iterations):
+    @T.prim_func
+    def stateful_serial_update(
+        A: T.Tensor((32, 32), "float32"),
+        C: T.Tensor((32, 32), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=1):
+            value = T.alloc_shared(
+                (32, 32),
+                "float32",
+                annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 1},
+            )
+            T.copy(A, value)
+            for _ in T.serial(iterations):
+                for i, j in T.Tiles(value):
+                    value[i, j] = value[i, j] + T.float32(1)
+            T.copy(value, C)
+
+    return stateful_serial_update
+
+
+def make_loop_carried_fragment_update(iterations):
+    @T.prim_func
+    def loop_carried_fragment_update(
+        A: T.Tensor((iterations * 32, 32), "float32"),
+        C: T.Tensor((32, 32), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=1):
+            panel = T.alloc_shared(
+                (32, 32),
+                "float32",
+                annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 1},
+            )
+            state = T.alloc_fragment((32, 32), "float32")
+            T.clear(state)
+            for step in T.serial(iterations):
+                T.copy(A[step * 32 : step * 32 + 32, 0:32], panel)
+                for i, j in T.Tiles(state):
+                    state[i, j] = state[i, j] + panel[i, j]
+            T.copy(state, C)
+
+    return loop_carried_fragment_update
+
+
+def test_stateful_serial_loop_uses_extent_invariant_device_resources_and_body():
+    modules = [lower(make_stateful_serial_update(iterations)) for iterations in (8, 16, 32)]
+    assert [len(mod.attrs["tt.dfb_storage_groups"]) for mod in modules] == [4, 4, 4]
+    assert all("tt.compute_value_families" not in mod.attrs for mod in modules)
+
+    trisc_functions = [
+        next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc") for mod in modules
+    ]
+    assert all(_compact_loop_names(mod) for mod in modules)
+    assert all(not _dynamic_dfb_operands(mod) for mod in modules)
+    assert len({_body_counts(function)["evaluate"] for function in trisc_functions}) == 1
+    script_sizes = [len(function.script()) for function in trisc_functions]
+    assert max(script_sizes) - min(script_sizes) <= 1
+
+
+def test_loop_carried_fragment_snapshots_are_extent_invariant():
+    modules = [lower(make_loop_carried_fragment_update(iterations)) for iterations in (8, 16, 32)]
+    group_counts = [len(mod.attrs["tt.dfb_storage_groups"]) for mod in modules]
+    assert len(set(group_counts)) == 1
+    assert all(not _dynamic_dfb_operands(mod) for mod in modules)
+
+    trisc_functions = [
+        next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc") for mod in modules
+    ]
+    assert all(any(call.op.name == "tl.tt.compute_value_store" for call in calls(function.body)) for function in trisc_functions)
+    assert len({_body_counts(function)["evaluate"] for function in trisc_functions}) == 1
+    script_sizes = [len(function.script()) for function in trisc_functions]
+    assert max(script_sizes) - min(script_sizes) <= 1
+
+
 def test_single_slot_in_place_update_uses_logical_streams():
     mod = lower(single_slot_in_place)
     dfbs = list(expanded(mod).attrs["tt.dfb_table"])
@@ -870,11 +944,7 @@ def test_flash_attention_core_and_kv_repetition_remain_parameterized():
         (2, 8, 1),
         (2, 8, 1),
     ]
-    assert [len(mod.attrs["tt.dfb_storage_groups"]) for mod in modules] == [
-        27,
-        38,
-        38,
-    ]
+    assert [len(mod.attrs["tt.dfb_storage_groups"]) for mod in modules] == [15, 16, 16]
     for mod in modules:
         assert "tt.storage_group_statements_specialized" not in mod.attrs
         assert not _dynamic_dfb_operands(mod)
@@ -911,7 +981,7 @@ def test_mixed_precision_flash_uses_full_fp32_accumulation():
     requirements = trisc.attrs["tt.compute_requirements"]
     assert str(requirements.destination_width) == "bits32_required"
     assert str(requirements.matmul_full_fp32) == "required"
-    assert len(mod.attrs["tt.dfb_storage_groups"]) == 31
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == 17
 
 
 def test_all_bf16_flash_uses_bf16_constants_and_destination():
@@ -940,4 +1010,4 @@ def test_all_bf16_flash_uses_bf16_constants_and_destination():
     requirements = trisc.attrs["tt.compute_requirements"]
     assert str(requirements.destination_width) == "bits16_required"
     assert str(requirements.matmul_full_fp32) == "forbidden"
-    assert len(mod.attrs["tt.dfb_storage_groups"]) == 27
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == 15

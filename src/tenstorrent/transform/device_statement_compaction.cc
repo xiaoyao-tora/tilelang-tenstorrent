@@ -23,11 +23,15 @@
 namespace tvm {
 namespace tl {
 namespace tenstorrent {
+static tirx::Stmt
+CompactGeneratedDeviceStatementsRecursive(const tirx::Stmt &body);
 namespace {
 using namespace tirx;
 
 constexpr int64_t kMaxExpansion = 4000000;
 constexpr size_t kMaxBlock = 4096;
+
+std::vector<size_t> DFBOperandPositions(const Call &call);
 
 [[noreturn]] void Invalid(const char *message) {
   TVM_FFI_THROW(ValueError) << "[TenstorrentDeviceStatements] " << message;
@@ -249,6 +253,61 @@ bool SameSkeleton(const ffi::Any &a, const ffi::Any &b,
     if (!(map && i % 2 == 0
               ? ScalarEqual(lhs[i], rhs[i])
               : SameSkeleton(lhs[i], rhs[i], semantic_core_locals)))
+      return false;
+  return true;
+}
+
+bool SameDFBOperands(const Stmt &left, const Stmt &right) {
+  auto collect = [](const Stmt &statement) {
+    std::vector<PrimExpr> operands;
+    PostOrderVisit(statement, [&](const ffi::ObjectRef &object) {
+      const auto *node = object.as<CallNode>();
+      if (!node)
+        return;
+      Call call = ffi::GetRef<Call>(node);
+      for (size_t position : DFBOperandPositions(call)) {
+        if (position >= call->args.size())
+          Invalid("Device DFB operation is missing an operand");
+        operands.push_back(call->args[position]);
+      }
+    });
+    return operands;
+  };
+  std::vector<PrimExpr> lhs = collect(left), rhs = collect(right);
+  if (lhs.size() != rhs.size())
+    return false;
+  for (size_t index = 0; index < lhs.size(); ++index)
+    if (!ffi::StructuralEqual()(lhs[index], rhs[index]))
+      return false;
+  return true;
+}
+
+bool SameControlIdentities(const Stmt &left, const Stmt &right) {
+  struct Signature {
+    std::vector<PrimExpr> predicates;
+    std::vector<ffi::ObjectRef> annotations;
+  };
+  auto collect = [](const Stmt &statement) {
+    Signature signature;
+    PostOrderVisit(statement, [&](const ffi::ObjectRef &object) {
+      if (const auto *branch = object.as<IfThenElseNode>())
+        signature.predicates.push_back(branch->condition);
+      else if (const auto *realize = object.as<SBlockRealizeNode>())
+        signature.predicates.push_back(realize->predicate);
+      else if (const auto *block = object.as<SBlockNode>())
+        signature.annotations.push_back(block->annotations);
+    });
+    return signature;
+  };
+  Signature lhs = collect(left), rhs = collect(right);
+  if (lhs.predicates.size() != rhs.predicates.size() ||
+      lhs.annotations.size() != rhs.annotations.size())
+    return false;
+  for (size_t index = 0; index < lhs.predicates.size(); ++index)
+    if (!ffi::StructuralEqual()(lhs.predicates[index], rhs.predicates[index]))
+      return false;
+  for (size_t index = 0; index < lhs.annotations.size(); ++index)
+    if (!ffi::StructuralEqual()(lhs.annotations[index], rhs.annotations[index]))
       return false;
   return true;
 }
@@ -630,7 +689,7 @@ void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
   }
   if (!parameterized.has_value())
     Invalid("singleton Core body could not be parameterized");
-  Stmt body = CompactDeviceStatementsRecursive(parameterized.value());
+  Stmt body = CompactGeneratedDeviceStatementsRecursive(parameterized.value());
   Span span = body->span.defined() ? body->span : fallback_span;
   CoreDomain domain(CoreCoord(rectangle.begin_x, rectangle.begin_y),
                     CoreCoord(rectangle.end_x, rectangle.end_y));
@@ -867,7 +926,13 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
         const auto &second = info[begin + length + j].integers;
         if (first.size() != second.size() ||
             !SameSkeleton(statements[begin + j], statements[begin + length + j],
-                          semantic_core_locals)) {
+                          semantic_core_locals) ||
+            (semantic_core_locals &&
+             !SameDFBOperands(statements[begin + j],
+                              statements[begin + length + j])) ||
+            (semantic_core_locals &&
+             !SameControlIdentities(statements[begin + j],
+                                    statements[begin + length + j]))) {
           valid = false;
           break;
         }
@@ -895,7 +960,14 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
           if (first.size() != current.size() ||
               !SameSkeleton(statements[begin + j],
                             statements[begin + repeats * length + j],
-                            semantic_core_locals)) {
+                            semantic_core_locals) ||
+              (semantic_core_locals &&
+               !SameDFBOperands(statements[begin + j],
+                                statements[begin + repeats * length + j])) ||
+              (semantic_core_locals &&
+               !SameControlIdentities(
+                   statements[begin + j],
+                   statements[begin + repeats * length + j]))) {
             valid = false;
             break;
           }
@@ -952,28 +1024,40 @@ Stmt CompactDeviceStatements(const Stmt &body) {
 
 namespace {
 class NestedDeviceStatementCompactor : public StmtMutator {
+public:
+  explicit NestedDeviceStatementCompactor(bool semantic_core_locals)
+      : semantic_core_locals_(semantic_core_locals) {}
+
+private:
   Stmt VisitStmt_(const ForNode *op) final {
     For loop = ffi::GetRef<For>(op);
-    Stmt body = CompactDeviceStatementsRecursive(op->body);
+    Stmt body = CompactDeviceStatementsImpl(op->body, semantic_core_locals_);
+    body = NestedDeviceStatementCompactor(semantic_core_locals_)(body);
     if (body.same_as(op->body))
       return loop;
     loop.CopyOnWrite()->body = std::move(body);
     return loop;
   }
+
+  bool semantic_core_locals_;
 };
 } // namespace
 
 Stmt CompactDeviceStatementsRecursive(const Stmt &body) {
   Stmt compact = CompactDeviceStatements(body);
-  NestedDeviceStatementCompactor nested;
+  NestedDeviceStatementCompactor nested(/*semantic_core_locals=*/false);
+  return nested(compact);
+}
+
+static Stmt CompactGeneratedDeviceStatementsRecursive(const Stmt &body) {
+  Stmt compact =
+      CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/true);
+  NestedDeviceStatementCompactor nested(/*semantic_core_locals=*/true);
   return nested(compact);
 }
 
 static Stmt CompactDeviceRoleStatements(const Stmt &body) {
-  Stmt compact =
-      CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/true);
-  NestedDeviceStatementCompactor nested;
-  return nested(compact);
+  return CompactGeneratedDeviceStatementsRecursive(body);
 }
 
 namespace {
