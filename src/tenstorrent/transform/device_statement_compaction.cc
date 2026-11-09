@@ -1018,6 +1018,124 @@ static Stmt CompactDeviceStatementsImpl(const Stmt &body,
   return loop;
 }
 
+static bool SameConcreteGeneratedStatement(const Stmt &expected,
+                                           const Stmt &actual) {
+  std::vector<IntImm> expected_integers, actual_integers;
+  if (Describe(expected, &expected_integers, /*semantic_core_locals=*/true) !=
+          Describe(actual, &actual_integers,
+                   /*semantic_core_locals=*/true) ||
+      expected_integers.size() != actual_integers.size() ||
+      !SameSkeleton(expected, actual, /*semantic_core_locals=*/true) ||
+      !SameDFBOperands(expected, actual) ||
+      !SameControlIdentities(expected, actual))
+    return false;
+  for (size_t index = 0; index < expected_integers.size(); ++index)
+    if (expected_integers[index]->value != actual_integers[index]->value)
+      return false;
+  return true;
+}
+
+static bool IsTerminalRelease(const ffi::Array<Stmt> &statements,
+                              size_t position) {
+  const auto *evaluate = statements[position].as<EvaluateNode>();
+  const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+  const int64_t *resource =
+      call && call->op.same_as(tenstorrent::dfb_release()) &&
+              call->args.size() == 1
+          ? as_const_int(call->args[0])
+          : nullptr;
+  if (!resource)
+    return false;
+  for (size_t index = position + 1; index < statements.size(); ++index) {
+    bool referenced = false;
+    PostOrderVisit(statements[index], [&](const ffi::ObjectRef &object) {
+      const auto *node = object.as<CallNode>();
+      if (!node)
+        return;
+      Call later = ffi::GetRef<Call>(node);
+      for (size_t operand : DFBOperandPositions(later))
+        if (operand < later->args.size()) {
+          const int64_t *value = as_const_int(later->args[operand]);
+          referenced |= !value || *value == *resource;
+        }
+    });
+    if (referenced)
+      return false;
+  }
+  return true;
+}
+
+static Stmt ExtendGeneratedCompactLoops(const Stmt &body) {
+  auto sequence = body.as<SeqStmt>();
+  if (!sequence.has_value())
+    return body;
+  const ffi::Array<Stmt> &statements = sequence.value()->seq;
+  ffi::Array<Stmt> result;
+  bool changed = false;
+  for (size_t index = 0; index < statements.size();) {
+    auto candidate = statements[index].as<For>();
+    if (!candidate.has_value() ||
+        std::string(candidate.value()->loop_var->name_hint)
+                .rfind("tt_compact_iteration", 0) != 0) {
+      result.push_back(statements[index++]);
+      continue;
+    }
+    auto extent = candidate.value()->extent.as<IntImm>();
+    if (!extent.has_value()) {
+      result.push_back(statements[index++]);
+      continue;
+    }
+    ffi::Array<Stmt> template_statements;
+    if (auto template_sequence = candidate.value()->body.as<SeqStmt>())
+      template_statements = template_sequence.value()->seq;
+    else
+      template_statements = {candidate.value()->body};
+    int64_t repeats = extent.value()->value;
+    size_t consumed = 1;
+    ffi::Array<Stmt> deferred_releases;
+    while (repeats < kMaxExpansion && consumed < statements.size() - index) {
+      AffineReader::Bindings bindings{{candidate.value()->loop_var, repeats}};
+      AffineReader reader(bindings);
+      bool continuation = true;
+      size_t cursor = index + consumed;
+      ffi::Array<Stmt> iteration_releases;
+      for (size_t item = 0; item < template_statements.size(); ++item) {
+        Stmt expected =
+            Downcast<Stmt>(reader.Rewrite(template_statements[item]));
+        while (cursor < statements.size() &&
+               !SameConcreteGeneratedStatement(expected, statements[cursor]) &&
+               IsTerminalRelease(statements, cursor))
+          iteration_releases.push_back(statements[cursor++]);
+        if (cursor >= statements.size() ||
+            !SameConcreteGeneratedStatement(expected, statements[cursor])) {
+          continuation = false;
+          break;
+        }
+        ++cursor;
+      }
+      if (!continuation)
+        break;
+      consumed = cursor - index;
+      for (const Stmt &release : iteration_releases)
+        deferred_releases.push_back(release);
+      ++repeats;
+    }
+    if (repeats != extent.value()->value) {
+      For extended = candidate.value();
+      extended.CopyOnWrite()->extent =
+          IntImm(extent.value()->dtype, repeats, extent.value()->span);
+      result.push_back(extended);
+      for (const Stmt &release : deferred_releases)
+        result.push_back(release);
+      changed = true;
+    } else {
+      result.push_back(statements[index]);
+    }
+    index += consumed;
+  }
+  return changed ? SeqStmt(result, body->span) : body;
+}
+
 Stmt CompactDeviceStatements(const Stmt &body) {
   return CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/false);
 }
@@ -1032,6 +1150,8 @@ private:
   Stmt VisitStmt_(const ForNode *op) final {
     For loop = ffi::GetRef<For>(op);
     Stmt body = CompactDeviceStatementsImpl(op->body, semantic_core_locals_);
+    if (semantic_core_locals_)
+      body = ExtendGeneratedCompactLoops(body);
     body = NestedDeviceStatementCompactor(semantic_core_locals_)(body);
     if (body.same_as(op->body))
       return loop;
@@ -1052,6 +1172,7 @@ Stmt CompactDeviceStatementsRecursive(const Stmt &body) {
 static Stmt CompactGeneratedDeviceStatementsRecursive(const Stmt &body) {
   Stmt compact =
       CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/true);
+  compact = ExtendGeneratedCompactLoops(compact);
   NestedDeviceStatementCompactor nested(/*semantic_core_locals=*/true);
   return nested(compact);
 }

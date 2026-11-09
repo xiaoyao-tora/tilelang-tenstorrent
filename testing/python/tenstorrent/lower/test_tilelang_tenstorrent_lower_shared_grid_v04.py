@@ -960,6 +960,38 @@ def test_flash_attention_core_and_kv_repetition_remain_parameterized():
     assert sizes[2] < 3 * sizes[1] // 2
 
 
+def test_stateful_loop_compaction_absorbs_the_terminal_steady_state_period():
+    from examples.tenstorrent.flash_attn import make_flash_attention
+
+    mod = lower(
+        make_flash_attention(
+            batch=1,
+            heads=1,
+            seq_q=32,
+            seq_kv=256,
+            head_dim=64,
+            core_q=1,
+            core_bh=1,
+            input_dtype="float32",
+            accum_dtype="float32",
+            output_dtype="float32",
+        )
+    )
+    trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
+    compact_loops = []
+    tirx.stmt_functor.post_order_visit(
+        trisc.body,
+        lambda node: (
+            compact_loops.append(node)
+            if isinstance(node, tirx.For) and str(node.loop_var.name).startswith("tt_compact_iteration")
+            else None
+        ),
+    )
+    assert [int(loop.extent) for loop in compact_loops] == [3]
+    assert sum(call.op.name == "tl.tt.compute_value_gemm" for call in calls(trisc.body)) == 8
+    assert not _dynamic_dfb_operands(mod)
+
+
 def test_mixed_precision_flash_uses_full_fp32_accumulation():
     from examples.tenstorrent.flash_attn import make_flash_attention
 
