@@ -4,7 +4,7 @@ import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import codegen, device_ir as D
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
-from tilelang.tenstorrent.ttl_codegen.records import resolve_transport_records
+from tilelang.tenstorrent.ttl_codegen.records import RecordResolutionError, resolve_transport_records
 from tvm import arith, ir, tirx
 
 
@@ -46,6 +46,29 @@ def point_transfer(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "floa
         T.comm.transfer(src=src, dst=dst, src_core=(0, 0), dst_cores=(1, 0))
         if x == 1:
             T.copy(dst, C)
+
+
+@T.prim_func
+def local_collective_then_transfer(A: T.Tensor((64, 32), "float32"), C: T.Tensor((64, 32), "float32")):
+    with T.Kernel(2, 1, threads=1) as (x, _y):
+        local_src = T.alloc_shared((32, 32), "float32")
+        local_dst = T.alloc_shared((32, 32), "float32")
+        remote_src = T.alloc_shared((32, 32), "float32")
+        remote_dst = T.alloc_shared((32, 32), "float32")
+        if x == 0:
+            T.copy(A[0:32, 0:32], local_src)
+        T.comm.all_gather(
+            src=local_src,
+            dst=local_dst,
+            group=T.comm.CoreRange((0, 0), (1, 1)),
+            axis=0,
+        )
+        if x == 0:
+            T.copy(local_dst, C[0:32, 0:32])
+            T.copy(A[32:64, 0:32], remote_src)
+        T.comm.transfer(src=remote_src, dst=remote_dst, src_core=(0, 0), dst_cores=(1, 0))
+        if x == 1:
+            T.copy(remote_dst, C[32:64, 0:32])
 
 
 @T.prim_func
@@ -268,17 +291,60 @@ def test_collective_transport_families_resolve_to_ordered_pipenet_records():
     assert set(records) == {0, 1}
     assert len(records[0]) == len(records[1]) == 4
     for row, record in enumerate(records[0]):
-        assert record.record_index == 4 * row
+        assert record.pipe_net_id == 0
+        assert record.communication_id == 0
+        assert record.record_index == row
         assert record.source == (0, row)
         assert record.destination_begin == (1, row)
         assert record.destination_end == (4, row + 1)
         assert record.contract == "collective"
     for column, record in enumerate(records[1]):
+        assert record.pipe_net_id == 1
+        assert record.communication_id == 1
         assert record.record_index == column
         assert record.source == (column, 0)
         assert record.destination_begin == (column, 1)
         assert record.destination_end == (column + 1, 4)
         assert record.contract == "collective"
+
+
+def test_pipe_net_namespace_is_independent_from_parent_communication():
+    mod = lower(local_collective_then_transfer)
+    communications = list(mod.attrs["tt.communication_table"])
+    assert [int(entry.communication_id) for entry in communications] == [0, 1]
+    records = resolve_transport_records(mod)
+    assert set(records) == {0}
+    (record,) = records[0]
+    assert record.pipe_net_id == 0
+    assert record.communication_id == 1
+    assert record.record_index == 0
+    transport_steps = [step for step in expanded(mod).attrs["tt.communication_step_table"] if int(step.pipe_net_id) >= 0]
+    assert transport_steps
+    assert all(int(step.communication_id) == 1 and int(step.pipe_net_id) == 0 for step in transport_steps)
+
+
+def test_codegen_record_resolver_rejects_sparse_record_indices():
+    mod = lower(point_transfer)
+    families = list(mod.attrs["tt.transport_families"])
+    family = families[0]
+    fields = dict(family.fields)
+    fields["record_index"] = D.DeviceIRIntColumn(1, 0, 1, [])
+    families[0] = D.DeviceIRDescriptorFamily(family.prototype, family.positions, fields, family.source_parts)
+    malformed = mod.with_attr("tt.transport_families", families)
+    with pytest.raises(RecordResolutionError, match="record indices are not dense"):
+        resolve_transport_records(malformed)
+
+
+def test_device_verifier_rejects_transport_with_wrong_parent_communication():
+    mod = lower(point_transfer)
+    families = list(mod.attrs["tt.transport_families"])
+    family = families[0]
+    fields = dict(family.fields)
+    fields["communication_id"] = D.DeviceIRIntColumn(1, 0, 1, [])
+    families[0] = D.DeviceIRDescriptorFamily(family.prototype, family.positions, fields, family.source_parts)
+    malformed = mod.with_attr("tt.transport_families", families)
+    with pytest.raises(ValueError, match="missing parent communication"):
+        transform.VerifyTenstorrentDeviceIR()(malformed)
 
 
 def _body_counts(function):
@@ -668,6 +734,7 @@ def test_communication_step_kind_must_match_the_referencing_body_op():
     prototype = D.CommunicationStepDescriptor(
         int(step.step_id),
         int(step.communication_id),
+        int(step.pipe_net_id),
         int(step.record_index),
         int(step.occurrence),
         "unknown_step",

@@ -54,12 +54,14 @@ ACCUMULATOR_DESCRIPTOR_FIELDS = (
 )
 COMPUTE_REQUIREMENTS_FIELDS = ("destination_width", "matmul_full_fp32", "accumulators")
 
-# v4 preserves all earlier reflected constructors and adds a typed transfer
-# table. Kernel order now lists global function names in (x, y, slot) order.
+# v4 introduced the typed transfer table. Its current reflected descriptor also
+# retains the parent communication independently from the materialized PipeNet.
+# Kernel order lists global function names in (x, y, slot) order.
 MULTICORE_MODULE_FIELDS = ("tt.pipe_transfer_table",)
 PIPE_TRANSFER_DESCRIPTOR_FIELDS = (
     "transfer_id",
     "pipe_net_id",
+    "communication_id",
     "record_index",
     "occurrence",
     "src_coord",
@@ -124,7 +126,8 @@ DFB_DESCRIPTOR_FIELDS = (
 
 PIPE_DESCRIPTOR_FIELDS = (
     "pipe_net_id",
-    "event_index",
+    "communication_id",
+    "record_index",
     "src_coord",
     "dst_begin",
     "dst_end",

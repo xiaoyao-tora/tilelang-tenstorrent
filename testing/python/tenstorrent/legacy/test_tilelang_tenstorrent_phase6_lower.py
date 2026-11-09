@@ -177,7 +177,7 @@ def test_zero_matching_core_is_idle_and_record_indices_are_preserved():
         if int(func.attrs["tt.core_domain"].begin.x) == 2:
             assert isinstance(func.body, tirx.Evaluate) and int(func.body.value) == 0
     mod = lower_multicore(make_scatter(True))
-    assert [int(record.event_index) for record in mod.attrs["tt.pipe_table"]] == [0, 1, 2]
+    assert [int(record.record_index) for record in mod.attrs["tt.pipe_table"]] == [0, 1, 2]
     assert len({int(edge.source_dfb_id) for edge in mod.attrs["tt.pipe_transfer_table"]}) == 3
 
 
@@ -191,7 +191,7 @@ def test_pipe_decode_rejects_malformed_frozen_schema():
 def test_reverse_source_record_order_and_discarded_receives():
     mod = lower_multicore(make_gather(reverse=True, last_only=True))
     records = mod.attrs["tt.pipe_table"]
-    assert [int(record.event_index) for record in records] == [0, 1]
+    assert [int(record.record_index) for record in records] == [0, 1]
     assert [int(record.src_coord.x) for record in records] == [2, 1]
     assert len(mod.attrs["tt.pipe_transfer_table"]) == 2
 

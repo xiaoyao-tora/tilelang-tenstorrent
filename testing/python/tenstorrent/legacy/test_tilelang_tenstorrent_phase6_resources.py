@@ -15,9 +15,7 @@ from testing.python.tenstorrent.legacy.test_tilelang_tenstorrent_phase2_device_i
 from testing.python.tenstorrent.device_ir.test_tilelang_tenstorrent_phase5_resources import rejected
 
 
-pytestmark = pytest.mark.skip(
-    reason="legacy Device IR v4 PipeNet resource schema replaced by typed v04 communication steps"
-)
+pytestmark = pytest.mark.skip(reason="legacy Device IR v4 PipeNet resource schema replaced by typed v04 communication steps")
 
 
 def resource_program(collective=False, duplicate=False):
@@ -80,6 +78,7 @@ def replace_transfer(transfer, **changes):
     fields = {
         "transfer_id": int(transfer.transfer_id),
         "pipe_net_id": int(transfer.pipe_net_id),
+        "communication_id": int(transfer.communication_id),
         "record_index": int(transfer.record_index),
         "occurrence": int(transfer.occurrence),
         "src_coord": transfer.src_coord,

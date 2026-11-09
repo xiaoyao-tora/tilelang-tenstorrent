@@ -316,9 +316,10 @@ public:
 
 /*! \brief One deterministic Device communication/collective algorithm step.
  *
- * Transport steps use a nonnegative Pipe record index. Local algorithm steps
- * use -1. A record-level send has no single destination Core; destination
- * receive/completion/publish steps retain their concrete Core instance.
+ * Every step retains its parent communication. Transport steps additionally
+ * use a nonnegative PipeNet ID and dense Pipe record index; local algorithm
+ * steps use -1 for both. A record-level send has no single destination Core;
+ * destination receive/completion/publish steps retain their concrete Core.
  */
 class CommunicationStepDescriptorNode : public ffi::Object {
 public:
@@ -326,6 +327,7 @@ public:
       kTVMFFISEqHashKindTreeNode;
   int64_t step_id;
   int64_t communication_id;
+  int64_t pipe_net_id;
   int64_t record_index;
   int64_t occurrence;
   ffi::String kind;
@@ -347,8 +349,8 @@ public:
 class CommunicationStepDescriptor : public ffi::ObjectRef {
 public:
   TVM_DLL CommunicationStepDescriptor(
-      int64_t step_id, int64_t communication_id, int64_t record_index,
-      int64_t occurrence, ffi::String kind,
+      int64_t step_id, int64_t communication_id, int64_t pipe_net_id,
+      int64_t record_index, int64_t occurrence, ffi::String kind,
       ffi::Optional<CoreCoord> source_core,
       ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
       int64_t destination_dfb_id, ffi::String owner_slot,
@@ -617,12 +619,19 @@ public:
                                              DeviceIRDescriptorFamilyNode);
 };
 
+/*! \brief One static, ordered record in a materialized transport PipeNet.
+ *
+ * PipeNet IDs are globally dense. record_index is dense within one PipeNet and
+ * directly indexes the downstream PipeNet record array. communication_id names
+ * the high-level communication whose selected algorithm owns this PipeNet.
+ */
 class PipeDescriptorNode : public ffi::Object {
 public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
       kTVMFFISEqHashKindTreeNode;
   int64_t pipe_net_id;
-  int64_t event_index;
+  int64_t communication_id;
+  int64_t record_index;
   CoreCoord src_coord;
   CoreCoord dst_begin;
   CoreCoord dst_end;
@@ -637,10 +646,11 @@ public:
 
 class PipeDescriptor : public ffi::ObjectRef {
 public:
-  TVM_DLL PipeDescriptor(int64_t pipe_net_id, int64_t event_index,
-                         CoreCoord src_coord, CoreCoord dst_begin,
-                         CoreCoord dst_end, ffi::String contract,
-                         int64_t payload_dfb_id, Span source_span);
+  TVM_DLL PipeDescriptor(int64_t pipe_net_id, int64_t communication_id,
+                         int64_t record_index, CoreCoord src_coord,
+                         CoreCoord dst_begin, CoreCoord dst_end,
+                         ffi::String contract, int64_t payload_dfb_id,
+                         Span source_span);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(PipeDescriptor, ffi::ObjectRef,
                                              PipeDescriptorNode);
 };
@@ -652,7 +662,8 @@ public:
  * requires occurrence=0 and transaction_count=1. Schema v6 additionally allows
  * statically expanded occurrences numbered contiguously from zero per record;
  * each occurrence has its own immutable source and destination generations.
- * Existing descriptor layouts are unchanged.
+ * The current reflected descriptor also retains the parent communication ID
+ * independently from its materialized PipeNet ID.
  */
 class PipeTransferDescriptorNode : public ffi::Object {
 public:
@@ -660,6 +671,7 @@ public:
       kTVMFFISEqHashKindTreeNode;
   int64_t transfer_id;
   int64_t pipe_net_id;
+  int64_t communication_id;
   int64_t record_index;
   int64_t occurrence;
   CoreCoord src_coord;
@@ -677,9 +689,9 @@ public:
 class PipeTransferDescriptor : public ffi::ObjectRef {
 public:
   TVM_DLL PipeTransferDescriptor(int64_t transfer_id, int64_t pipe_net_id,
-                                 int64_t record_index, int64_t occurrence,
-                                 CoreCoord src_coord, CoreCoord dst_coord,
-                                 int64_t source_dfb_id,
+                                 int64_t communication_id, int64_t record_index,
+                                 int64_t occurrence, CoreCoord src_coord,
+                                 CoreCoord dst_coord, int64_t source_dfb_id,
                                  int64_t destination_dfb_id,
                                  int64_t transaction_count, Span source_span);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(PipeTransferDescriptor,

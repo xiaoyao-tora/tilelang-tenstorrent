@@ -38,7 +38,7 @@ DFB:
   transaction_count_or_loop_relation, source_span
 
 Pipe:
-  pipe_net_id, event_index, src_coord, dst_begin, dst_end, contract,
+  pipe_net_id, communication_id, record_index, src_coord, dst_begin, dst_end, contract,
   payload_dfb_id, source_span
 
 PrimFunc attributes:

@@ -709,6 +709,7 @@ ffi::Array<DeviceIRDescriptorFamily> CompactCurrentSteps(
     FamilyBuilder &builder = builders[found->second];
     builder.positions.push_back(builder.positions.size());
     builder.fields["step_id"].push_back(descriptor->step_id);
+    builder.fields["pipe_net_id"].push_back(descriptor->pipe_net_id);
     builder.fields["record_index"].push_back(descriptor->record_index);
     builder.fields["occurrence"].push_back(descriptor->occurrence);
     builder.fields["source_dfb_id"].push_back(descriptor->source_dfb_id);
@@ -754,7 +755,8 @@ CompactCurrentTransports(const ffi::Array<PipeDescriptor> &descriptors) {
     FamilyBuilder &builder = builders[found->second];
     builder.positions.push_back(position);
     builder.fields["pipe_net_id"].push_back(descriptor->pipe_net_id);
-    builder.fields["event_index"].push_back(descriptor->event_index);
+    builder.fields["communication_id"].push_back(descriptor->communication_id);
+    builder.fields["record_index"].push_back(descriptor->record_index);
     builder.fields["source_x"].push_back(descriptor->src_coord->x);
     builder.fields["source_y"].push_back(descriptor->src_coord->y);
     builder.fields["destination_begin_x"].push_back(descriptor->dst_begin->x);
@@ -1085,7 +1087,8 @@ RestoreCurrentSteps(const DeviceIRDescriptorFamily &family,
                     const CommunicationStepDescriptor &prototype) {
   Check(family->source_parts.empty(),
         "communication-step family cannot have source string parts");
-  std::set<std::string> names{"step_id", "record_index", "occurrence",
+  std::set<std::string> names{"step_id",       "pipe_net_id",
+                              "record_index",  "occurrence",
                               "source_dfb_id", "destination_dfb_id"};
   bool parameter_column = prototype->parameter.as<IntImmNode>() != nullptr;
   if (parameter_column)
@@ -1118,10 +1121,10 @@ RestoreCurrentSteps(const DeviceIRDescriptorFamily &family,
           Integer(fields.at("dependency." + std::to_string(index))[row]));
     result.emplace_back(
         fields.at("step_id")[row], prototype->communication_id,
-        fields.at("record_index")[row], fields.at("occurrence")[row],
-        prototype->kind, source, destination, fields.at("source_dfb_id")[row],
-        fields.at("destination_dfb_id")[row], prototype->owner_slot,
-        dependencies,
+        fields.at("pipe_net_id")[row], fields.at("record_index")[row],
+        fields.at("occurrence")[row], prototype->kind, source, destination,
+        fields.at("source_dfb_id")[row], fields.at("destination_dfb_id")[row],
+        prototype->owner_slot, dependencies,
         parameter_column ? PrimExpr(Integer(fields.at("parameter")[row]))
                          : prototype->parameter,
         prototype->source_span);
@@ -1135,14 +1138,15 @@ RestoreCurrentTransports(const DeviceIRDescriptorFamily &family,
   Check(family->source_parts.empty(),
         "transport family cannot have source string parts");
   DecodedFields fields = ReadFields(
-      family, {"pipe_net_id", "event_index", "source_x", "source_y",
-               "destination_begin_x", "destination_begin_y",
+      family, {"pipe_net_id", "communication_id", "record_index", "source_x",
+               "source_y", "destination_begin_x", "destination_begin_y",
                "destination_end_x", "destination_end_y", "payload_dfb_id"});
   std::vector<PipeDescriptor> result;
   result.reserve(family->positions->count);
   for (int64_t row = 0; row < family->positions->count; ++row)
     result.emplace_back(
-        fields.at("pipe_net_id")[row], fields.at("event_index")[row],
+        fields.at("pipe_net_id")[row], fields.at("communication_id")[row],
+        fields.at("record_index")[row],
         CoreCoord(fields.at("source_x")[row], fields.at("source_y")[row]),
         CoreCoord(fields.at("destination_begin_x")[row],
                   fields.at("destination_begin_y")[row]),

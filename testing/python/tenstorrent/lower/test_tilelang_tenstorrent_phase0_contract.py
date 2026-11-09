@@ -176,7 +176,8 @@ def test_frozen_device_ir_schema_and_slot_contract():
     )
     assert contracts.PIPE_DESCRIPTOR_FIELDS == (
         "pipe_net_id",
-        "event_index",
+        "communication_id",
+        "record_index",
         "src_coord",
         "dst_begin",
         "dst_end",

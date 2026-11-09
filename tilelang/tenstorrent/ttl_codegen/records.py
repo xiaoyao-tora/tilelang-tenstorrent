@@ -13,6 +13,7 @@ class RecordResolutionError(NotImplementedError):
 
 @dataclass(frozen=True)
 class ResolvedPipeRecord:
+    pipe_net_id: int
     communication_id: int
     record_index: int
     source: tuple[int, int]
@@ -46,7 +47,8 @@ def resolve_transport_records(mod: IRModule) -> dict[int, tuple[ResolvedPipeReco
     records: dict[int, list[ResolvedPipeRecord]] = {}
     required = (
         "pipe_net_id",
-        "event_index",
+        "communication_id",
+        "record_index",
         "source_x",
         "source_y",
         "destination_begin_x",
@@ -67,10 +69,11 @@ def resolve_transport_records(mod: IRModule) -> dict[int, tuple[ResolvedPipeReco
         if contract not in ("point_to_point", "collective"):
             raise RecordResolutionError(f"unsupported transport contract {contract!r}")
         for row in range(count):
-            communication = columns["pipe_net_id"][row]
+            pipe_net = columns["pipe_net_id"][row]
             record = ResolvedPipeRecord(
-                communication_id=communication,
-                record_index=columns["event_index"][row],
+                pipe_net_id=pipe_net,
+                communication_id=columns["communication_id"][row],
+                record_index=columns["record_index"][row],
                 source=(columns["source_x"][row], columns["source_y"][row]),
                 destination_begin=(columns["destination_begin_x"][row], columns["destination_begin_y"][row]),
                 destination_end=(columns["destination_end_x"][row], columns["destination_end_y"][row]),
@@ -83,14 +86,21 @@ def resolve_transport_records(mod: IRModule) -> dict[int, tuple[ResolvedPipeReco
                 and record.destination_begin[1] <= record.source[1] < record.destination_end[1]
             ):
                 raise RecordResolutionError("source-exclusive transport record includes its source")
-            records.setdefault(communication, []).append(record)
+            records.setdefault(pipe_net, []).append(record)
+    pipe_net_ids = sorted(records)
+    if pipe_net_ids != list(range(len(pipe_net_ids))):
+        raise RecordResolutionError("PipeNet IDs are not dense")
     result: dict[int, tuple[ResolvedPipeRecord, ...]] = {}
-    for communication, entries in records.items():
+    for pipe_net in pipe_net_ids:
+        entries = records[pipe_net]
         ordered = sorted(entries, key=lambda entry: entry.record_index)
         indices = [entry.record_index for entry in ordered]
-        if len(indices) != len(set(indices)):
-            raise RecordResolutionError(f"PipeNet {communication} has duplicate record indices")
-        result[communication] = tuple(ordered)
+        if indices != list(range(len(indices))):
+            raise RecordResolutionError(f"PipeNet {pipe_net} record indices are not dense")
+        communications = {entry.communication_id for entry in ordered}
+        if len(communications) != 1:
+            raise RecordResolutionError(f"PipeNet {pipe_net} has inconsistent parent communications")
+        result[pipe_net] = tuple(ordered)
     return result
 
 

@@ -393,23 +393,34 @@ DFBTable VerifyDFBTable(const ffi::Array<DFBDescriptor> &dfbs,
 
 void VerifyPipeTable(const ffi::Array<PipeDescriptor> &pipes,
                      const DFBTable &dfbs, const CoreCoord &launch_grid) {
-  std::unordered_set<std::string> event_ids;
-  std::unordered_map<int64_t, int64_t> next_event;
+  std::unordered_set<std::string> record_ids;
+  std::unordered_map<int64_t, int64_t> next_record;
   std::unordered_map<int64_t, ffi::String> contracts;
+  std::unordered_map<int64_t, int64_t> communications;
+  int64_t expected_pipe_net = 0;
   for (const PipeDescriptor &pipe : pipes) {
     const std::string label = "PipeNet " + std::to_string(pipe->pipe_net_id) +
-                              " event " + std::to_string(pipe->event_index);
+                              " record " + std::to_string(pipe->record_index);
     Check(pipe->pipe_net_id >= 0, label + " has a negative pipe_net_id");
-    Check(pipe->event_index >= 0, label + " has a negative event_index");
-    const std::string event_id = std::to_string(pipe->pipe_net_id) + ":" +
-                                 std::to_string(pipe->event_index);
-    Check(event_ids.insert(event_id).second,
-          label + " duplicates a Pipe event identity");
-    int64_t &expected = next_event[pipe->pipe_net_id];
-    Check(pipe->event_index == expected,
-          label + " is out of order; expected event_index " +
+    Check(pipe->communication_id >= 0,
+          label + " has a negative communication_id");
+    Check(pipe->record_index >= 0, label + " has a negative record_index");
+    const std::string record_id = std::to_string(pipe->pipe_net_id) + ":" +
+                                  std::to_string(pipe->record_index);
+    Check(record_ids.insert(record_id).second,
+          label + " duplicates a Pipe record identity");
+    int64_t &expected = next_record[pipe->pipe_net_id];
+    if (expected == 0)
+      Check(pipe->pipe_net_id == expected_pipe_net++,
+            label + " PipeNet IDs must be dense and deterministic");
+    Check(pipe->record_index == expected,
+          label + " is out of order; expected record_index " +
               std::to_string(expected));
     ++expected;
+    auto [communication, new_pipe_net] =
+        communications.emplace(pipe->pipe_net_id, pipe->communication_id);
+    Check(new_pipe_net || communication->second == pipe->communication_id,
+          label + " has inconsistent parent communication IDs");
     VerifyCoord(pipe->src_coord, launch_grid, label + " src_coord");
     VerifyDomain(CoreDomain(pipe->dst_begin, pipe->dst_end), launch_grid,
                  label + " destination range");
@@ -3079,7 +3090,8 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
   std::unordered_map<int64_t, PipeTransferDescriptor> transfer_table;
   std::map<std::pair<int64_t, int64_t>, PipeDescriptor> records;
   for (const PipeDescriptor &pipe : pipes)
-    records.emplace(std::make_pair(pipe->pipe_net_id, pipe->event_index), pipe);
+    records.emplace(std::make_pair(pipe->pipe_net_id, pipe->record_index),
+                    pipe);
   const bool extended =
       RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr)->value >= 6 ||
       pipeline.enabled;
@@ -3183,6 +3195,8 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     Check(records.count(record_key),
           "Pipe transfer references missing original record");
     const PipeDescriptor &record = records.at(record_key);
+    Check(transfer->communication_id == record->communication_id,
+          "Pipe transfer parent communication disagrees with original record");
     Check(transfer->occurrence >= 0 && (extended || transfer->occurrence == 0),
           "schema v4 supports one occurrence; schema v6 requires a nonnegative "
           "epoch");
@@ -3913,7 +3927,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   std::map<std::pair<int64_t, int64_t>, PipeDescriptor> transport_records;
   for (const PipeDescriptor &transport : transports) {
     Check(transport.defined() && transport->pipe_net_id >= 0 &&
-              transport->event_index >= 0,
+              transport->communication_id >= 0 && transport->record_index >= 0,
           "transport descriptor has an invalid identity");
     VerifyCoord(transport->src_coord, launch_grid, "transport source");
     VerifyDomain(CoreDomain(transport->dst_begin, transport->dst_end),
@@ -3922,9 +3936,13 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
            transport->contract == "collective") &&
               dfb_table.count(transport->payload_dfb_id),
           "transport descriptor has an invalid contract or payload DFB");
+    Check(communication.has_value() &&
+              transport->communication_id <
+                  static_cast<int64_t>(communication.value().size()),
+          "transport descriptor references a missing parent communication");
     Check(transport_records
               .emplace(std::make_pair(transport->pipe_net_id,
-                                      transport->event_index),
+                                      transport->record_index),
                        transport)
               .second,
           "transport descriptor has a duplicate Pipe record identity");
@@ -4700,19 +4718,22 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                        coord.value()->y == y;
               };
               if (record_send || record_recv || record_wait) {
-                int64_t communication = id(call, 0);
+                int64_t pipe_net = id(call, 0);
                 int64_t record = id(call, 1);
                 int64_t occurrence = id(call, 2);
                 int64_t resource = id(call, 3);
-                Check(step->communication_id == communication &&
+                Check(step->pipe_net_id == pipe_net &&
                           step->record_index == record &&
                           step->occurrence == occurrence,
                       "Pipe record operation and step use different record "
                       "identities");
-                auto transport =
-                    transport_records.find({communication, record});
+                auto transport = transport_records.find({pipe_net, record});
                 Check(transport != transport_records.end(),
                       "Pipe record operation references missing transport");
+                Check(
+                    step->communication_id ==
+                        transport->second->communication_id,
+                    "Pipe record operation has the wrong parent communication");
                 if (record_send) {
                   Check(step->kind == "send" && coord_is(step->source_core) &&
                             !step->destination_core.has_value() &&
@@ -5293,13 +5314,19 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
           "communication step has an unknown kind");
     bool transport_step = step->kind == "send" || step->kind == "receive" ||
                           step->kind == "completion" || step->kind == "publish";
-    Check((transport_step && step->record_index >= 0) ||
-              (!transport_step && step->record_index == -1),
-          "communication step has an invalid record index");
-    if (transport_step)
-      Check(
-          transport_records.count({step->communication_id, step->record_index}),
-          "communication step references a missing Pipe record");
+    Check(
+        (transport_step && step->pipe_net_id >= 0 && step->record_index >= 0) ||
+            (!transport_step && step->pipe_net_id == -1 &&
+             step->record_index == -1),
+        "communication step has an invalid Pipe record identity");
+    if (transport_step) {
+      auto record =
+          transport_records.find({step->pipe_net_id, step->record_index});
+      Check(record != transport_records.end(),
+            "communication step references a missing Pipe record");
+      Check(record->second->communication_id == step->communication_id,
+            "communication step and Pipe record have different parents");
+    }
     Check(
         step_ref_counts[index] == 1,
         "communication step must be referenced by exactly one body operation");
@@ -5375,13 +5402,12 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
           if (step->kind == "send") {
             Check(!step->destination_core.has_value(),
                   "record-level send must not name one destination Core");
-            auto record = transport_records.find(
-                {step->communication_id, step->record_index});
+            auto record =
+                transport_records.find({step->pipe_net_id, step->record_index});
             Check(record != transport_records.end() &&
                       ffi::StructuralEqual()(record->second->src_coord, source),
                   "record-level send disagrees with its transport record");
-            Check(source_records
-                      .insert({step->communication_id, step->record_index})
+            Check(source_records.insert({step->pipe_net_id, step->record_index})
                       .second,
                   "communication occurrence has a duplicate record send");
             for (int64_t dx = record->second->dst_begin->x;

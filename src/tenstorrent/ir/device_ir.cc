@@ -146,14 +146,16 @@ void CommunicationDescriptorNode::RegisterReflection() {
 }
 
 CommunicationStepDescriptor::CommunicationStepDescriptor(
-    int64_t step_id, int64_t communication_id, int64_t record_index,
-    int64_t occurrence, ffi::String kind, ffi::Optional<CoreCoord> source_core,
+    int64_t step_id, int64_t communication_id, int64_t pipe_net_id,
+    int64_t record_index, int64_t occurrence, ffi::String kind,
+    ffi::Optional<CoreCoord> source_core,
     ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
     int64_t destination_dfb_id, ffi::String owner_slot,
     ffi::Array<Integer> dependencies, PrimExpr parameter, Span source_span) {
   auto node = ffi::make_object<CommunicationStepDescriptorNode>();
   node->step_id = step_id;
   node->communication_id = communication_id;
+  node->pipe_net_id = pipe_net_id;
   node->record_index = record_index;
   node->occurrence = occurrence;
   node->kind = std::move(kind);
@@ -173,6 +175,7 @@ void CommunicationStepDescriptorNode::RegisterReflection() {
       .def_ro("step_id", &CommunicationStepDescriptorNode::step_id)
       .def_ro("communication_id",
               &CommunicationStepDescriptorNode::communication_id)
+      .def_ro("pipe_net_id", &CommunicationStepDescriptorNode::pipe_net_id)
       .def_ro("record_index", &CommunicationStepDescriptorNode::record_index)
       .def_ro("occurrence", &CommunicationStepDescriptorNode::occurrence)
       .def_ro("kind", &CommunicationStepDescriptorNode::kind)
@@ -527,14 +530,16 @@ void DFBStorageGroupDescriptorNode::RegisterReflection() {
       .def_ro("source_span", &DFBStorageGroupDescriptorNode::source_span);
 }
 
-PipeDescriptor::PipeDescriptor(int64_t pipe_net_id, int64_t event_index,
-                               CoreCoord src_coord, CoreCoord dst_begin,
-                               CoreCoord dst_end, ffi::String contract,
-                               int64_t payload_dfb_id, Span source_span) {
+PipeDescriptor::PipeDescriptor(int64_t pipe_net_id, int64_t communication_id,
+                               int64_t record_index, CoreCoord src_coord,
+                               CoreCoord dst_begin, CoreCoord dst_end,
+                               ffi::String contract, int64_t payload_dfb_id,
+                               Span source_span) {
   ffi::ObjectPtr<PipeDescriptorNode> node =
       ffi::make_object<PipeDescriptorNode>();
   node->pipe_net_id = pipe_net_id;
-  node->event_index = event_index;
+  node->communication_id = communication_id;
+  node->record_index = record_index;
   node->src_coord = std::move(src_coord);
   node->dst_begin = std::move(dst_begin);
   node->dst_end = std::move(dst_end);
@@ -548,7 +553,8 @@ void PipeDescriptorNode::RegisterReflection() {
   namespace refl = ffi::reflection;
   refl::ObjectDef<PipeDescriptorNode>()
       .def_ro("pipe_net_id", &PipeDescriptorNode::pipe_net_id)
-      .def_ro("event_index", &PipeDescriptorNode::event_index)
+      .def_ro("communication_id", &PipeDescriptorNode::communication_id)
+      .def_ro("record_index", &PipeDescriptorNode::record_index)
       .def_ro("src_coord", &PipeDescriptorNode::src_coord)
       .def_ro("dst_begin", &PipeDescriptorNode::dst_begin)
       .def_ro("dst_end", &PipeDescriptorNode::dst_end)
@@ -558,13 +564,14 @@ void PipeDescriptorNode::RegisterReflection() {
 }
 
 PipeTransferDescriptor::PipeTransferDescriptor(
-    int64_t transfer_id, int64_t pipe_net_id, int64_t record_index,
-    int64_t occurrence, CoreCoord src_coord, CoreCoord dst_coord,
-    int64_t source_dfb_id, int64_t destination_dfb_id,
+    int64_t transfer_id, int64_t pipe_net_id, int64_t communication_id,
+    int64_t record_index, int64_t occurrence, CoreCoord src_coord,
+    CoreCoord dst_coord, int64_t source_dfb_id, int64_t destination_dfb_id,
     int64_t transaction_count, Span source_span) {
   auto node = ffi::make_object<PipeTransferDescriptorNode>();
   node->transfer_id = transfer_id;
   node->pipe_net_id = pipe_net_id;
+  node->communication_id = communication_id;
   node->record_index = record_index;
   node->occurrence = occurrence;
   node->src_coord = std::move(src_coord);
@@ -581,6 +588,7 @@ void PipeTransferDescriptorNode::RegisterReflection() {
   refl::ObjectDef<PipeTransferDescriptorNode>()
       .def_ro("transfer_id", &PipeTransferDescriptorNode::transfer_id)
       .def_ro("pipe_net_id", &PipeTransferDescriptorNode::pipe_net_id)
+      .def_ro("communication_id", &PipeTransferDescriptorNode::communication_id)
       .def_ro("record_index", &PipeTransferDescriptorNode::record_index)
       .def_ro("occurrence", &PipeTransferDescriptorNode::occurrence)
       .def_ro("src_coord", &PipeTransferDescriptorNode::src_coord)
@@ -806,16 +814,16 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(source_span));
            })
       .def("tl.tenstorrent.CommunicationStepDescriptor",
-           [](int64_t step_id, int64_t communication_id, int64_t record_index,
-              int64_t occurrence, ffi::String kind,
+           [](int64_t step_id, int64_t communication_id, int64_t pipe_net_id,
+              int64_t record_index, int64_t occurrence, ffi::String kind,
               ffi::Optional<CoreCoord> source_core,
               ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
               int64_t destination_dfb_id, ffi::String owner_slot,
               ffi::Array<Integer> dependencies, PrimExpr parameter,
               Span source_span) {
              return CommunicationStepDescriptor(
-                 step_id, communication_id, record_index, occurrence,
-                 std::move(kind), std::move(source_core),
+                 step_id, communication_id, pipe_net_id, record_index,
+                 occurrence, std::move(kind), std::move(source_core),
                  std::move(destination_core), source_dfb_id, destination_dfb_id,
                  std::move(owner_slot), std::move(dependencies),
                  std::move(parameter), std::move(source_span));
@@ -897,23 +905,26 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                                         std::move(accumulators));
            })
       .def("tl.tenstorrent.PipeDescriptor",
-           [](int64_t pipe_net_id, int64_t event_index, CoreCoord src_coord,
-              CoreCoord dst_begin, CoreCoord dst_end, ffi::String contract,
-              int64_t payload_dfb_id, Span source_span) {
-             return PipeDescriptor(pipe_net_id, event_index,
+           [](int64_t pipe_net_id, int64_t communication_id,
+              int64_t record_index, CoreCoord src_coord, CoreCoord dst_begin,
+              CoreCoord dst_end, ffi::String contract, int64_t payload_dfb_id,
+              Span source_span) {
+             return PipeDescriptor(pipe_net_id, communication_id, record_index,
                                    std::move(src_coord), std::move(dst_begin),
                                    std::move(dst_end), std::move(contract),
                                    payload_dfb_id, std::move(source_span));
            })
       .def("tl.tenstorrent.PipeTransferDescriptor",
-           [](int64_t transfer_id, int64_t pipe_net_id, int64_t record_index,
+           [](int64_t transfer_id, int64_t pipe_net_id,
+              int64_t communication_id, int64_t record_index,
               int64_t occurrence, CoreCoord src_coord, CoreCoord dst_coord,
               int64_t source_dfb_id, int64_t destination_dfb_id,
               int64_t transaction_count, Span source_span) {
              return PipeTransferDescriptor(
-                 transfer_id, pipe_net_id, record_index, occurrence,
-                 std::move(src_coord), std::move(dst_coord), source_dfb_id,
-                 destination_dfb_id, transaction_count, std::move(source_span));
+                 transfer_id, pipe_net_id, communication_id, record_index,
+                 occurrence, std::move(src_coord), std::move(dst_coord),
+                 source_dfb_id, destination_dfb_id, transaction_count,
+                 std::move(source_span));
            })
       .def("tl.tenstorrent.LogicalKernel",
            [](ffi::String kernel_id, ffi::String kind, ffi::String role,
