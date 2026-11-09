@@ -888,6 +888,121 @@ void Expand(const Stmt &body, AffineReader::Bindings *bindings,
 }
 } // namespace
 
+static bool ReferencesDFBResource(const Stmt &statement, int64_t resource) {
+  bool referenced = false;
+  PostOrderVisit(statement, [&](const ffi::ObjectRef &object) {
+    const auto *node = object.as<CallNode>();
+    if (!node)
+      return;
+    Call call = ffi::GetRef<Call>(node);
+    for (size_t operand : DFBOperandPositions(call))
+      if (operand < call->args.size()) {
+        const int64_t *value = as_const_int(call->args[operand]);
+        referenced |= !value || *value == resource;
+      }
+  });
+  return referenced;
+}
+
+static bool ProducesLocalDFBResource(const Stmt &statement, int64_t resource) {
+  const auto *evaluate = statement.as<EvaluateNode>();
+  const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+  if (!call)
+    return false;
+  size_t output;
+  if (call->op.same_as(tenstorrent::dfb_compute()))
+    output = 0;
+  else if (call->op.same_as(tenstorrent::compute_value_store()))
+    output = 1;
+  else
+    return false;
+  const int64_t *value =
+      output < call->args.size() ? as_const_int(call->args[output]) : nullptr;
+  return value && *value == resource;
+}
+
+static bool ReleasesDFBResource(const Stmt &statement, int64_t resource) {
+  const auto *evaluate = statement.as<EvaluateNode>();
+  const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+  const int64_t *value = call && call->op.same_as(tenstorrent::dfb_release()) &&
+                                 call->args.size() == 1
+                             ? as_const_int(call->args[0])
+                             : nullptr;
+  return value && *value == resource;
+}
+
+// A TRISC-local result can be awaited once its producing instruction has been
+// issued. Keep the following wait next to that transaction instead of after an
+// unrelated compute phase. This exposes the original serial period without
+// moving waits for Tensor, Pipe, or other cross-slot producers.
+static Stmt ScheduleLocalDFBWaits(const Stmt &body) {
+  auto sequence = body.as<SeqStmt>();
+  if (!sequence.has_value())
+    return body;
+  std::vector<Stmt> statements(sequence.value()->seq.begin(),
+                               sequence.value()->seq.end());
+  bool changed = false;
+  for (size_t index = 0; index < statements.size(); ++index) {
+    const auto *evaluate = statements[index].as<EvaluateNode>();
+    const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+    const int64_t *resource =
+        call && call->op.same_as(tenstorrent::dfb_wait()) &&
+                call->args.size() == 1
+            ? as_const_int(call->args[0])
+            : nullptr;
+    if (!resource)
+      continue;
+    size_t producer = index;
+    for (size_t cursor = index; cursor > 0;) {
+      --cursor;
+      if (ProducesLocalDFBResource(statements[cursor], *resource)) {
+        producer = cursor;
+        break;
+      }
+      if (ReferencesDFBResource(statements[cursor], *resource) &&
+          !ReleasesDFBResource(statements[cursor], *resource))
+        break;
+    }
+    if (producer == index)
+      continue;
+    size_t target = producer + 1;
+    for (size_t cursor = target; cursor < index; ++cursor)
+      if (ReferencesDFBResource(statements[cursor], *resource))
+        target = cursor + 1;
+    if (target == index)
+      continue;
+    Span producer_span = statements[producer]->span;
+    ffi::Array<PrimExpr> wait_args;
+    for (const PrimExpr &arg : call->args) {
+      if (auto integer = arg.as<IntImm>())
+        wait_args.push_back(IntImm(integer.value()->dtype,
+                                   integer.value()->value, producer_span));
+      else
+        wait_args.push_back(arg);
+    }
+    auto wait_annotations = call->annotations;
+    auto identity = wait_annotations.Get("tt.stream_identity");
+    if (identity.has_value()) {
+      ffi::Array<Integer> normalized;
+      for (const Integer &value :
+           Downcast<ffi::Array<Integer>>(identity.value()))
+        normalized.push_back(IntImm(value->dtype, value->value, producer_span));
+      wait_annotations.Set("tt.stream_identity", normalized);
+    }
+    Stmt wait = Evaluate(
+        Call(call->dtype, call->op, wait_args, wait_annotations, producer_span),
+        producer_span);
+    statements.erase(statements.begin() + index);
+    statements.insert(statements.begin() + target, wait);
+    changed = true;
+    --index;
+  }
+  if (!changed)
+    return body;
+  ffi::Array<Stmt> scheduled(statements.begin(), statements.end());
+  return SeqStmt(scheduled, body->span);
+}
+
 static Stmt CompactDeviceStatementsImpl(const Stmt &body,
                                         bool semantic_core_locals,
                                         bool allow_dfb_variants = false) {
@@ -1192,7 +1307,9 @@ private:
         semantic_core_locals_ &&
         std::string(op->loop_var->name_hint).rfind("tt_compact_iteration", 0) ==
             0;
-    Stmt body = CompactDeviceStatementsImpl(op->body, semantic_core_locals_,
+    Stmt normalized =
+        semantic_core_locals_ ? ScheduleLocalDFBWaits(op->body) : op->body;
+    Stmt body = CompactDeviceStatementsImpl(normalized, semantic_core_locals_,
                                             generated_compact_loop);
     if (semantic_core_locals_)
       body = ExtendGeneratedCompactLoops(body);
@@ -1214,8 +1331,9 @@ Stmt CompactDeviceStatementsRecursive(const Stmt &body) {
 }
 
 static Stmt CompactGeneratedDeviceStatementsRecursive(const Stmt &body) {
+  Stmt scheduled = ScheduleLocalDFBWaits(body);
   Stmt compact =
-      CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/true,
+      CompactDeviceStatementsImpl(scheduled, /*semantic_core_locals=*/true,
                                   /*allow_dfb_variants=*/false);
   compact = ExtendGeneratedCompactLoops(compact);
   NestedDeviceStatementCompactor nested(/*semantic_core_locals=*/true);
