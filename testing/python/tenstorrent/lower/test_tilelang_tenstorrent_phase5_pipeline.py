@@ -92,6 +92,30 @@ def test_pipeline_materializes_bounded_windows(stages, extent, start, arch):
     ir.assert_structural_equal(mod, VerifyTenstorrentDeviceIR()(mod))
 
 
+@pytest.mark.parametrize("stages", [0, 1, 2, 3])
+@pytest.mark.parametrize("arch", ["wormhole_b0", "blackhole"])
+def test_loop_plan_keeps_input_immutable_and_reusable(stages, arch):
+    """Lowering must not mutate its input, and must be re-runnable on the same input.
+
+    This is the observable proxy for "specialize and consume one proof instance at a
+    time" (see FormMulticoreProgram): an implementation that materializes a gx*gy clone
+    of the structured input and specializes it in place would either mutate the caller's
+    IRModule or produce a different module on the second run.
+    """
+    func = make_pipeline(stages=stages, extent=3, start=4)
+    original = ir.save_json(func)
+    first = lower_pipeline(func, arch)
+    assert ir.save_json(func) == original, "lowering must not mutate its input IRModule"
+    second = lower_pipeline(func, arch)
+    assert ir.save_json(func) == original, "input must stay immutable across repeated lowering"
+    assert ir.save_json(first) == ir.save_json(second)
+    if stages:
+        assert int(first.attrs["tt.pipeline_stages"]) == stages
+        assert int(first.attrs["tt.pipeline_extent"]) == 3
+    else:
+        assert "tt.pipeline_stages" not in first.attrs
+
+
 def test_pipeline_explicit_capacity_preserved_and_insufficient_diagnosed():
     mod = lower_pipeline(make_pipeline(3, 5, block_count=4))
     assert {int(desc.block_count) for desc in mod.attrs["tt.dfb_table"]} == {4}
