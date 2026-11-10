@@ -94,17 +94,19 @@ def test_missing_release_and_release_before_read():
     mod = device()
     func = next(f for f in mod.functions.values() if f.attrs["tt.kernel_slot"] == "trisc")
     statements = _core_statements(func)
-    release = next(i for i, stmt in enumerate(statements) if stmt.value.op.name == "tl.tt.dfb_release")
+    bindings = [stmt for stmt in statements if isinstance(stmt, tirx.Bind)]
+    actions = [stmt for stmt in statements if not isinstance(stmt, tirx.Bind)]
+    release = next(i for i, stmt in enumerate(actions) if stmt.value.op.name == "tl.tt.dfb_release")
     missing = ir.load_json(ir.save_json(mod))
     missing.update_func(
         missing.get_global_var(str(func.attrs["global_symbol"])),
-        _with_core_statements(func, statements[:release] + statements[release + 1 :]),
+        _with_core_statements(func, [*bindings, *actions[:release], *actions[release + 1 :]]),
     )
     check_rejected(missing, "missing release")
     premature = ir.load_json(ir.save_json(mod))
     premature.update_func(
         premature.get_global_var(str(func.attrs["global_symbol"])),
-        _with_core_statements(func, [statements[release], *statements[:release], *statements[release + 1 :]]),
+        _with_core_statements(func, [*bindings, actions[release], *actions[:release], *actions[release + 1 :]]),
     )
     check_rejected(premature, "must follow wait|release precedes|no active acquisition")
 

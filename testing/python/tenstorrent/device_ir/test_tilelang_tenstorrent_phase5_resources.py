@@ -35,7 +35,19 @@ def pipeline(stages=2, extent=3, capacity=None):
 
 
 def statements(mod, slot):
-    return [tirx.Evaluate(call) for call in _calls(_slots(mod)[slot].body)]
+    return [
+        tirx.Evaluate(call)
+        for call in _calls(
+            _slots(mod)[slot].body,
+            collapse_resource_refs=False,
+        )
+    ]
+
+
+def stream_id(expression):
+    assert isinstance(expression, tirx.Call)
+    assert expression.op.name == "tl.tt.dfb_stream_ref"
+    return int(expression.args[0])
 
 
 def replace_statements(mod, slot, body):
@@ -83,7 +95,10 @@ def test_stream_capacity_and_closed_lifetimes(stages, extent):
     assert [int(group.storage_group_id) for group in groups] == list(range(len(groups)))
     assert all(int(group.block_count) == depth for group in groups)
     releases = [
-        int(stmt.value.args[0]) for slot in ("trisc", "ncrisc") for stmt in statements(mod, slot) if operation(stmt) == "tl.tt.dfb_release"
+        stream_id(stmt.value.args[0])
+        for slot in ("trisc", "ncrisc")
+        for stmt in statements(mod, slot)
+        if operation(stmt) == "tl.tt.dfb_release"
     ]
     assert sorted(releases) == list(range(len(groups)))
     transform.VerifyTenstorrentDeviceIR()(ir.load_json(ir.save_json(mod)))
@@ -190,8 +205,8 @@ def test_use_after_release():
     mod = pipeline()
     body = statements(mod, "trisc")
     index = next(i for i, stmt in enumerate(body) if operation(stmt) == "tl.tt.dfb_release")
-    released = int(body[index].value.args[0])
-    prior = next(stmt for stmt in body[:index] if operation(stmt) == "tl.tt.dfb_wait" and int(stmt.value.args[0]) == released)
+    released = stream_id(body[index].value.args[0])
+    prior = next(stmt for stmt in body[:index] if operation(stmt) == "tl.tt.dfb_wait" and stream_id(stmt.value.args[0]) == released)
     body.insert(index + 1, prior)
     replace_statements(mod, "trisc", body)
     rejected(mod, "after release|no matching producer|release precedes")

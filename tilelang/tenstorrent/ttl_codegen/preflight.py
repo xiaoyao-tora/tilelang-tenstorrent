@@ -50,6 +50,10 @@ def preflight_ttl_mapping(mod: IRModule) -> None:
     current_operations = {
         "tl.tt.core_x",
         "tl.tt.core_y",
+        "tl.tt.tensor_ref",
+        "tl.tt.dfb_stream_ref",
+        "tl.tt.pipe_net_ref",
+        "tl.tt.accumulator_ref",
         "tl.tt.dfb_compute",
         "tl.tt.dfb_load",
         "tl.tt.compute_broadcast",

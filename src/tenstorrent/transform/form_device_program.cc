@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -492,6 +493,11 @@ public:
     return resource.metadata->buffer_id + ".generation" +
            std::to_string(resource.generation) + "." + resource.producer + "." +
            resource.consumer;
+  }
+  ffi::String ResourceDebugName(int64_t id) const {
+    if (id < 0 || id >= static_cast<int64_t>(resources_.size()))
+      ThrowMalformed("resource debug-name index is out of range");
+    return resources_[id].metadata->buffer->name;
   }
   std::string ResourceStorageIdentity(int64_t id) const {
     if (id < 0 || id >= static_cast<int64_t>(resources_.size()))
@@ -3122,28 +3128,257 @@ class TransientDeviceAnnotationRemover : public StmtExprMutator {
 class DeviceCallExpressionSimplifier : public StmtExprMutator {
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
-    if (!call->op.same_as(tenstorrent::dfb_pipe_send_record()) &&
-        !call->op.same_as(tenstorrent::dfb_pipe_recv_record()) &&
-        !call->op.same_as(tenstorrent::dfb_pipe_wait_record()))
+    bool record = call->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
+                  call->op.same_as(tenstorrent::dfb_pipe_recv_record()) ||
+                  call->op.same_as(tenstorrent::dfb_pipe_wait_record());
+    bool tensor = call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
+                  call->op.same_as(tenstorrent::dfb_to_tensor_nd());
+    if (!record && !tensor)
       return call;
     auto args = call->args;
-    for (size_t index = 0; index < args.size(); ++index)
+    for (size_t index = tensor ? 2 : 0; index < args.size(); ++index)
       args.Set(index, analyzer_.Simplify(args[index]));
     auto annotations = call->annotations;
-    for (const auto &[key, object] : call->annotations) {
-      if (auto expression = object.as<PrimExpr>()) {
-        annotations.Set(key, analyzer_.Simplify(expression.value()));
-      } else if (auto expressions = object.as<ffi::Array<PrimExpr>>()) {
-        ffi::Array<PrimExpr> simplified;
-        for (const PrimExpr &expression : expressions.value())
-          simplified.push_back(analyzer_.Simplify(expression));
-        annotations.Set(key, simplified);
+    if (record) {
+      for (const auto &[key, object] : call->annotations) {
+        if (auto expression = object.as<PrimExpr>()) {
+          annotations.Set(key, analyzer_.Simplify(expression.value()));
+        } else if (auto expressions = object.as<ffi::Array<PrimExpr>>()) {
+          ffi::Array<PrimExpr> simplified;
+          for (const PrimExpr &expression : expressions.value())
+            simplified.push_back(analyzer_.Simplify(expression));
+          annotations.Set(key, simplified);
+        }
       }
     }
     return Call(call->dtype, call->op, args, annotations, call->span);
   }
 
   arith::Analyzer analyzer_;
+};
+
+enum class DeviceResourceKind : int {
+  kTensor = 0,
+  kDFBStream = 1,
+  kPipeNet = 2,
+  kAccumulator = 3,
+};
+
+using DeviceResourceKey = std::pair<DeviceResourceKind, int64_t>;
+
+struct DeviceResourceNames {
+  std::array<std::map<int64_t, std::string>, 4> by_kind;
+
+  const std::string &Get(DeviceResourceKind kind, int64_t id) const {
+    const auto &names = by_kind[static_cast<size_t>(kind)];
+    auto found = names.find(id);
+    if (found == names.end())
+      ThrowMalformed("Device resource alias has no stable debug name");
+    return found->second;
+  }
+};
+
+std::string ResourceFallbackName(DeviceResourceKind kind, int64_t id);
+
+std::string SanitizeResourceName(std::string name) {
+  for (char &character : name)
+    if (!std::isalnum(static_cast<unsigned char>(character)) &&
+        character != '_')
+      character = '_';
+  if (name.empty() || std::isdigit(static_cast<unsigned char>(name.front())))
+    name = "resource_" + name;
+  return name;
+}
+
+std::map<int64_t, std::string>
+BuildResourceNames(const std::map<int64_t, std::set<std::string>> &sources,
+                   DeviceResourceKind kind, const std::string &suffix) {
+  std::map<int64_t, std::string> result;
+  std::set<std::string> used;
+  for (const auto &[id, names] : sources) {
+    std::string name = names.size() == 1
+                           ? SanitizeResourceName(*names.begin()) + suffix
+                           : ResourceFallbackName(kind, id);
+    if (!used.insert(name).second) {
+      name += "_" + std::to_string(id);
+      used.insert(name);
+    }
+    result.emplace(id, std::move(name));
+  }
+  return result;
+}
+
+const Op &ResourceRefOp(DeviceResourceKind kind) {
+  switch (kind) {
+  case DeviceResourceKind::kTensor:
+    return tenstorrent::tensor_ref();
+  case DeviceResourceKind::kDFBStream:
+    return tenstorrent::dfb_stream_ref();
+  case DeviceResourceKind::kPipeNet:
+    return tenstorrent::pipe_net_ref();
+  case DeviceResourceKind::kAccumulator:
+    return tenstorrent::accumulator_ref();
+  }
+  TVM_FFI_UNREACHABLE();
+}
+
+std::string ResourceFallbackName(DeviceResourceKind kind, int64_t id) {
+  const char *prefix = kind == DeviceResourceKind::kTensor      ? "tensor"
+                       : kind == DeviceResourceKind::kDFBStream ? "stream"
+                       : kind == DeviceResourceKind::kPipeNet   ? "pipe_net"
+                                                                : "accumulator";
+  return std::string(prefix) + "_" + std::to_string(id);
+}
+
+std::vector<std::pair<size_t, DeviceResourceKind>>
+ResourceOperands(const Call &call) {
+  std::vector<std::pair<size_t, DeviceResourceKind>> result;
+  auto add = [&](size_t index, DeviceResourceKind kind) {
+    result.emplace_back(index, kind);
+  };
+  if (call->op.same_as(tenstorrent::dfb_compute())) {
+    for (size_t index = 0; index < call->args.size(); ++index)
+      add(index, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::compute_value())) {
+    for (size_t index = 1; index < call->args.size(); ++index)
+      add(index, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::compute_value_gemm())) {
+    add(1, DeviceResourceKind::kDFBStream);
+    add(2, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::compute_value_store())) {
+    add(1, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::dfb_load()) ||
+             call->op.same_as(tenstorrent::dfb_reserve()) ||
+             call->op.same_as(tenstorrent::dfb_wait()) ||
+             call->op.same_as(tenstorrent::dfb_copy_wait()) ||
+             call->op.same_as(tenstorrent::dfb_release())) {
+    add(0, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::tensor_to_dfb_nd())) {
+    add(0, DeviceResourceKind::kTensor);
+    add(1, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::dfb_to_tensor_nd())) {
+    add(0, DeviceResourceKind::kDFBStream);
+    add(1, DeviceResourceKind::kTensor);
+  } else if (call->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
+             call->op.same_as(tenstorrent::dfb_pipe_recv_record()) ||
+             call->op.same_as(tenstorrent::dfb_pipe_wait_record())) {
+    add(0, DeviceResourceKind::kPipeNet);
+    add(2, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::gemm_update())) {
+    add(0, DeviceResourceKind::kDFBStream);
+    add(1, DeviceResourceKind::kDFBStream);
+    add(2, DeviceResourceKind::kAccumulator);
+  } else if (call->op.same_as(tenstorrent::accumulator_init())) {
+    add(0, DeviceResourceKind::kAccumulator);
+  } else if (call->op.same_as(tenstorrent::accumulator_materialize())) {
+    add(0, DeviceResourceKind::kAccumulator);
+    add(1, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::dfb_local_copy()) ||
+             call->op.same_as(tenstorrent::dfb_gather_copy())) {
+    add(0, DeviceResourceKind::kDFBStream);
+    add(1, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::dfb_collective_reduce())) {
+    add(0, DeviceResourceKind::kDFBStream);
+    add(1, DeviceResourceKind::kDFBStream);
+    add(2, DeviceResourceKind::kDFBStream);
+  }
+  return result;
+}
+
+class DeviceResourceUseCollector : public StmtExprVisitor {
+public:
+  const std::map<DeviceResourceKey, size_t> &Counts() const { return counts_; }
+
+private:
+  void VisitExpr_(const CallNode *op) final {
+    Call call = ffi::GetRef<Call>(op);
+    for (const auto &[index, kind] : ResourceOperands(call)) {
+      if (index >= call->args.size())
+        ThrowMalformed("resource alias operand is missing");
+      if (const int64_t *id = as_const_int(call->args[index]))
+        ++counts_[{kind, *id}];
+      else if (!call->args[index].dtype().is_int() ||
+               call->args[index].dtype().lanes() != 1 ||
+               SideEffect(call->args[index]) > CallEffectKind::kPure)
+        ThrowMalformed(
+            "parameterized resource ID must be a pure scalar integer");
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  std::map<DeviceResourceKey, size_t> counts_;
+};
+
+class DeviceResourceRefRewriter : public StmtExprMutator {
+public:
+  explicit DeviceResourceRefRewriter(
+      const std::map<DeviceResourceKey, Var> *aliases)
+      : aliases_(aliases) {}
+
+private:
+  PrimExpr ResourceRef(DeviceResourceKind kind, const PrimExpr &id,
+                       const Span &span) const {
+    if (const int64_t *constant = as_const_int(id)) {
+      auto alias = aliases_->find({kind, *constant});
+      if (alias != aliases_->end())
+        return alias->second;
+    }
+    return Call(DataType::Handle(), ResourceRefOp(kind), {id}, {}, span);
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    auto args = call->args;
+    for (const auto &[index, kind] : ResourceOperands(call)) {
+      args.Set(index, ResourceRef(kind, args[index], args[index]->span));
+    }
+    return Call(call->dtype, call->op, args, call->annotations, op->span);
+  }
+
+  const std::map<DeviceResourceKey, Var> *aliases_;
+};
+
+class DeviceResourceAliasMaterializer {
+public:
+  explicit DeviceResourceAliasMaterializer(const DeviceResourceNames *names)
+      : names_(names) {}
+
+  Stmt operator()(const Stmt &input) const {
+    return MaterializePrologue(input);
+  }
+
+private:
+  Stmt MaterializePrologue(const Stmt &input) const {
+    DeviceResourceUseCollector collector;
+    collector(input);
+    std::map<DeviceResourceKey, Var> aliases;
+    std::set<std::string> used_names;
+    for (const auto &[key, count] : collector.Counts()) {
+      bool name = key.first != DeviceResourceKind::kDFBStream || count > 1;
+      if (!name)
+        continue;
+      std::string candidate = names_->Get(key.first, key.second);
+      if (!used_names.insert(candidate).second) {
+        candidate += "_" + std::to_string(key.second);
+        used_names.insert(candidate);
+      }
+      aliases.emplace(key, Var(candidate, DataType::Handle()));
+    }
+    DeviceResourceRefRewriter rewrite(&aliases);
+    Stmt body = rewrite(input);
+    if (!aliases.empty()) {
+      ffi::Array<Stmt> sequence;
+      for (const auto &[key, variable] : aliases)
+        sequence.push_back(
+            Bind(variable, Call(DataType::Handle(), ResourceRefOp(key.first),
+                                {Integer(key.second)})));
+      sequence.push_back(body);
+      body = SeqStmt::Flatten(sequence);
+    }
+    return body;
+  }
+
+  const DeviceResourceNames *names_;
 };
 
 using StorageLocalKey = std::tuple<int64_t, int64_t, int64_t>;
@@ -3667,6 +3902,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   CoreDomain shared_domain(CoreCoord(0, 0), CoreCoord(gx, gy));
   std::map<std::string, int64_t> logical_resource_ids;
   std::map<int64_t, std::string> resource_storage_keys;
+  std::map<int64_t, std::set<std::string>> resource_debug_names;
   // Specialize and consume one proof instance at a time. Do not materialize a
   // gx*gy clone of the structured input before shared-body parameterization.
   TransportBufferCache transport_buffers;
@@ -3708,6 +3944,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
           logical_resource_ids.emplace(key, logical_resource_ids.size());
       int64_t global_id = found->second;
       resource_ids[local_id] = global_id;
+      resource_debug_names[global_id].insert(
+          std::string(planner.ResourceDebugName(local_id)));
       std::string storage_key = planner.ResourceStorageIdentity(local_id);
       if (inserted) {
         resource_storage_keys.emplace(global_id, std::move(storage_key));
@@ -3964,6 +4202,56 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   }
   compute_values = std::move(stream_values);
 
+  DeviceResourceNames resource_names;
+  std::map<int64_t, std::set<std::string>> tensor_name_sources;
+  for (size_t index = 0; index < frontend->params.size(); ++index) {
+    auto buffer = frontend->buffer_map.Get(frontend->params[index]);
+    if (!buffer.has_value())
+      ThrowMalformed("Tensor ABI parameter has no Buffer for resource naming");
+    tensor_name_sources[index].insert(std::string(buffer.value()->name));
+  }
+  resource_names.by_kind[static_cast<size_t>(DeviceResourceKind::kTensor)] =
+      BuildResourceNames(tensor_name_sources, DeviceResourceKind::kTensor,
+                         "_tensor");
+
+  std::map<int64_t, std::set<std::string>> stream_name_sources;
+  for (size_t resource = 0; resource < stream_plan.resource_stream_ids.size();
+       ++resource) {
+    int64_t stream = stream_plan.resource_stream_ids[resource];
+    auto names = resource_debug_names.find(resource);
+    if (stream < 0 || names == resource_debug_names.end() ||
+        names->second.empty())
+      ThrowMalformed("logical stream has no stable resource debug source");
+    stream_name_sources[stream].insert(names->second.begin(),
+                                       names->second.end());
+  }
+  resource_names.by_kind[static_cast<size_t>(DeviceResourceKind::kDFBStream)] =
+      BuildResourceNames(stream_name_sources, DeviceResourceKind::kDFBStream,
+                         "_stream");
+
+  std::map<int64_t, std::set<std::string>> pipe_name_sources;
+  for (const PipeDescriptor &pipe : pipes) {
+    if (pipe->communication_id < 0 ||
+        pipe->communication_id >= static_cast<int64_t>(communications.size()))
+      ThrowMalformed("PipeNet has no parent communication for resource naming");
+    const CommunicationDescriptor &communication =
+        communications[pipe->communication_id];
+    pipe_name_sources[pipe->pipe_net_id].insert(
+        std::string(communication->source_region->buffer->name));
+  }
+  resource_names.by_kind[static_cast<size_t>(DeviceResourceKind::kPipeNet)] =
+      BuildResourceNames(pipe_name_sources, DeviceResourceKind::kPipeNet,
+                         "_pipe");
+
+  std::map<int64_t, std::set<std::string>> accumulator_name_sources;
+  for (const AccumulatorDescriptor &accumulator : accumulators)
+    accumulator_name_sources[accumulator->accumulator_id].insert(
+        std::string(accumulator->accumulator_region->buffer->name));
+  resource_names
+      .by_kind[static_cast<size_t>(DeviceResourceKind::kAccumulator)] =
+      BuildResourceNames(accumulator_name_sources,
+                         DeviceResourceKind::kAccumulator, "_acc");
+
   const std::array<ffi::String, 3> slots = {"trisc", "ncrisc", "brisc"};
   for (size_t index = 0; index < slots.size(); ++index) {
     const ffi::String &slot = slots[index];
@@ -3975,6 +4263,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                                                       gy, slot, frontend->span);
     slot_body = DeviceCallExpressionSimplifier()(slot_body);
     slot_body = TransientDeviceAnnotationRemover()(slot_body);
+    slot_body = DeviceResourceAliasMaterializer(&resource_names)(slot_body);
     PrimFunc func = MakeSlotFunction(
         frontend, target, shared_domain, operation, slot,
         compute ? "compute" : "datamovement",

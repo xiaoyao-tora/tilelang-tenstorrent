@@ -70,6 +70,18 @@ explicit pool relation. The pure resolver binds the finite groups required by
 each kernel slot from typed producer/consumer ownership without expanding the
 body or materializing concrete descriptor tables.
 
+Current Device bodies distinguish resource identities from ordinary scalar
+integers with pure, handle-typed `tensor_ref`, `dfb_stream_ref`, `pipe_net_ref`,
+and `accumulator_ref` expressions. Each function places its static aliases in
+one contiguous PrimFunc prologue, with at most one alias per resource kind and
+canonical ID; a canonical parser-created root block is transparent to this
+rule. Names are diagnostic only and do not emit TTL operations. The resolver
+follows either a prologue alias or an inline reference, checks the expected
+resource kind, and uses the enclosed canonical table ID. A raw integer, an
+alias outside the prologue, an unbound handle, a mismatched reference kind, or
+a dynamic reference that the current mapping cannot select is rejected before
+optional compiler import.
+
 TT-Lang's current DFB identity analysis only traces a CB operand directly to
 `ttl.bind_cb` through unrealized casts. The current emitter must therefore add a
 narrow family-row resource-selection lowering (or the equivalent TT-Lang op and

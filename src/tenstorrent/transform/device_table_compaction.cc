@@ -908,6 +908,8 @@ public:
     auto shift = [&](size_t index, const std::map<CoreKey, int64_t> &offsets,
                      const char *label, bool optional = false) {
       Check(index < args.size(), std::string(label) + " operand is missing");
+      if (args[index].dtype().is_handle())
+        return;
       if (optional) {
         const int64_t *constant = tirx::as_const_int(args[index]);
         if (constant && *constant < 0)

@@ -44,6 +44,12 @@ TVM_DLL const Op &pipe_recv();
 TVM_DLL const Op &core_x();
 TVM_DLL const Op &core_y();
 
+/*! \brief Pure, kinded references to stable current Device resource IDs. */
+TVM_DLL const Op &tensor_ref();
+TVM_DLL const Op &dfb_stream_ref();
+TVM_DLL const Op &pipe_net_ref();
+TVM_DLL const Op &accumulator_ref();
+
 /*!
  * \brief Describe one source-exclusive, logically synchronous Core transfer.
  *

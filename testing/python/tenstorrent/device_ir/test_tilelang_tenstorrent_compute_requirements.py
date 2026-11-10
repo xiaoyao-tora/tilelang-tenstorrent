@@ -167,7 +167,7 @@ def test_inference_does_not_treat_control_flow_as_dominance(control):
     inferred = transform.InferTenstorrentComputeRequirements()(mod)
     with pytest.raises(
         (ValueError, error.TVMError),
-        match="shared slot body|Core work|cross-function Var",
+        match="shared slot body|Core work|cross-function Var|resource alias is outside the PrimFunc prologue",
     ):
         transform.VerifyTenstorrentDeviceIR()(inferred)
 

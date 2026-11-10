@@ -15,6 +15,10 @@ _FIXED_DTYPES = {
     "pipe_dst_range": "int32",
     "core_x": "int32",
     "core_y": "int32",
+    "tensor_ref": "handle",
+    "dfb_stream_ref": "handle",
+    "pipe_net_ref": "handle",
+    "accumulator_ref": "handle",
 }
 
 _DYNAMIC_DTYPE = {

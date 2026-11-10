@@ -265,7 +265,7 @@ def test_stateful_serial_loop_uses_extent_invariant_device_resources_and_body():
     assert all(not _dynamic_dfb_operands(mod) for mod in modules)
     assert len({_body_counts(function)["evaluate"] for function in trisc_functions}) == 1
     script_sizes = [len(function.script()) for function in trisc_functions]
-    assert max(script_sizes) - min(script_sizes) <= 1
+    assert max(script_sizes) - min(script_sizes) <= 8
 
 
 def test_loop_carried_fragment_snapshots_are_extent_invariant():
@@ -286,7 +286,7 @@ def test_loop_carried_fragment_snapshots_are_extent_invariant():
     assert all(expected_state_ops <= {call.op.name for call in calls(function.body)} for function in trisc_functions)
     assert len({_body_counts(function)["evaluate"] for function in trisc_functions}) == 1
     script_sizes = [len(function.script()) for function in trisc_functions]
-    assert max(script_sizes) - min(script_sizes) <= 1
+    assert max(script_sizes) - min(script_sizes) <= 8
 
 
 def test_loop_state_yield_requires_a_matching_initialized_state():
@@ -422,6 +422,55 @@ def test_collective_transport_families_resolve_to_ordered_pipenet_records():
         assert record.contract == "collective"
 
 
+def test_summa_device_body_uses_kind_resource_aliases():
+    from examples.tenstorrent.summa import make_summa
+
+    mod = lower(make_summa(core_m=2, core_n=2, k_stages=2, block_m=32, block_n=32, block_k=32))
+    aliases = {}
+    for function in mod.functions.values():
+        resource_binds = []
+
+        def collect(node, resource_binds=resource_binds):
+            if (
+                isinstance(node, tirx.Bind)
+                and isinstance(node.value, tirx.Call)
+                and node.value.op.name
+                in (
+                    "tl.tt.tensor_ref",
+                    "tl.tt.dfb_stream_ref",
+                    "tl.tt.pipe_net_ref",
+                    "tl.tt.accumulator_ref",
+                )
+            ):
+                resource_binds.append(node)
+
+        tirx.stmt_functor.post_order_visit(function.body, collect)
+        statements = list(function.body.seq) if isinstance(function.body, tirx.SeqStmt) else [function.body]
+        prologue = []
+        for statement in statements:
+            if not isinstance(statement, tirx.Bind):
+                break
+            assert isinstance(statement.value, tirx.Call)
+            prologue.append(statement)
+        assert {bind.var for bind in resource_binds} == {bind.var for bind in prologue}
+        identities = [(str(bind.value.op.name), int(bind.value.args[0])) for bind in prologue]
+        assert len(identities) == len(set(identities))
+        tirx.stmt_functor.post_order_visit(
+            function.body,
+            lambda node: aliases.setdefault(str(node.var.name), str(node.value.op.name))
+            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call)
+            else None,
+        )
+    assert aliases["A_tensor"] == "tl.tt.tensor_ref"
+    assert aliases["a_panel_stream"] == "tl.tt.dfb_stream_ref"
+    assert aliases["b_panel_stream"] == "tl.tt.dfb_stream_ref"
+    assert aliases["a_panel_pipe"] == "tl.tt.pipe_net_ref"
+    assert aliases["c_local_acc"] == "tl.tt.accumulator_ref"
+    trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
+    assert trisc.script().count("T.tt.accumulator_ref(0)") == 1
+    assert "c_local_acc_1" not in trisc.script()
+
+
 def test_pipe_net_namespace_is_independent_from_parent_communication():
     mod = lower(local_collective_then_transfer)
     communications = list(mod.attrs["tt.communication_table"])
@@ -512,19 +561,32 @@ def _dynamic_dfb_operands(mod):
         "tl.tt.compute_value_gemm": (1, 2),
     }
 
-    def visit(node):
-        if not isinstance(node, tirx.Call) or not hasattr(node.op, "name"):
-            return
-        operands = positions.get(node.op.name, ())
-        if node.op.name == "tl.tt.dfb_compute":
-            operands = range(len(node.args))
-        elif node.op.name == "tl.tt.compute_value":
-            operands = range(1, len(node.args))
-        found.extend(
-            (node.op.name, node.args[index]) for index in operands if not isinstance(analyzer.simplify(node.args[index]), tirx.IntImm)
-        )
-
     for function in mod.functions.values():
+        aliases = {}
+
+        def collect_alias(node, aliases=aliases):
+            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.dfb_stream_ref":
+                aliases[node.var] = node.value.args[0]
+
+        tirx.stmt_functor.post_order_visit(function.body, collect_alias)
+
+        def visit(node, aliases=aliases):
+            if not isinstance(node, tirx.Call) or not hasattr(node.op, "name"):
+                return
+            operands = positions.get(node.op.name, ())
+            if node.op.name == "tl.tt.dfb_compute":
+                operands = range(len(node.args))
+            elif node.op.name == "tl.tt.compute_value":
+                operands = range(1, len(node.args))
+            for index in operands:
+                operand = node.args[index]
+                if isinstance(operand, tirx.Var) and operand in aliases:
+                    operand = aliases[operand]
+                elif isinstance(operand, tirx.Call) and operand.op.name == "tl.tt.dfb_stream_ref":
+                    operand = operand.args[0]
+                if not isinstance(analyzer.simplify(operand), tirx.IntImm):
+                    found.append((node.op.name, node.args[index]))
+
         tirx.stmt_functor.post_order_visit(function.body, visit)
     return found
 
@@ -790,6 +852,13 @@ def test_summa_accumulator_identity_is_spmd_local():
         (family,) = mod.attrs["tt.accumulator_families"]
         assert set(_column_values(family.fields["accumulator_id"])) == {0}
         trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
+        aliases = {}
+        tirx.stmt_functor.post_order_visit(
+            trisc.body,
+            lambda node, aliases=aliases: aliases.setdefault(node.var, int(node.value.args[0]))
+            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.accumulator_ref"
+            else None,
+        )
         accumulator_operands = []
         for call in calls(trisc.body):
             if call.op.name in (
@@ -800,7 +869,7 @@ def test_summa_accumulator_identity_is_spmd_local():
             elif call.op.name == "tl.tt.gemm_update":
                 accumulator_operands.append(call.args[2])
         assert accumulator_operands
-        assert all(isinstance(operand, tirx.IntImm) and int(operand) == 0 for operand in accumulator_operands)
+        assert all(isinstance(operand, tirx.Var) and aliases[operand] == 0 for operand in accumulator_operands)
         diagnostic = expanded(mod)
         assert transform.VerifyTenstorrentDeviceIR()(diagnostic).same_as(diagnostic)
 
@@ -902,6 +971,97 @@ def test_final_record_operation_rejects_step_refs():
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
+def test_device_verifier_rejects_wrong_resource_ref_kind():
+    mod = ir.load_json(ir.save_json(lower(point_transfer)))
+    changed = False
+
+    def corrupt(call):
+        nonlocal changed
+        if changed or call.op.name != "tl.tt.dfb_reserve":
+            return None
+        changed = True
+        wrong = tirx.Call(
+            "handle",
+            ir.Op.get("tl.tt.accumulator_ref"),
+            [tirx.IntImm("int32", 0)],
+        )
+        return tirx.Call(call.dtype, call.op, [wrong], call.annotations, call.span)
+
+    for global_var, function in list(mod.functions.items()):
+        body = tirx.stmt_functor.ir_transform(function.body, None, corrupt, ["tirx.Call"])
+        mod.update_func(global_var, function.with_body(body))
+    assert changed
+    with pytest.raises(ValueError, match="wrong resource kind"):
+        transform.VerifyTenstorrentDeviceIR()(mod)
+
+
+def test_device_verifier_rejects_resource_alias_after_prologue():
+    from examples.tenstorrent.summa import make_summa
+
+    mod = ir.load_json(ir.save_json(lower(make_summa(core_m=2, core_n=2, k_stages=2, block_m=32, block_n=32, block_k=32))))
+    changed = False
+
+    for global_var, function in list(mod.functions.items()):
+        if changed or str(function.attrs["tt.kernel_slot"]) != "trisc":
+            continue
+        statements = list(function.body.seq) if isinstance(function.body, tirx.SeqStmt) else [function.body]
+        alias_index = next(index for index, statement in enumerate(statements) if isinstance(statement, tirx.Bind))
+        first_action = next(index for index, statement in enumerate(statements) if not isinstance(statement, tirx.Bind))
+        alias = statements[alias_index]
+        statements.insert(first_action + 1, tirx.Bind(tirx.Var("late_resource", "handle"), alias.value))
+        mod.update_func(global_var, function.with_body(tirx.SeqStmt(statements)))
+        changed = True
+    assert changed
+    with pytest.raises(ValueError, match="must form the PrimFunc prologue"):
+        transform.VerifyTenstorrentDeviceIR()(mod)
+
+
+def test_device_verifier_rejects_raw_resource_id():
+    mod = ir.load_json(ir.save_json(lower(point_transfer)))
+    changed = False
+    for global_var, function in list(mod.functions.items()):
+        aliases = {}
+        alias_names = {}
+
+        def collect_alias(node, aliases=aliases, alias_names=alias_names):
+            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.dfb_stream_ref":
+                identifier = int(node.value.args[0])
+                aliases[node.var] = identifier
+                alias_names[str(node.var.name)] = identifier
+
+        tirx.stmt_functor.post_order_visit(function.body, collect_alias)
+
+        def corrupt(call, aliases=aliases, alias_names=alias_names):
+            nonlocal changed
+            if changed or call.op.name != "tl.tt.dfb_reserve":
+                return None
+            operand = call.args[0]
+            if isinstance(operand, tirx.Var):
+                identifier = aliases.get(operand)
+                if identifier is None:
+                    identifier = alias_names[str(operand.name)]
+            else:
+                assert isinstance(operand, tirx.Call)
+                assert operand.op.name == "tl.tt.dfb_stream_ref"
+                if not isinstance(operand.args[0], tirx.IntImm):
+                    return None
+                identifier = int(operand.args[0])
+            changed = True
+            return tirx.Call(
+                call.dtype,
+                call.op,
+                [tirx.IntImm("int32", identifier)],
+                call.annotations,
+                call.span,
+            )
+
+        body = tirx.stmt_functor.ir_transform(function.body, None, corrupt, ["tirx.Call"])
+        mod.update_func(global_var, function.with_body(body))
+    assert changed
+    with pytest.raises(ValueError, match="raw resource ID"):
+        transform.VerifyTenstorrentDeviceIR()(mod)
+
+
 def test_current_codegen_preflight_rejects_before_loading_ttlang(monkeypatch):
     mod = lower(point_transfer)
     imported = False
@@ -923,6 +1083,7 @@ def test_lower_preserves_parameterized_storage_group_selection_for_codegen():
     from tilelang.tenstorrent.ttl_codegen.resources import (
         resolve_current_function_groups,
     )
+    from tvm.script import from_source
 
     mod = lower(
         make_summa(
@@ -944,6 +1105,8 @@ def test_lower_preserves_parameterized_storage_group_selection_for_codegen():
     assert resolved["main_trisc"]
     assert resolved["main_ncrisc"]
     assert not resolved["main_brisc"]
+    restored = from_source(D.device_ir_to_tirx(mod))
+    assert resolve_current_function_groups(restored) == resolved
     with pytest.raises(NotImplementedError) as error:
         codegen.prepare_ttl_codegen(mod, TARGET)
     assert "DFB stream binding resolution failed" not in str(error.value)

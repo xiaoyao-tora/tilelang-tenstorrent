@@ -13,7 +13,7 @@ from tvm import tirx
 TARGET = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
 
 
-def _specialize_expr(expr, bindings, core):
+def _specialize_expr(expr, bindings, core, *, collapse_resource_refs=True):
     expr = tirx.stmt_functor.substitute(expr, bindings)
     if core is not None:
 
@@ -25,40 +25,111 @@ def _specialize_expr(expr, bindings, core):
             return None
 
         expr = tirx.stmt_functor.ir_transform(tirx.Evaluate(expr), rewrite, None, ["tirx.Call"]).value
-    return tvm.arith.Analyzer().simplify(expr)
+    expr = tvm.arith.Analyzer().simplify(expr)
+    if collapse_resource_refs:
+
+        def collapse_ref(node):
+            if isinstance(node, tirx.Call) and str(node.op.name) in (
+                "tl.tt.tensor_ref",
+                "tl.tt.dfb_stream_ref",
+                "tl.tt.pipe_net_ref",
+                "tl.tt.accumulator_ref",
+            ):
+                assert len(node.args) == 1 and isinstance(node.args[0], tirx.IntImm)
+                return tirx.IntImm("int32", int(node.args[0]))
+            return None
+
+        expr = tirx.stmt_functor.ir_transform(tirx.Evaluate(expr), collapse_ref, None, ["tirx.Call"]).value
+    return expr
 
 
-def _specialize_call(call, bindings, core):
-    args = [_specialize_expr(arg, bindings, core) for arg in call.args]
+def _specialize_call(call, bindings, core, *, collapse_resource_refs=True):
+    def specialize(expression):
+        if collapse_resource_refs:
+            return _specialize_expr(expression, bindings, core)
+        return _specialize_expr(
+            expression,
+            bindings,
+            core,
+            collapse_resource_refs=False,
+        )
+
+    args = [specialize(arg) for arg in call.args]
     annotations = {key: value for key, value in call.annotations.items()}
     if "tt.value_inputs" in annotations:
-        annotations["tt.value_inputs"] = [_specialize_expr(value, bindings, core) for value in annotations["tt.value_inputs"]]
+        annotations["tt.value_inputs"] = [specialize(value) for value in annotations["tt.value_inputs"]]
     if "tt.expression" in annotations:
-        annotations["tt.expression"] = _specialize_expr(annotations["tt.expression"], bindings, core)
+        annotations["tt.expression"] = specialize(annotations["tt.expression"])
     return tirx.Call(call.dtype, call.op, args, annotations, call.span)
 
 
-def _calls(body, bindings=None, core=None):
+def _calls(body, bindings=None, core=None, *, collapse_resource_refs=True):
     bindings = {} if bindings is None else bindings
     if isinstance(body, tirx.SeqStmt):
+        nested = dict(bindings)
         for stmt in body.seq:
-            yield from _calls(stmt, bindings, core)
+            if isinstance(stmt, tirx.Bind):
+                nested[stmt.var] = _specialize_expr(
+                    stmt.value,
+                    nested,
+                    core,
+                    collapse_resource_refs=False,
+                )
+                continue
+            yield from _calls(
+                stmt,
+                nested,
+                core,
+                collapse_resource_refs=collapse_resource_refs,
+            )
+    elif isinstance(body, tirx.Bind):
+        bindings[body.var] = _specialize_expr(
+            body.value,
+            bindings,
+            core,
+            collapse_resource_refs=False,
+        )
     elif isinstance(body, tirx.Evaluate) and isinstance(body.value, tirx.Call):
-        yield _specialize_call(body.value, bindings, core)
+        yield _specialize_call(
+            body.value,
+            bindings,
+            core,
+            collapse_resource_refs=collapse_resource_refs,
+        )
     elif isinstance(body, tirx.Evaluate) and int(body.value) == 0:
         return
     elif isinstance(body, tirx.IfThenElse):
-        yield from _calls(body.then_case, bindings, core)
+        yield from _calls(
+            body.then_case,
+            bindings,
+            core,
+            collapse_resource_refs=collapse_resource_refs,
+        )
         if body.else_case is not None:
-            yield from _calls(body.else_case, bindings, core)
+            yield from _calls(
+                body.else_case,
+                bindings,
+                core,
+                collapse_resource_refs=collapse_resource_refs,
+            )
     elif isinstance(body, tirx.SBlockRealize):
         domain = body.block.annotations.get("tt.core_domain")
         if domain is not None and core is None:
             for x in range(int(domain.begin.x), int(domain.end.x)):
                 for y in range(int(domain.begin.y), int(domain.end.y)):
-                    yield from _calls(body.block.body, bindings, (x, y))
+                    yield from _calls(
+                        body.block.body,
+                        bindings,
+                        (x, y),
+                        collapse_resource_refs=collapse_resource_refs,
+                    )
         else:
-            yield from _calls(body.block.body, bindings, core)
+            yield from _calls(
+                body.block.body,
+                bindings,
+                core,
+                collapse_resource_refs=collapse_resource_refs,
+            )
     elif isinstance(body, tirx.For):
         minimum = int(body.min)
         step = int(body.step) if body.step is not None else 1
@@ -66,16 +137,30 @@ def _calls(body, bindings=None, core=None):
             iteration = tirx.IntImm(body.loop_var.dtype, minimum + offset * step)
             nested = dict(bindings)
             nested[body.loop_var] = iteration
-            yield from _calls(body.body, nested, core)
+            yield from _calls(
+                body.body,
+                nested,
+                core,
+                collapse_resource_refs=collapse_resource_refs,
+            )
     else:
         raise AssertionError(f"Unexpected Device statement: {body}")
 
 
+def _resource_prologue_and_dispatch(func):
+    body = func.body
+    if isinstance(body, tirx.SBlockRealize) and str(body.block.name_hint) == "root":
+        body = body.block.body
+    statements = list(body.seq) if isinstance(body, tirx.SeqStmt) else [body]
+    split = 0
+    while split < len(statements) and isinstance(statements[split], tirx.Bind):
+        split += 1
+    assert len(statements[split:]) == 1
+    return statements[:split], statements[split]
+
+
 def _core_statements(func):
-    dispatch = func.body
-    if isinstance(dispatch, tirx.SeqStmt):
-        assert len(dispatch.seq) == 1
-        dispatch = dispatch.seq[0]
+    _prologue, dispatch = _resource_prologue_and_dispatch(func)
     realize = dispatch.then_case if isinstance(dispatch, tirx.IfThenElse) else dispatch
     assert isinstance(realize, tirx.SBlockRealize)
     body = realize.block.body
@@ -83,7 +168,7 @@ def _core_statements(func):
 
 
 def _with_core_statements(func, statements):
-    dispatch = func.body
+    prologue, dispatch = _resource_prologue_and_dispatch(func)
     realize = dispatch.then_case if isinstance(dispatch, tirx.IfThenElse) else dispatch
     assert isinstance(realize, tirx.SBlockRealize)
     block = realize.block
@@ -101,8 +186,11 @@ def _with_core_statements(func, statements):
     )
     realize = tirx.SBlockRealize(realize.iter_values, realize.predicate, updated)
     if isinstance(dispatch, tirx.IfThenElse):
-        return func.with_body(tirx.IfThenElse(dispatch.condition, realize, dispatch.else_case))
-    return func.with_body(realize)
+        dispatch = tirx.IfThenElse(dispatch.condition, realize, dispatch.else_case)
+    else:
+        dispatch = realize
+    body = [*prologue, dispatch]
+    return func.with_body(tirx.SeqStmt(body) if len(body) != 1 else body[0])
 
 
 def _round(value, dtype):

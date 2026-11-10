@@ -228,9 +228,23 @@ def test_resource_metadata_rejected(monkeypatch, change, match):
 
 def test_missing_wait_rejected(monkeypatch):
     mod = lower(monkeypatch, elementwise_program())
-    statements = _core_statements(_slots(mod)["trisc"])
+    trisc = _slots(mod)["trisc"]
+    statements = _core_statements(trisc)
+    aliases = {}
+    tirx.stmt_functor.post_order_visit(
+        trisc.body,
+        lambda node: aliases.setdefault(node.var, int(node.value.args[0]))
+        if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.dfb_stream_ref"
+        else None,
+    )
     statements = [
-        statement for statement in statements if not (statement.value.op.name == "tl.tt.dfb_wait" and int(statement.value.args[0]) == 0)
+        statement
+        for statement in statements
+        if not (
+            isinstance(statement, tirx.Evaluate)
+            and statement.value.op.name == "tl.tt.dfb_wait"
+            and aliases.get(statement.value.args[0]) == 0
+        )
     ]
     replace_core_statements(mod, "trisc", statements)
     with pytest.raises(ValueError, match="missing consumer wait|no active acquisition"):
@@ -239,7 +253,18 @@ def test_missing_wait_rejected(monkeypatch):
 
 def test_cross_slot_cycle_rejected(monkeypatch):
     mod = lower(monkeypatch, elementwise_program())
-    statements = [tirx.Evaluate(call) for call in _calls(_slots(mod)["ncrisc"].body)]
+    body = _slots(mod)["ncrisc"].body
+    aliases = {}
+    calls = []
+
+    def collect(node):
+        if isinstance(node, tirx.Bind):
+            aliases[node.var] = node.value
+        elif isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
+            calls.append(tirx.stmt_functor.substitute(node.value, aliases))
+
+    tirx.stmt_functor.post_order_visit(body, collect)
+    statements = [tirx.Evaluate(call) for call in calls]
     export_wait = next(i for i, statement in enumerate(statements) if statement.value.op.name == "tl.tt.dfb_wait")
     statements.insert(0, statements.pop(export_wait))
     replace_core_statements(mod, "ncrisc", statements)

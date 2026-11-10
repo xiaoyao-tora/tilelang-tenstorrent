@@ -83,18 +83,42 @@ def forge_fp32_output(mod):
     tensor_id = int(tensors[target].global_arg_index)
     tensors[target] = replace(tensors[target], TensorDescriptor, dtype="float32")
     dfbs = list(mod.attrs["tt.dfb_table"])
-    exports = []
+    resource_refs = {}
+    resource_ref_names = {}
     for function in mod.functions.values():
         tirx.stmt_functor.post_order_visit(
             function.body,
             lambda node: (
-                exports.append(node)
-                if isinstance(node, tirx.Call) and node.op.name == "tl.tt.dfb_to_tensor_nd" and int(node.args[1]) == tensor_id
-                else None
-            ),
+                resource_refs.setdefault(node.var, (node.value.op.name, int(node.value.args[0]))),
+                resource_ref_names.setdefault(str(node.var.name), (node.value.op.name, int(node.value.args[0]))),
+            )
+            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call)
+            else None,
         )
-    (export,) = exports
-    output = next(i for i, dfb in enumerate(dfbs) if int(dfb.dfb_id) == int(export.args[0]))
+
+    def resource_id(expr, kind):
+        if isinstance(expr, tirx.Var):
+            reference = resource_refs.get(expr) or resource_ref_names.get(str(expr.name))
+        elif isinstance(expr, tirx.Call):
+            reference = (expr.op.name, int(expr.args[0]))
+        else:
+            reference = None
+        return reference[1] if reference and reference[0] == kind else None
+
+    exports = []
+    for function in mod.functions.values():
+
+        def visit(node):
+            if (
+                isinstance(node, tirx.Call)
+                and node.op.name == "tl.tt.dfb_to_tensor_nd"
+                and resource_id(node.args[1], "tl.tt.tensor_ref") == tensor_id
+            ):
+                exports.append((node, resource_id(node.args[0], "tl.tt.dfb_stream_ref")))
+
+        tirx.stmt_functor.post_order_visit(function.body, visit)
+    ((export, output_id),) = exports
+    output = next(i for i, dfb in enumerate(dfbs) if int(dfb.dfb_id) == output_id)
     dfb_id = int(dfbs[output].dfb_id)
     groups = list(mod.attrs["tt.dfb_storage_groups"])
     groups[dfb_id] = replace(groups[dfb_id], DFBStorageGroupDescriptor, element_dtype="float32")
@@ -108,7 +132,7 @@ def forge_fp32_output(mod):
     mod.update_func(symbol, tirx.PrimFunc(ncrisc.params, ncrisc.body, ncrisc.ret_type, buffers, ncrisc.attrs, ncrisc.span))
 
     def remove_final_cast(call):
-        if call.op.name == "tl.tt.dfb_compute" and int(call.args[0]) == dfb_id:
+        if call.op.name == "tl.tt.dfb_compute" and resource_id(call.args[0], "tl.tt.dfb_stream_ref") == dfb_id:
             attrs = dict(call.annotations)
             expression = attrs["tt.expression"]
             attrs["tt.expression"] = (
