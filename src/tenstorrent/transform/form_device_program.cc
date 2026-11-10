@@ -60,6 +60,11 @@ using BufferMetadataMap =
     std::unordered_map<Buffer, TTBufferMetadata, ffi::ObjectPtrHash,
                        ffi::ObjectPtrEqual>;
 
+// Transport payload buffers are declared once for the whole program so every
+// Core role reuses one DFB identity and the storage table stays parameterized.
+using TransportBufferCache =
+    std::map<std::pair<int64_t, int64_t>, std::pair<Buffer, TTBufferMetadata>>;
+
 [[noreturn]] void ThrowMalformed(const std::string &message) {
   TVM_FFI_THROW(ValueError)
       << "[FormTenstorrentDeviceProgram] malformed input: " << message;
@@ -411,9 +416,11 @@ public:
   GeneralDataflowPlanner(const PrimFunc &frontend,
                          const ffi::Array<TTBufferMetadata> &metadata,
                          TransferKeys *transfers = nullptr, int64_t x = 0,
-                         int64_t y = 0)
+                         int64_t y = 0,
+                         TransportBufferCache *transport_buffers = nullptr)
       : transfers_(transfers), core_x_(x), core_y_(y), frontend_(frontend),
         metadata_(IndexBufferMetadata(metadata)),
+        transport_buffers_(transport_buffers),
         tensor_reads_(frontend->params.size(), false),
         tensor_writes_(frontend->params.size(), false) {
     auto grid = frontend_->GetAttr<ffi::Array<PrimExpr>>(kLaunchGridAttr);
@@ -2279,6 +2286,9 @@ private:
         args.push_back(range->min);
         args.push_back(range->extent);
       }
+      // Keep the load shape so a pipe send can re-issue the same panel into its
+      // transport buffer without sharing the compute DFB generation.
+      tensor_load_args_[id] = args;
       transfer_.push_back(
           MakeDeviceCall(tenstorrent::tensor_to_dfb_nd(), args, call->span));
       if (transfers_)
@@ -2433,6 +2443,37 @@ private:
     return storage;
   }
 
+  // A dedicated transport buffer keeps the compute panel and the payload as
+  // independent single-consumer generations in every Core role, so BRISC can
+  // own the inter-core transfer without sharing a DFB with TRISC computation.
+  Buffer MakeTransportBuffer(const Buffer &source, int64_t site,
+                             int64_t occurrence, const Span &span) {
+    auto key = std::make_pair(site, occurrence);
+    TransportBufferCache &cache =
+        transport_buffers_ ? *transport_buffers_ : local_transport_buffers_;
+    auto found = cache.find(key);
+    if (found != cache.end()) {
+      // Another Core already declared this payload; reuse its DFB identity so
+      // the storage table can stay parameterized across the launch grid.
+      metadata_.emplace(found->second.first, found->second.second);
+      return found->second.first;
+    }
+    const TTBufferMetadata &metadata =
+        RequireMetadata(metadata_, source, "transport payload");
+    const std::string name = "tt_transport_" + std::to_string(site) + "_" +
+                             std::to_string(occurrence);
+    Buffer storage = decl_buffer(source->shape, source->dtype, name, "shared",
+                                 std::nullopt, span);
+    TTBufferMetadata transport(
+        "transport.temp." + name, storage, "logical_dfb_candidate",
+        std::nullopt, metadata->tile_shape, metadata->tile_grid_shape,
+        "interleaved", std::nullopt, metadata->dfb_block_count, std::nullopt,
+        std::nullopt, "inferred", "inferred", "unset", "inferred", span);
+    metadata_.emplace(storage, transport);
+    cache.emplace(key, std::make_pair(storage, transport));
+    return storage;
+  }
+
   void PlanAllGather(const Call &call) {
     if (call->args.size() != 8)
       ThrowMalformed("all_gather arity mismatch");
@@ -2570,6 +2611,74 @@ private:
       }
   }
 
+  // NCRISC owns every payload move: a Tensor-backed panel is re-issued into
+  // the transport buffer so the compute panel and the payload keep exactly one
+  // consumer slot each, and any other payload is copied locally inside L1.
+  int64_t FillTransportPayload(const Buffer &transport,
+                               const BufferRegion &region, int64_t site,
+                               int64_t occurrence, const Span &span) {
+    auto current = current_.find(region->buffer->data);
+    if (current == current_.end())
+      ThrowMalformed("Pipe send payload has no producing definition");
+    const ResourceVersion &source = resources_[current->second];
+    auto loaded = tensor_load_args_.find(current->second);
+    if (source.backing.has_value() && loaded != tensor_load_args_.end()) {
+      // A Tensor-backed panel is local compute input and transport payload at
+      // the same time. Re-issue the load into the transport buffer so both
+      // generations keep exactly one consumer slot.
+      int64_t id = Write(transport, "ncrisc", source.backing);
+      resources_[id].consumer = "brisc";
+      Reserve(&transfer_, id, span);
+      const ffi::Array<PrimExpr> &original = loaded->second;
+      ffi::Array<PrimExpr> args;
+      args.push_back(original[0]);
+      args.push_back(Integer(id));
+      for (size_t index = 2; index < original.size(); ++index)
+        args.push_back(original[index]);
+      transfer_.push_back(MakeDeviceCall(tenstorrent::tensor_to_dfb_nd(),
+                                         std::move(args), span));
+      transfer_.push_back(MakeDeviceCall(tenstorrent::dfb_copy_wait(),
+                                         {Integer(id)}, span));
+      return id;
+    }
+    if (IsPipeline())
+      ThrowUnsupported("pipelined transport payload requires a Tensor-backed "
+                       "source panel");
+    // The payload already lives in the slot that produced it, so stage it from
+    // that same slot: a generation may only ever have one consumer slot, and
+    // the local copy stays inside L1 (no DRAM traffic).
+    const ffi::String slot = source.producer;
+    ffi::Array<Stmt> *body = slot == "trisc" ? &compute_ : &transfer_;
+    int64_t input = Read(region->buffer, slot);
+    int64_t id = Write(transport, slot);
+    resources_[id].consumer = "brisc";
+    Reserve(body, id, span);
+    Wait(body, input, span);
+    if (body == &compute_) {
+      // A compute-slot payload move is a plain local copy, not a collective
+      // contribution: keep it out of the all_gather/all_reduce local-kind
+      // accounting by expressing it as dfb_compute.
+      const TTBufferMetadata &metadata = resources_[id].metadata;
+      ffi::Map<ffi::String, ffi::ObjectRef> annotations{
+          {"tt.compute_kind", StringImm("copy")},
+          {"tt.compute_dtype",
+           StringImm(transport->dtype == DataType::BFloat(16) ? "bfloat16"
+                                                             : "float32")},
+          {"tt.compute_tile_shape", metadata->tile_shape},
+          {"tt.logical_domain", transport->shape},
+          {"tt.input_shapes",
+           ffi::Array<ffi::Array<PrimExpr>>{transport->shape}}};
+      body->push_back(Evaluate(
+          Call(DataType::Void(), tenstorrent::dfb_compute(),
+               {Integer(id), Integer(input)}, annotations, span),
+          span));
+    } else {
+      body->push_back(MakeDeviceCall(tenstorrent::dfb_local_copy(),
+                                     {Integer(input), Integer(id)}, span));
+    }
+    return id;
+  }
+
   void PlanPipe(const Call &call) {
     auto descriptor = call->annotations.Get("tt.pipe_record");
     if (!descriptor.has_value())
@@ -2581,53 +2690,29 @@ private:
                                 send ? kAccessRead : kAccessWrite)
             .region;
     FullRegion(region);
-    int64_t id;
-    bool forward = false;
-    if (send) {
-      int64_t input = Read(region->buffer, "trisc");
-      const ResourceVersion &resource = resources_[input];
-      forward = has_accumulator_compute_ && resource.producer == "ncrisc" &&
-                resource.backing.has_value();
-      if (forward) {
-        has_producer_forwarding_ = true;
-        // Forward the completed Tensor load before publishing the same panel
-        // to local computation. The verifier's publication frontier includes
-        // every send completion; no TRISC copy or second payload is needed.
-        id = input;
-      } else {
-        EnsurePrecision(Call(DataType::Void(), tile_compute(),
-                             {region->ToPrimExpr()}, {}, call->span),
-                        "copy");
-        id = Write(region->buffer, "trisc", std::nullopt, false);
-        resources_[id].consumer = "brisc";
-        Wait(&compute_, input, call->span);
-        Reserve(&compute_, id, call->span);
-        const auto &metadata = resources_[id].metadata;
-        ffi::Map<ffi::String, ffi::ObjectRef> annotations{
-            {"tt.compute_kind", StringImm("copy")},
-            {"tt.compute_dtype",
-             StringImm(region->buffer->dtype == DataType::BFloat(16)
-                           ? "bfloat16"
-                           : "float32")},
-            {"tt.compute_tile_shape", metadata->tile_shape},
-            {"tt.logical_domain", region->buffer->shape},
-            {"tt.input_shapes",
-             ffi::Array<ffi::Array<PrimExpr>>{region->buffer->shape}}};
-        compute_.push_back(Evaluate(
-            Call(DataType::Void(), tenstorrent::dfb_compute(),
-                 {Integer(id), Integer(input)}, annotations, call->span),
-            call->span));
-        Wait(&pipe_, id, call->span);
-      }
-    } else {
-      id = Write(region->buffer, "ncrisc");
-      Reserve(&transfer_, id, call->span);
-    }
     // Each endpoint's lexical occurrence names the same K-stage transaction.
     // Separate source/receiver counters also handle self-delivery.
     auto occurrence_key =
         std::make_tuple(record[0]->value, record[1]->value, send);
     int64_t occurrence = occurrences_[occurrence_key]++;
+    // A dedicated transport buffer keeps the compute panel and the outgoing
+    // payload as independent single-consumer generations, so BRISC can own the
+    // inter-core transfer without sharing a DFB with TRISC.
+    int64_t id;
+    if (send) {
+      Buffer transport = MakeTransportBuffer(region->buffer, record[0]->value,
+                                             occurrence, call->span);
+      // NCRISC owns every payload move and BRISC owns the inter-core transfer.
+      id = FillTransportPayload(transport, region, record[0]->value,
+                                occurrence, call->span);
+      Wait(&pipe_, id, call->span);
+    } else {
+      // The received payload lands directly in the consuming generation: BRISC
+      // publishes it with dfb_pipe_wait_record, so no Core-crossing wait or
+      // staging copy is introduced.
+      id = Write(region->buffer, "brisc");
+      Reserve(&pipe_, id, call->span);
+    }
     int64_t bx = send ? record[5]->value : core_x_;
     int64_t by = send ? record[6]->value : core_y_;
     int64_t ex = send ? record[7]->value : core_x_ + 1;
@@ -2658,12 +2743,14 @@ private:
         if (found != transfers_->end() && found->second != transfer)
           ThrowMalformed("communication transfer identity is not stable");
         (*transfers_)[key] = transfer;
-        endpoints_.push_back({transfer, occurrence, record, x, y, id, send,
-                              send && forward, call->span});
+        // BRISC owns the transfer, so no endpoint is a forwarded producer:
+        // every payload has its own single-consumer transport generation.
+        endpoints_.push_back(
+            {transfer, occurrence, record, x, y, id, send, false, call->span});
       }
     }
     int64_t site = record[0]->value, record_index = record[1]->value;
-    auto *body = send && !forward ? &pipe_ : &transfer_;
+    auto *body = &pipe_;
     body->push_back(MakeCommunicationDeviceCall(
         send ? tenstorrent::dfb_pipe_send_record()
              : tenstorrent::dfb_pipe_recv_record(),
@@ -2702,6 +2789,9 @@ private:
   std::unordered_set<int64_t> observable_resources_;
   std::set<int64_t> suppressed_compute_waits_;
   bool has_producer_forwarding_{false};
+  TransportBufferCache *transport_buffers_{nullptr};
+  TransportBufferCache local_transport_buffers_;
+  std::unordered_map<int64_t, ffi::Array<PrimExpr>> tensor_load_args_;
   int64_t next_loop_state_id_{0};
   TransferKeys *transfers_;
   int64_t core_x_, core_y_, grid_x_{1}, grid_y_{1};
@@ -3579,13 +3669,15 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   std::map<int64_t, std::string> resource_storage_keys;
   // Specialize and consume one proof instance at a time. Do not materialize a
   // gx*gy clone of the structured input before shared-body parameterization.
+  TransportBufferCache transport_buffers;
   for (int64_t index = 0; index < gx * gy; ++index) {
     int64_t x = index / gy, y = index % gy;
     StaticIterationSubstituter specialize_x(core_x_var, Integer(x));
     Stmt specialized = specialize_x(kernel_body);
     StaticIterationSubstituter specialize_y(core_y_var, Integer(y));
     specialized = specialize_y(specialized);
-    GeneralDataflowPlanner planner(frontend, metadata, &transfer_keys, x, y);
+    GeneralDataflowPlanner planner(frontend, metadata, &transfer_keys, x, y,
+                                   &transport_buffers);
     std::vector<For> independent_loops = FindIndependentLoops(specialized);
     planner.Plan(IndependentLoopBody(independent_loops, specialized));
     planner.EliminateDeadWrites();
