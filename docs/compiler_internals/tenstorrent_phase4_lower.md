@@ -52,9 +52,12 @@ GEMM fragment 的完整 K 生命周期和 v5 扩展见
 kind、输入顺序、结果 dtype、shape 和各 operation 的必要属性。`tile_compute`
 只能存在于中间 IR，不能出现在最终 Device IR。
 
-elementwise 的表达式是保留节点 dtype 的纯运算 DAG。Device 阶段的输入叶节点为
-`tl.tt.dfb_load`，它表示读入逻辑 DFB block 的 tile 值，不是从宿主内存取 scalar。
-最终表达式不得残留 frontend Buffer、BufferLoad、自由 Var 或未消费的 SBlock。
+elementwise 的表达式是保留节点 dtype 的纯运算 DAG。Legalize/Form 中间阶段可以使用
+`tl.tt.dfb_load(resource_id)` 和 `tl.tt.compute_value_load(value_id)`；current Device body
+必须改写成 `tl.tt.dfb_operand(index)` 和 `tl.tt.compute_value_operand(index)`。这里的
+`index` 是本调用有序 DFB operand 或 `tt.value_inputs` 的零基序号，不是资源 ID。资源身份
+只在调用 operand/value-input 列表中保存一次。最终表达式不得残留 frontend Buffer、
+BufferLoad、自由 Var、直接资源 ID leaf 或未消费的 SBlock。
 access map 与有序 input 对应。本轮每个 Buffer 只能有一种 access map；例如
 `A[i, j] + A[0, j]` 明确拒绝，不在去重时丢失差异。操作 kind 字符串不能替代表达式、
 轴或 accumulation 语义。当前 expression 集合不包含 comparison/select。
@@ -67,13 +70,18 @@ schema version，再按对应契约消费 operation。
 | --- | --- |
 | `tl.tt.tile_compute` | 参数为 `[output BufferRegion, input BufferRegions...]`；仅 Legalize→Form 中间层存在 |
 | `tl.tt.dfb_compute` | 参数为 `[output dfb_id, input dfb_ids...]`；output 必须是新的 generation，只有 TRISC 可执行 |
-| `tl.tt.dfb_load` | 单一 `dfb_id` 参数，result dtype 等于对应 DFB dtype；仅存在于纯 `tt.expression` 中 |
+| `tl.tt.dfb_operand` | 单一零基 operand index；result dtype 等于 `dfb_compute/compute_value` 对应 DFB operand dtype |
+| `tl.tt.compute_value_operand` | 单一零基 operand index；通过 `tt.value_inputs[index]` 解析 dominating compute value |
 | `tl.tt.tensor_to_dfb_nd` | `[tensor_id, dfb_id, min0, extent0, ...]`；NCRISC 发布已 reserve 的 DFB |
 | `tl.tt.dfb_to_tensor_nd` | `[dfb_id, tensor_id, min0, extent0, ...]`；NCRISC 消费已 wait 的 DFB |
-| `tl.tt.dfb_reserve` / `tl.tt.dfb_wait` | `[dfb_id, transaction_count]`，每次调用请求一个 block transaction，count 固定为 1 |
+| `tl.tt.dfb_reserve` / `tl.tt.dfb_wait` | 单一 logical stream operand；结构化循环和 stream descriptor 保存总 transaction cardinality |
 
-每个 compute 的公共 annotations 是 `tt.compute_kind`、`tt.compute_dtype`、
-`tt.compute_tile_shape`、`tt.logical_domain`、`tt.input_shapes` 和 `tt.access_maps`。
+current `dfb_compute` 的公共 annotations 是 `tt.compute_kind`、`tt.logical_domain` 和非空时的
+`tt.input_shapes`；output stream descriptor 是 output dtype 与 tile shape 的唯一权威。
+`compute_value` 的 dtype、tile shape 和 logical domain 全部来自 output
+`ComputeValueDescriptor`。两者都不得重复保存 `tt.compute_dtype`、
+`tt.compute_tile_shape` 或 `tt.value_input_shapes`，空的 `tt.input_shapes` / `tt.value_inputs`
+也必须省略。
 `tt.input_shapes` 按 input 参数保存逻辑 shape，不能用 tile-grid 代替：Reduction
 移除轴后，原本 untiled 的 batch 轴可能进入最后两轴，需要重新推导 output tile-grid。
 `tt.access_maps` 是按
@@ -82,14 +90,16 @@ input 参数顺序排列的整数 axis 数组，elementwise 中 `-1` 表示该�
 
 | kind | 额外语义 |
 | --- | --- |
-| `elementwise` / `typecast` / `fill` | `tt.expression` 保留运算 DAG；Fill 没有 DFB input；typecast 也不能丢失其内层复合表达式 |
+| `elementwise` / `typecast` / `fill` | `tt.expression` 保留运算 DAG；Fill 没有 DFB input；同 dtype 单一 operand 的直通 typecast 规范化为 `copy` |
 | `copy` | Form 为输出 snapshot 生成的同 dtype、同 shape 值复制 |
 | `transpose` | `tt.axes` 为保留 batch、交换末两轴的 permutation |
-| `gemm` | `tt.transpose_a`、`tt.transpose_b`、`tt.clear`、`tt.accum_dtype`；M/N/K 从经验证的 operand shape 推导；clear 为 false 时末尾 input 是旧 accumulator |
-| `reduce` | `tt.reduce_axis`、`tt.reduce_kind`、`tt.clear`、`tt.nan_propagate`、`tt.accum_dtype`；clear 为 false 时末尾 input 是旧输出值 |
+| `gemm` | `tt.transpose_a`、`tt.transpose_b` 和 `tt.accum_dtype`；M/N/K 从经验证的 operand shape 推导；存在末尾旧 accumulator operand 表示 clear=false |
+| `reduce` | `tt.reduce_axis`、`tt.reduce_kind`，以及非默认 `tt.nan_propagate` / `tt.accum_dtype`；存在末尾旧输出 operand 表示 clear=false |
 
-`tt.clear=true` 的 sum/GEMM 使用零初始化；max/min 使用对应归约单位元。
-`tt.clear=false` 从显式旧值开始累积，read-before-write 必须失败。
+没有旧值 operand 时 sum/GEMM 使用零初始化，max/min 使用对应归约单位元；存在旧值 operand
+时从该值开始累积，read-before-write 必须失败。`nan_propagate=false` 和等于 output dtype 的
+reduction accumulation dtype 是 current Device 默认值，不重复序列化；GEMM accumulation
+dtype 继续显式参与 compute-requirement 推导。
 
 ### 2.2 Shape 与 dtype
 

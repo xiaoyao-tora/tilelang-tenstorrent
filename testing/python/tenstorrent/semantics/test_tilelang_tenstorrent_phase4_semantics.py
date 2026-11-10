@@ -56,8 +56,10 @@ def expression(expr, values, maps, domain):
     elif isinstance(expr, tirx.Not):
         result = np.logical_not(expression(expr.a, values, maps, domain))
     elif isinstance(expr, tirx.Call):
-        if expr.op.name == "tl.tt.dfb_load":
+        if expr.op.name in ("tl.tt.dfb_operand", "tl.tt.dfb_load"):
             resource = int(expr.args[0])
+            if expr.op.name == "tl.tt.dfb_operand":
+                resource = maps[("dfb_operand", resource)]
             if resource in maps:
                 coordinates = np.indices(domain, sparse=True)
                 indices = tuple(0 if axis == -1 else coordinates[axis] for axis in maps[resource])
@@ -128,6 +130,7 @@ def run_device(mod, inputs):
         return result
     tensors = [cast(value, desc.dtype).copy() for value, desc in zip(inputs, mod.attrs["tt.tensor_table"])]
     values = {}
+    dfb_descriptors = {int(desc.dfb_id): desc for desc in mod.attrs["tt.dfb_table"]}
     preserve_next_release = set()
     streams = []
     from testing.python.tenstorrent._support.reference import _calls
@@ -162,6 +165,7 @@ def run_device(mod, inputs):
                 kind = attrs["tt.compute_kind"].value
                 domain = tuple(int(x) for x in attrs["tt.logical_domain"])
                 maps = {resource: [int(x) for x in axes] for resource, axes in zip(operands, attrs.get("tt.access_maps", []))}
+                maps.update({("dfb_operand", position): resource for position, resource in enumerate(operands)})
                 if kind in ("elementwise", "typecast", "fill"):
                     result = np.broadcast_to(expression(attrs["tt.expression"], values, maps, domain), domain)
                 elif kind == "copy":
@@ -175,7 +179,7 @@ def run_device(mod, inputs):
                     if int(attrs["tt.transpose_b"]):
                         b = b.T
                     result = a.astype(np.float32) @ b.astype(np.float32)
-                    if not int(attrs["tt.clear"]):
+                    if len(operands) == 3:
                         result = result + values[operands[2]].astype(np.float32)
                 elif kind == "reduce":
                     axis = int(attrs["tt.reduce_axis"])
@@ -185,14 +189,14 @@ def run_device(mod, inputs):
                         result = np.sum(source, axis=axis, dtype=np.float32)
                         combine = np.add
                     else:
-                        propagate = bool(int(attrs["tt.nan_propagate"]))
+                        propagate = bool(int(attrs.get("tt.nan_propagate", 0)))
                         combine = (np.maximum if propagate else np.fmax) if reduction == "max" else (np.minimum if propagate else np.fmin)
                         result = combine.reduce(source, axis=axis)
-                    if not int(attrs["tt.clear"]):
+                    if len(operands) == 2:
                         result = combine(values[operands[1]].astype(np.float32), result)
                 else:
                     raise AssertionError(kind)
-                values[output] = cast(result, attrs["tt.compute_dtype"].value).copy()
+                values[output] = cast(result, dfb_descriptors[output].element_dtype).copy()
                 if output in operands:
                     preserve_next_release.add(output)
             elif name == "tl.tt.dfb_release":

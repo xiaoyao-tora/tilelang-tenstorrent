@@ -96,10 +96,16 @@ TVM_DLL const Op &tile_add();
  * Operands are output followed by inputs. Legalization fixes operation kind,
  * dtypes, logical domain and operation-specific parameters in annotations.
  * Formation replaces regions with versioned DFB IDs in dfb_compute, and
- * expression BufferLoads with pure dfb_load values. No frontend block survives.
+ * current Device expressions refer to those ordered operands by zero-based
+ * dfb_operand/compute_value_operand indices. No frontend block survives.
  */
 TVM_DLL const Op &tile_compute();
 TVM_DLL const Op &dfb_compute();
+/*! \brief Current Device expression reference to an ordered DFB operand. */
+TVM_DLL const Op &dfb_operand();
+/*! \brief Current Device expression reference to tt.value_inputs by index. */
+TVM_DLL const Op &compute_value_operand();
+// Legacy/intermediate expression references retain direct resource identities.
 TVM_DLL const Op &dfb_load();
 /*! \brief Pure structured-expression broadcast over the listed logical axes. */
 TVM_DLL const Op &compute_broadcast();

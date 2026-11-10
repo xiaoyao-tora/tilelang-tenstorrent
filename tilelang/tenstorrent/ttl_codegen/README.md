@@ -82,6 +82,14 @@ alias outside the prologue, an unbound handle, a mismatched reference kind, or
 a dynamic reference that the current mapping cannot select is rejected before
 optional compiler import.
 
+Current compute expressions use the same single-source rule. The ordered
+`dfb_compute`/`compute_value` operands and `tt.value_inputs` contain canonical
+identities once; `dfb_operand(index)` and `compute_value_operand(index)` select
+them by zero-based position. Output dtype/tile geometry and compute-value shapes
+come from typed descriptors. The current emitter must resolve these indices
+before building TTL SSA and must not recover dependencies from duplicated IDs in
+expression leaves.
+
 TT-Lang's current DFB identity analysis only traces a CB operand directly to
 `ttl.bind_cb` through unrealized casts. The current emitter must therefore add a
 narrow family-row resource-selection lowering (or the equivalent TT-Lang op and

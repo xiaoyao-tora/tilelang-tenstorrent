@@ -127,12 +127,30 @@ def test_operation_diagnostic_identifies_symbol_resource_and_source():
 
     def edit(call):
         nonlocal changed
-        if not changed and call.op.name == "tl.tt.compute_value":
-            changed = True
-            attrs = dict(call.annotations)
-            attrs["tt.compute_dtype"] = tirx.StringImm("bfloat16")
-            return tirx.Call(call.dtype, call.op, call.args, attrs, call.span)
-        return None
+        if changed or call.op.name != "tl.tt.compute_value":
+            return None
+        attrs = dict(call.annotations)
+        expression = attrs.get("tt.expression")
+        if expression is None:
+            return None
+
+        def corrupt_operand(node):
+            if node.op.name == "tl.tt.dfb_operand":
+                return tirx.Call(
+                    node.dtype,
+                    node.op,
+                    [tirx.IntImm("int32", 999)],
+                    node.annotations,
+                    node.span,
+                )
+            return None
+
+        rewritten = tirx.stmt_functor.ir_transform(tirx.Evaluate(expression), None, corrupt_operand, ["tirx.Call"]).value
+        if rewritten.same_as(expression):
+            return None
+        changed = True
+        attrs["tt.expression"] = rewritten
+        return tirx.Call(call.dtype, call.op, call.args, attrs, call.span)
 
     malformed = rewrite_calls(mod, edit)
     before = ir.save_json(malformed)

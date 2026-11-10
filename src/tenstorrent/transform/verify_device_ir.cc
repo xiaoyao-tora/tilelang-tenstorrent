@@ -144,11 +144,11 @@ bool IsCurrentDeviceOp(const std::string &op_name) {
       "tl.tt.pipe_net_ref",
       "tl.tt.accumulator_ref",
       "tl.tt.dfb_compute",
-      "tl.tt.dfb_load",
+      "tl.tt.dfb_operand",
       "tl.tt.compute_broadcast",
       "tl.tt.compute_precision",
       "tl.tt.compute_value",
-      "tl.tt.compute_value_load",
+      "tl.tt.compute_value_operand",
       "tl.tt.compute_value_store",
       "tl.tt.compute_value_gemm",
       "tl.tt.compute_value_state_init",
@@ -1267,13 +1267,16 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
   Check(allow_stream_inplace || !input_ids.count(operands[0]->dfb_id),
         "dfb_compute output must be a fresh generation");
   const DFBDescriptor &output = operands[0];
-  ffi::String dtype = ComputeString(call, "tt.compute_dtype");
-  Check(dtype == (output->element_dtype == DataType::BFloat(16) ? "bfloat16"
-                                                                : "float32"),
-        "dfb_compute dtype annotation disagrees with output DFB");
-  auto tile = ComputeShape(call, "tt.compute_tile_shape");
-  Check(ffi::StructuralEqual()(tile, output->tile_shape),
-        "dfb_compute tile shape mismatch");
+  ffi::String dtype =
+      output->element_dtype == DataType::BFloat(16) ? "bfloat16" : "float32";
+  if (auto annotated = call->annotations.Get("tt.compute_dtype"))
+    Check(Downcast<StringImm>(annotated.value())->value == dtype,
+          "dfb_compute dtype annotation disagrees with output DFB");
+  if (auto annotated = call->annotations.Get("tt.compute_tile_shape"))
+    Check(ffi::StructuralEqual()(
+              CheckedShape(annotated.value(), "tt.compute_tile_shape"),
+              output->tile_shape),
+          "dfb_compute tile shape mismatch");
   auto shape = ComputeShape(call, "tt.logical_domain");
   VerifyTileGrid(shape, output->block_shape_in_tiles, "dfb_compute output");
   auto maps_value = call->annotations.Get("tt.access_maps");
@@ -1285,9 +1288,9 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
           "dfb_compute access maps must cover every input operand");
   ffi::String kind = ComputeString(call, "tt.compute_kind");
   auto input_shapes_value = call->annotations.Get("tt.input_shapes");
-  Check(input_shapes_value.has_value(), "dfb_compute missing tt.input_shapes");
-  auto input_shapes =
-      CheckedShapes(input_shapes_value.value(), "tt.input_shapes");
+  ffi::Array<ffi::Array<PrimExpr>> input_shapes;
+  if (input_shapes_value.has_value())
+    input_shapes = CheckedShapes(input_shapes_value.value(), "tt.input_shapes");
   Check(input_shapes.size() + 1 == operands.size(),
         "dfb_compute input shape count mismatch");
   auto access_ids_attr = call->annotations.Get("tt.access_ids");
@@ -1338,7 +1341,9 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
     Check(expression.has_value(), "scalar dfb_compute has invalid expression");
     Check(expression.value().dtype() == output->element_dtype,
           "dfb_compute expression dtype disagrees with output");
-    std::unordered_set<int64_t> used;
+    std::unordered_set<int64_t> used_ids;
+    std::unordered_set<int64_t> used_indices;
+    bool direct_loads = false, indexed_operands = false;
     PostOrderVisit(expression.value(), [&](const ffi::ObjectRef &object) {
       const auto *variable = object.as<VarNode>();
       bool bound_variable =
@@ -1400,7 +1405,23 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
         const auto *operation = node->op.as<OpNode>();
         Check(operation != nullptr,
               "Device expression contains an external call");
-        if (node->op.same_as(dfb_load())) {
+        if (node->op.same_as(dfb_operand())) {
+          indexed_operands = true;
+          Check(!direct_loads,
+                "Device expression mixes indexed and direct DFB references");
+          Check(node->args.size() == 1,
+                "dfb_operand must have one operand index");
+          int64_t index =
+              RequireStaticInteger(node->args[0], "dfb_operand index");
+          Check(index >= 0 && index < static_cast<int64_t>(input_shapes.size()),
+                "dfb_operand index is out of range");
+          Check(node->dtype == operands[index + 1]->element_dtype,
+                "dfb_operand dtype mismatch");
+          used_indices.insert(index);
+        } else if (node->op.same_as(dfb_load())) {
+          direct_loads = true;
+          Check(!indexed_operands,
+                "Device expression mixes indexed and direct DFB references");
           Check(node->args.size() == 1, "dfb_load must have one resource ID");
           int64_t id =
               RequireStaticInteger(node->args[0], "dfb_load resource ID");
@@ -1408,18 +1429,31 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
                 "dfb_load references an undeclared input DFB");
           Check(node->dtype == dfbs.at(id)->element_dtype,
                 "dfb_load dtype mismatch");
-          used.insert(id);
+          used_ids.insert(id);
         } else if (node->op.same_as(compute_broadcast())) {
           Check(node->args.size() >= 2,
                 "compute_broadcast requires one value and broadcast axes");
           const auto *load = node->args[0].as<CallNode>();
-          Check(load && load->op.same_as(dfb_load()) && load->args.size() == 1,
-                "compute_broadcast input must be a direct dfb_load");
-          int64_t id = RequireStaticInteger(load->args[0],
-                                            "broadcast input resource ID");
-          Check(shape_by_input.count(id),
-                "compute_broadcast references an undeclared input DFB");
-          const auto &input_shape = shape_by_input.at(id);
+          Check(load &&
+                    (load->op.same_as(dfb_operand()) ||
+                     load->op.same_as(dfb_load())) &&
+                    load->args.size() == 1,
+                "compute_broadcast input must be a direct DFB operand");
+          ffi::Array<PrimExpr> input_shape;
+          if (load->op.same_as(dfb_operand())) {
+            int64_t index =
+                RequireStaticInteger(load->args[0], "broadcast operand index");
+            Check(index >= 0 &&
+                      index < static_cast<int64_t>(input_shapes.size()),
+                  "broadcast operand index is out of range");
+            input_shape = input_shapes[index];
+          } else {
+            int64_t id = RequireStaticInteger(load->args[0],
+                                              "broadcast input resource ID");
+            Check(shape_by_input.count(id),
+                  "compute_broadcast references an undeclared input DFB");
+            input_shape = shape_by_input.at(id);
+          }
           Check(input_shape.size() == shape.size(),
                 "compute_broadcast rank disagrees with logical domain");
           std::unordered_set<int64_t> axes;
@@ -1453,8 +1487,16 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
         }
       }
     });
-    Check(used == input_ids,
-          "dfb_compute has unused declared expression inputs");
+    if (indexed_operands) {
+      Check(used_indices.size() == input_shapes.size(),
+            "dfb_compute has unused declared expression operands");
+      for (size_t index = 0; index < input_shapes.size(); ++index)
+        Check(used_indices.count(index),
+              "dfb_compute has unused declared expression operand");
+    } else {
+      Check(used_ids == input_ids,
+            "dfb_compute has unused declared expression inputs");
+    }
     Check(kind != "fill" || input_ids.empty(), "fill must not read DFB inputs");
   } else if (kind == "copy" || kind == "transpose") {
     Check(operands.size() == 2, "copy/transpose requires one input");
@@ -1481,9 +1523,22 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
     Check(ffi::StructuralEqual()(expected, output->block_shape_in_tiles),
           "copy/transpose input-output tile-grid mismatch");
   } else {
-    int64_t clear = ComputeInteger(call, "tt.clear");
+    size_t count = kind == "gemm" ? 3 : 2;
+    Check(operands.size() == count || operands.size() == count + 1,
+          "GEMM/reduce operand count mismatch");
+    int64_t clear = operands.size() == count ? 1 : 0;
+    if (auto annotated = call->annotations.Get("tt.clear"))
+      Check(RequireStaticInteger(Downcast<PrimExpr>(annotated.value()),
+                                 "tt.clear") == clear,
+            "compute tt.clear disagrees with operand count");
     Check(clear == 0 || clear == 1, "compute tt.clear must be Boolean");
-    ffi::String accumulation = ComputeString(call, "tt.accum_dtype");
+    ffi::String accumulation = dtype;
+    if (auto annotated = call->annotations.Get("tt.accum_dtype"))
+      accumulation = Downcast<StringImm>(annotated.value())->value;
+    if (allow_stream_inplace && kind == "reduce" &&
+        call->annotations.count("tt.accum_dtype"))
+      Check(accumulation != dtype,
+            "current Device reduction must omit default accumulation dtype");
     Check(accumulation == "float32" ||
               (kind == "gemm" && accumulation == "bfloat16" &&
                dtype == "bfloat16") ||
@@ -1491,9 +1546,6 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
                ComputeString(call, "tt.reduce_kind") != "sum" &&
                accumulation == dtype),
           "unsupported accumulation dtype");
-    size_t count = kind == "gemm" ? 3 : 2;
-    Check(operands.size() == count + (clear ? 0 : 1),
-          "GEMM/reduce operand count mismatch");
     if (!clear) {
       Check(operands.back()->element_dtype == output->element_dtype &&
                 ffi::StructuralEqual()(operands.back()->block_shape_in_tiles,
@@ -1548,8 +1600,14 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
       ffi::String reduction = ComputeString(call, "tt.reduce_kind");
       Check(reduction == "sum" || reduction == "max" || reduction == "min",
             "unsupported reduction kind");
-      int64_t nan = ComputeInteger(call, "tt.nan_propagate");
+      int64_t nan = 0;
+      if (auto annotated = call->annotations.Get("tt.nan_propagate"))
+        nan = RequireStaticInteger(Downcast<PrimExpr>(annotated.value()),
+                                   "tt.nan_propagate");
       Check(nan == 0 || nan == 1, "reduction nan propagation must be Boolean");
+      if (allow_stream_inplace && call->annotations.count("tt.nan_propagate"))
+        Check(nan == 1,
+              "current Device reduction must omit disabled NaN propagation");
       ffi::Array<PrimExpr> expected;
       for (size_t i = 0; i < input.size(); ++i)
         if (static_cast<int64_t>(i) != axis)
@@ -1646,60 +1704,90 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
   if (local_output) {
     int64_t output = static_integer(call->args[0], "compute output ID");
     const ComputeValueDescriptor &descriptor = values.at(output);
-    if (!attrs.count("tt.compute_dtype"))
-      attrs.Set("tt.compute_dtype",
-                StringImm(descriptor->dtype == DataType::Float(32)
-                              ? "float32"
-                              : "bfloat16"));
-    if (!attrs.count("tt.compute_tile_shape"))
-      attrs.Set("tt.compute_tile_shape", descriptor->compute_tile_shape);
     if (!attrs.count("tt.logical_domain"))
       attrs.Set("tt.logical_domain", descriptor->logical_shape);
-    if (!attrs.count("tt.value_input_shapes")) {
-      ffi::Array<ffi::Array<PrimExpr>> value_shapes;
-      if (auto value_inputs = attrs.Get("tt.value_inputs")) {
-        auto input_ids = value_inputs.value().as<ffi::Array<PrimExpr>>();
-        Check(input_ids.has_value(), "invalid tt.value_inputs");
-        for (const PrimExpr &input : input_ids.value()) {
-          int64_t id = static_integer(input, "compute value input ID");
-          Check(values.count(id),
-                "compute value references missing descriptor");
-          value_shapes.push_back(values.at(id)->logical_shape);
-        }
-      }
-      attrs.Set("tt.value_input_shapes", value_shapes);
-    }
-    if (!attrs.count("tt.value_inputs"))
-      attrs.Set("tt.value_inputs", ffi::Array<PrimExpr>());
     if (!attrs.count("tt.input_shapes"))
       attrs.Set("tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>());
   }
   auto input_attr = attrs.Get("tt.value_inputs");
   auto maps_attr = attrs.Get("tt.value_access_maps");
   auto shapes_attr = attrs.Get("tt.value_input_shapes");
-  if (!local_output && !input_attr.has_value() && !shapes_attr.has_value()) {
+  if (!local_output && !input_attr.has_value()) {
+    Check(!shapes_attr.has_value(),
+          "value input shapes require declared compute-value inputs");
     VerifyGeneralCompute(call, dfbs, bound_vars, allow_stream_inplace);
     return;
   }
-  Check(input_attr.has_value() && shapes_attr.has_value(),
-        "v7 expression missing compute value input metadata");
-  auto inputs = input_attr.value().as<ffi::Array<PrimExpr>>();
-  Check(inputs.has_value(), "invalid tt.value_inputs");
+  ffi::Array<PrimExpr> inputs;
+  if (input_attr.has_value()) {
+    auto typed = input_attr.value().as<ffi::Array<PrimExpr>>();
+    Check(typed.has_value(), "invalid tt.value_inputs");
+    inputs = typed.value();
+  }
   ffi::Array<ffi::Array<Integer>> maps =
       maps_attr.has_value() ? CheckedMaps(maps_attr.value())
                             : ffi::Array<ffi::Array<Integer>>();
-  auto shapes = CheckedShapes(shapes_attr.value(), "tt.value_input_shapes");
-  Check(inputs.value().size() == shapes.size() &&
-            (!maps_attr.has_value() || maps.size() == shapes.size()),
+  ffi::Array<ffi::Array<PrimExpr>> shapes;
+  for (const PrimExpr &input : inputs) {
+    int64_t id = static_integer(input, "compute value input ID");
+    Check(values.count(id), "compute value references missing descriptor");
+    shapes.push_back(values.at(id)->logical_shape);
+  }
+  if (auto expression = attrs.Get("tt.expression")) {
+    auto typed = expression.value().as<PrimExpr>();
+    Check(typed.has_value(), "invalid compute value expression");
+    PostOrderVisit(typed.value(), [&](const ffi::ObjectRef &object) {
+      const auto *broadcast = object.as<CallNode>();
+      if (!broadcast || !broadcast->op.same_as(compute_broadcast()))
+        return;
+      Check(broadcast->args.size() >= 2,
+            "compute_broadcast requires one value and broadcast axes");
+      const auto *load = broadcast->args[0].as<CallNode>();
+      if (!load || (!load->op.same_as(compute_value_operand()) &&
+                    !load->op.same_as(compute_value_load())))
+        return;
+      Check(load->args.size() == 1,
+            "compute-value broadcast requires one operand reference");
+      int64_t position = -1;
+      if (load->op.same_as(compute_value_operand())) {
+        position = static_integer(load->args[0], "compute value operand index");
+      } else {
+        int64_t id = static_integer(load->args[0], "compute value input ID");
+        for (size_t index = 0; index < inputs.size(); ++index)
+          if (static_integer(inputs[index], "compute value input ID") == id) {
+            position = index;
+            break;
+          }
+      }
+      Check(position >= 0 && position < static_cast<int64_t>(shapes.size()),
+            "compute-value broadcast references an undeclared operand");
+      auto shape = shapes[position];
+      for (size_t index = 1; index < broadcast->args.size(); ++index) {
+        int64_t axis =
+            static_integer(broadcast->args[index], "compute broadcast axis");
+        Check(axis >= 0 && axis < static_cast<int64_t>(shape.size()),
+              "compute broadcast axis is out of range");
+        shape.Set(axis, Integer(1));
+      }
+      shapes.Set(position, shape);
+    });
+  }
+  if (shapes_attr.has_value())
+    Check(ffi::StructuralEqual()(
+              CheckedShapes(shapes_attr.value(), "tt.value_input_shapes"),
+              shapes),
+          "compute value input shape metadata disagrees with descriptors");
+  Check(!maps_attr.has_value() || maps.size() == shapes.size(),
         "compute value input metadata count mismatch");
-  auto all_shapes =
-      CheckedShapes(attrs.at("tt.input_shapes"), "tt.input_shapes");
+  ffi::Array<ffi::Array<PrimExpr>> all_shapes;
+  if (auto dfb_shapes = attrs.Get("tt.input_shapes"))
+    all_shapes = CheckedShapes(dfb_shapes.value(), "tt.input_shapes");
   ffi::Array<ffi::Array<Integer>> all_maps;
   if (auto access_maps = attrs.Get("tt.access_maps"))
     all_maps = CheckedMaps(access_maps.value());
   std::set<int64_t> declared;
-  for (size_t i = 0; i < inputs.value().size(); ++i) {
-    int64_t id = static_integer(inputs.value()[i], "compute value input ID");
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    int64_t id = static_integer(inputs[i], "compute value input ID");
     Check(values.count(id) && defined.count(id),
           "compute value use is not dominated by its definition");
     declared.insert(id);
@@ -1721,15 +1809,40 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
       RewriteLoads(const ComputeValueTable &values,
                    const std::map<int64_t, int64_t> &ids,
                    const std::set<int64_t> &declared,
-                   const std::set<int64_t> &dfb_inputs)
+                   const std::set<int64_t> &dfb_inputs,
+                   ffi::Array<PrimExpr> value_inputs, size_t dfb_count)
           : values_(values), ids_(ids), declared_(declared),
-            dfb_inputs_(dfb_inputs) {}
+            dfb_inputs_(dfb_inputs), value_inputs_(std::move(value_inputs)),
+            dfb_count_(dfb_count) {}
       PrimExpr VisitExpr_(const CallNode *op) final {
         if (op->op.same_as(dfb_load())) {
           Check(op->args.size() == 1 &&
                     dfb_inputs_.count(RequireStaticInteger(
                         op->args[0], "dfb_load resource ID")),
                 "dfb_load references an undeclared input DFB");
+        }
+        if (op->op.same_as(dfb_operand())) {
+          Check(op->args.size() == 1 && op->annotations.empty(),
+                "dfb_operand requires one index and no annotations");
+          int64_t index =
+              RequireStaticInteger(op->args[0], "dfb operand index");
+          Check(index >= 0 && index < static_cast<int64_t>(dfb_count_),
+                "dfb_operand index is out of range");
+        }
+        if (op->op.same_as(compute_value_operand())) {
+          Check(op->args.size() == 1 && op->annotations.empty(),
+                "compute_value_operand requires one index and no annotations");
+          int64_t index =
+              RequireStaticInteger(op->args[0], "compute value operand index");
+          Check(index >= 0 &&
+                    index < static_cast<int64_t>(value_inputs_.size()),
+                "compute_value_operand index is out of range");
+          int64_t id = RequireStaticInteger(value_inputs_[index],
+                                            "compute value operand identity");
+          Check(declared_.count(id), "undeclared compute value input");
+          Check(op->dtype == values_.at(id)->buffer->dtype,
+                "compute value operand dtype mismatch");
+          return Call(op->dtype, dfb_operand(), {Integer(dfb_count_ + index)});
         }
         if (!op->op.same_as(compute_value_load()))
           return ExprMutator::VisitExpr_(op);
@@ -1747,7 +1860,10 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
       const std::map<int64_t, int64_t> &ids_;
       const std::set<int64_t> &declared_;
       const std::set<int64_t> &dfb_inputs_;
-    } rewrite(values, virtual_ids, declared, dfb_inputs);
+      ffi::Array<PrimExpr> value_inputs_;
+      size_t dfb_count_;
+    } rewrite(values, virtual_ids, declared, dfb_inputs, inputs,
+              call->args.size() - 1);
     auto expr = expression.value().as<PrimExpr>();
     Check(expr.has_value(), "invalid compute value expression");
     attrs.Set("tt.expression", rewrite(expr.value()));
@@ -4049,9 +4165,22 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                     !call->op.same_as(compute_value())))
         return;
       for (const char *key :
-           {"tt.access_maps", "tt.access_ids", "tt.value_access_maps"})
+           {"tt.compute_dtype", "tt.compute_tile_shape",
+            "tt.value_input_shapes", "tt.access_maps", "tt.access_ids",
+            "tt.value_access_maps", "tt.clear"})
         Check(!call->annotations.count(key),
               std::string("current Device compute must not carry ") + key);
+      if (call->op.same_as(compute_value()))
+        Check(!call->annotations.count("tt.logical_domain"),
+              "current Device compute_value must derive tt.logical_domain");
+      for (const char *key : {"tt.input_shapes", "tt.value_inputs"}) {
+        auto value = call->annotations.Get(key);
+        if (!value.has_value())
+          continue;
+        auto array = value.value().as<ffi::Array<ffi::Any>>();
+        Check(array.has_value() && !array.value().empty(),
+              std::string("current Device compute must omit empty ") + key);
+      }
     });
   }
   ffi::String stage =

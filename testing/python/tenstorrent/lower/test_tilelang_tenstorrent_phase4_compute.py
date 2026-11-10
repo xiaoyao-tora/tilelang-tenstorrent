@@ -216,7 +216,8 @@ def test_bfloat16_reduction_has_validated_device_accumulation(kind, accum_dtype)
     assert str(mod.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in mod.attrs
     selected = [call for call in calls(mod, "tl.tt.dfb_compute") if call.annotations["tt.compute_kind"].value == "reduce"][0]
-    assert selected.annotations["tt.accum_dtype"].value == accum_dtype
+    actual = selected.annotations["tt.accum_dtype"].value if "tt.accum_dtype" in selected.annotations else "bfloat16"
+    assert actual == accum_dtype
     transform.VerifyTenstorrentDeviceIR()(mod)
 
 

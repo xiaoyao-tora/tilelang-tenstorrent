@@ -214,7 +214,7 @@ def test_reduction_semantics(monkeypatch, kind, axis, clear):
     [
         ({"consumer_slot": "brisc"}, "wait in wrong slot|consumer slot"),
         ({"transaction_count_or_loop_relation": 2}, "transaction count disagrees"),
-        ({"element_dtype": "bfloat16"}, "backing metadata mismatch|dfb_load dtype mismatch"),
+        ({"element_dtype": "bfloat16"}, "backing metadata mismatch|dfb_operand dtype mismatch"),
     ],
 )
 def test_resource_metadata_rejected(monkeypatch, change, match):
@@ -233,9 +233,11 @@ def test_missing_wait_rejected(monkeypatch):
     aliases = {}
     tirx.stmt_functor.post_order_visit(
         trisc.body,
-        lambda node: aliases.setdefault(node.var, int(node.value.args[0]))
-        if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.dfb_stream_ref"
-        else None,
+        lambda node: (
+            aliases.setdefault(node.var, int(node.value.args[0]))
+            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.dfb_stream_ref"
+            else None
+        ),
     )
     statements = [
         statement
@@ -330,7 +332,10 @@ def replace_compute_annotation(mod, key, value, *, kind=None):
 @pytest.mark.parametrize(
     "key,value,match",
     [
-        ("tt.compute_dtype", tirx.StringImm("bfloat16"), "dtype annotation"),
+        ("tt.compute_dtype", tirx.StringImm("bfloat16"), "must not carry tt.compute_dtype"),
+        ("tt.compute_tile_shape", ir_metadata([32, 32]), "must not carry tt.compute_tile_shape"),
+        ("tt.value_input_shapes", ir_metadata([[32, 32]]), "must not carry tt.value_input_shapes"),
+        ("tt.clear", tirx.IntImm("int32", 1), "must not carry tt.clear"),
         ("tt.logical_domain", [32, 64], "tile-grid metadata"),
         ("tt.compute_kind", tirx.StringImm("unknown"), "unknown compute kind"),
     ],

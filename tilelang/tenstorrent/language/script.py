@@ -22,8 +22,10 @@ _FIXED_DTYPES = {
 }
 
 _DYNAMIC_DTYPE = {
+    "dfb_operand",
     "dfb_load",
     "compute_broadcast",
+    "compute_value_operand",
     "compute_value_load",
 }
 

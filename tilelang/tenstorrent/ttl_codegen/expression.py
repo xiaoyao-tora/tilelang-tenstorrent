@@ -20,7 +20,12 @@ _UNARY = {
     "tirx.floor": "floor",
     "tirx.ceil": "ceil",
 }
-_LOADS = ("tl.tt.dfb_load", "tl.tt.compute_value_load")
+_LOADS = (
+    "tl.tt.dfb_operand",
+    "tl.tt.compute_value_operand",
+    "tl.tt.dfb_load",
+    "tl.tt.compute_value_load",
+)
 
 
 def check_expression(expr):
@@ -47,12 +52,13 @@ def check_expression(expr):
 
 
 class ExpressionEmitter:
-    def __init__(self, emitter, call, result_type):
+    def __init__(self, emitter, call, result_type, dtype=None):
         self.e = emitter
         self.b = emitter.b
+        self.call = call
         self.shape = list(result_type.shape)
         self.result_type = result_type
-        self.dtype = str(call.annotations["tt.compute_dtype"].value)
+        self.dtype = str(call.annotations["tt.compute_dtype"].value) if dtype is None else str(dtype)
 
     def tensor_type(self, dtype):
         return self.b.ir.RankedTensorType.get(self.shape, self.e.tile_type(dtype, (32, 32)))
@@ -74,6 +80,11 @@ class ExpressionEmitter:
             return getattr(ttl, _BINARY[type(expr)])(self.emit(expr.a, expr.dtype), self.emit(expr.b, expr.dtype))
         if isinstance(expr, tirx.Call) and expr.op.name in _LOADS:
             index = int(expr.args[0])
+            if expr.op.name == "tl.tt.dfb_operand":
+                return self.e.values[int(self.call.args[index + 1])]
+            if expr.op.name == "tl.tt.compute_value_operand":
+                inputs = self.call.annotations.get("tt.value_inputs", [])
+                return self.e.compute_values[int(inputs[index])]
             return self.e.values[index] if expr.op.name == "tl.tt.dfb_load" else self.e.compute_values[index]
         if isinstance(expr, tirx.Call) and expr.op.name == "tl.tt.compute_broadcast":
             dims_attr = self.b.ir.DenseI64ArrayAttr.get([int(axis) for axis in expr.args[1:]])

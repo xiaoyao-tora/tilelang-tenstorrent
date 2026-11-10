@@ -158,16 +158,29 @@ def test_current_device_tirx_parses_and_reverifies():
         "tt.compute_dtype",
         "tt.compute_tile_shape",
         "tt.logical_domain",
+        "tt.value_input_shapes",
     }
     value_calls = [call for function in mod.functions.values() for call in calls(function.body) if call.op.name == "tl.tt.compute_value"]
     assert value_calls
     assert all(derived.isdisjoint(call.annotations) for call in value_calls)
-    optional_arrays = {"tt.input_shapes", "tt.value_inputs", "tt.value_input_shapes"}
+    optional_arrays = {"tt.input_shapes", "tt.value_inputs"}
     assert all(all(key not in call.annotations or len(call.annotations[key]) for key in optional_arrays) for call in value_calls)
+    dfb_calls = [call for function in mod.functions.values() for call in calls(function.body) if call.op.name == "tl.tt.dfb_compute"]
+    assert dfb_calls
+    dfb_derived = {
+        "tt.compute_dtype",
+        "tt.compute_tile_shape",
+        "tt.value_input_shapes",
+        "tt.clear",
+    }
+    assert all(dfb_derived.isdisjoint(call.annotations) for call in dfb_calls)
+    assert all(all(key not in call.annotations or len(call.annotations[key]) for key in optional_arrays) for call in dfb_calls)
     source = D.device_ir_to_tirx(mod)
     assert "tt__compute_kind" in source
     assert "tt.compute_kind=" not in source
-    assert 'T.tt.dfb_load("float32",' in source
+    assert 'T.tt.dfb_operand("float32",' in source
+    assert "T.tt.dfb_load" not in source
+    assert "T.tt.compute_value_load" not in source
     restored = from_source(source)
     assert transform.VerifyTenstorrentDeviceIR()(restored).same_as(restored)
 
@@ -457,9 +470,11 @@ def test_summa_device_body_uses_kind_resource_aliases():
         assert len(identities) == len(set(identities))
         tirx.stmt_functor.post_order_visit(
             function.body,
-            lambda node: aliases.setdefault(str(node.var.name), str(node.value.op.name))
-            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call)
-            else None,
+            lambda node: (
+                aliases.setdefault(str(node.var.name), str(node.value.op.name))
+                if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call)
+                else None
+            ),
         )
     assert aliases["A_tensor"] == "tl.tt.tensor_ref"
     assert aliases["a_panel_stream"] == "tl.tt.dfb_stream_ref"
@@ -855,9 +870,11 @@ def test_summa_accumulator_identity_is_spmd_local():
         aliases = {}
         tirx.stmt_functor.post_order_visit(
             trisc.body,
-            lambda node, aliases=aliases: aliases.setdefault(node.var, int(node.value.args[0]))
-            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.accumulator_ref"
-            else None,
+            lambda node, aliases=aliases: (
+                aliases.setdefault(node.var, int(node.value.args[0]))
+                if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.accumulator_ref"
+                else None
+            ),
         )
         accumulator_operands = []
         for call in calls(trisc.body):

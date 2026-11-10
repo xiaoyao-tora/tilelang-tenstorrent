@@ -276,7 +276,12 @@ class _Emitter:
         elif name == "tl.tt.dfb_compute":
             kind = _kind(call)
             if kind in ("elementwise", "fill", "typecast", "copy") and "tt.expression" in call.annotations:
-                value = ExpressionEmitter(self, call, self.types[args[0]]).emit(call.annotations["tt.expression"])
+                value = ExpressionEmitter(
+                    self,
+                    call,
+                    self.types[args[0]],
+                    self.dfbs[args[0]].element_dtype,
+                ).emit(call.annotations["tt.expression"])
             elif kind == "gemm":
                 value = ttl.matmul(
                     self.types[args[0]],
@@ -299,7 +304,7 @@ class _Emitter:
         elif name == "tl.tt.compute_value":
             buffer = self.value_descriptors[args[0]].buffer
             result_type = ir.RankedTensorType.get([int(size) // 32 for size in buffer.shape], self.tile_type(buffer.dtype, (32, 32)))
-            self.compute_values[args[0]] = ExpressionEmitter(self, call, result_type).emit(call.annotations["tt.expression"])
+            self.compute_values[args[0]] = ExpressionEmitter(self, call, result_type, buffer.dtype).emit(call.annotations["tt.expression"])
         elif name == "tl.tt.compute_value_store":
             self.store(args[1], self.compute_values[args[0]])
         elif name == "tl.tt.compute_value_gemm":

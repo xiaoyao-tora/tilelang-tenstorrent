@@ -117,6 +117,7 @@ def run_pipeline_device(mod, inputs, *, seed=0):
                 kind = str(attrs["tt.compute_kind"].value)
                 domain = tuple(int(x) for x in attrs["tt.logical_domain"])
                 maps = {i: [int(x) for x in axes] for i, axes in zip(operands, attrs.get("tt.access_maps", []))}
+                maps.update({("dfb_operand", position): resource for position, resource in enumerate(operands)})
                 if kind in ("elementwise", "typecast", "fill"):
                     result = np.broadcast_to(expression(attrs["tt.expression"], values, maps, domain), domain)
                 elif kind == "copy":
@@ -128,7 +129,7 @@ def run_pipeline_device(mod, inputs, *, seed=0):
                     a = a.T if int(attrs["tt.transpose_a"]) else a
                     b = b.T if int(attrs["tt.transpose_b"]) else b
                     result = a.astype(np.float32) @ b.astype(np.float32)
-                    if not int(attrs["tt.clear"]):
+                    if len(operands) == 3:
                         result = result + values[operands[2]]
                 elif kind == "reduce":
                     axis, reduction = int(attrs["tt.reduce_axis"]), str(attrs["tt.reduce_kind"].value)
@@ -136,14 +137,14 @@ def run_pipeline_device(mod, inputs, *, seed=0):
                     if reduction == "sum":
                         result, combine = np.sum(source, axis=axis, dtype=np.float32), np.add
                     else:
-                        propagate = bool(int(attrs["tt.nan_propagate"]))
+                        propagate = bool(int(attrs.get("tt.nan_propagate", 0)))
                         combine = (np.maximum if propagate else np.fmax) if reduction == "max" else (np.minimum if propagate else np.fmin)
                         result = combine.reduce(source, axis=axis)
-                    if not int(attrs["tt.clear"]):
+                    if len(operands) == 2:
                         result = combine(values[operands[1]], result)
                 else:
                     raise AssertionError(f"Unsupported reference compute: {kind}")
-                storage[addresses[output]] = cast(result, attrs["tt.compute_dtype"].value).copy()
+                storage[addresses[output]] = cast(result, dfbs[output].element_dtype).copy()
                 published.add(output)
             else:
                 raise AssertionError(f"Unsupported reference op: {name}")

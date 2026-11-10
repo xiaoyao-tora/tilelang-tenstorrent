@@ -53,15 +53,19 @@ The TRISC body owns the definitions and actual dependencies:
 | Intrinsic | Contract |
 | --- | --- |
 | `compute_value(output, dfb_inputs...)` | Define a typed pure elementwise/fill/typecast value |
-| `compute_value_load(value)` | Pure expression reference to a dominating definition |
+| `compute_value_operand(index)` | Pure expression reference through `tt.value_inputs[index]` |
 | `compute_value_gemm(output, lhs_dfb, rhs_dfb, old, transpose_a, transpose_b)` | Produce a new accumulator version |
 | `compute_value_store(value, output_dfb)` | Exact-dtype compute store to a reserved DFB |
 
-Expression annotations reuse the existing logical domain, compute dtype and
-tile geometry. `tt.access_maps` / `tt.input_shapes` describe only DFB operands;
-`tt.value_inputs`, `tt.value_access_maps` and `tt.value_input_shapes` describe
-compute-local operands. Tensor exports use an explicit compute cast when their
-storage dtype differs; they never silently retag a value.
+The output `ComputeValueDescriptor` is authoritative for logical domain, dtype
+and tile geometry. Current Device calls do not repeat those fields or
+`tt.value_input_shapes`. `tt.input_shapes` describes nonempty DFB operand views;
+`tt.value_inputs` is the only serialized compute-value identity list. Effective
+value-input views are derived from each input descriptor plus explicit
+`compute_broadcast` axes. The expression uses zero-based `dfb_operand` and
+`compute_value_operand` leaves, so it never duplicates resource IDs. Tensor
+exports use an explicit compute cast when their storage dtype differs; they
+never silently retag a value.
 
 The verifier resolves value and accumulator IDs using the active Core before it
 checks definitions, predecessor chains, exact expression effects, geometry,

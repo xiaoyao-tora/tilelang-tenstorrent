@@ -112,7 +112,7 @@ def test_value_geometry_proof_ids_cannot_be_used_as_real_dfbs():
         attrs = dict(call.annotations)
 
         def forge_load(node):
-            if node.op.name == "tl.tt.compute_value_load":
+            if node.op.name == "tl.tt.compute_value_operand":
                 return tirx.call_intrin(node.dtype, ir.Op.get("tl.tt.dfb_load"), 0)
             return None
 
@@ -123,4 +123,4 @@ def test_value_geometry_proof_ids_cannot_be_used_as_real_dfbs():
 
     corrupted = rewrite_calls(device(), edit)
     assert changed
-    check_rejected(corrupted, "undeclared input DFB")
+    check_rejected(corrupted, "non-current Device op.*dfb_load")

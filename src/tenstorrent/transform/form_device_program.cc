@@ -3091,35 +3091,126 @@ class DuplicateGenerationWaitRemover : public StmtExprMutator {
 };
 
 class TransientDeviceAnnotationRemover : public StmtExprMutator {
+  class OperandIndexRewriter : public ExprMutator {
+  public:
+    OperandIndexRewriter(ffi::Array<PrimExpr> dfb_inputs,
+                         ffi::Array<PrimExpr> value_inputs)
+        : dfb_inputs_(std::move(dfb_inputs)),
+          value_inputs_(std::move(value_inputs)) {}
+
+  private:
+    size_t Find(const PrimExpr &identity, const ffi::Array<PrimExpr> &inputs,
+                const char *label) const {
+      for (size_t index = 0; index < inputs.size(); ++index)
+        if (ffi::StructuralEqual()(identity, inputs[index]))
+          return index;
+      ThrowMalformed(std::string("compute expression references undeclared ") +
+                     label);
+    }
+
+    PrimExpr VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(tenstorrent::dfb_load())) {
+        if (op->args.size() != 1 || !op->annotations.empty())
+          ThrowMalformed("dfb_load requires one identity without annotations");
+        return Call(op->dtype, tenstorrent::dfb_operand(),
+                    {Integer(Find(op->args[0], dfb_inputs_, "DFB input"))}, {},
+                    op->span);
+      }
+      if (op->op.same_as(tenstorrent::compute_value_load())) {
+        if (op->args.size() != 1 || !op->annotations.empty())
+          ThrowMalformed(
+              "compute_value_load requires one identity without annotations");
+        return Call(
+            op->dtype, tenstorrent::compute_value_operand(),
+            {Integer(Find(op->args[0], value_inputs_, "compute-value input"))},
+            {}, op->span);
+      }
+      return ExprMutator::VisitExpr_(op);
+    }
+
+    ffi::Array<PrimExpr> dfb_inputs_;
+    ffi::Array<PrimExpr> value_inputs_;
+  };
+
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     bool derived_compute_value = call->op.same_as(compute_value());
+    bool device_compute = call->op.same_as(dfb_compute());
     if (!call->annotations.count("tt.stream_identity") &&
         !call->annotations.count("tt.internal_communication_id") &&
-        !derived_compute_value)
+        !derived_compute_value && !device_compute)
       return call;
     auto annotations = call->annotations;
     annotations.erase("tt.stream_identity");
     annotations.erase("tt.internal_communication_id");
-    if (derived_compute_value) {
+    if (derived_compute_value || device_compute) {
+      ffi::Array<PrimExpr> dfb_inputs;
+      for (size_t index = 1; index < call->args.size(); ++index)
+        dfb_inputs.push_back(call->args[index]);
+      ffi::Array<PrimExpr> value_inputs;
+      if (auto inputs = annotations.Get("tt.value_inputs"))
+        value_inputs = Downcast<ffi::Array<PrimExpr>>(inputs.value());
+      auto expression = annotations.Get("tt.expression");
+      if (expression.has_value()) {
+        auto typed = expression.value().as<PrimExpr>();
+        if (!typed.has_value())
+          ThrowMalformed("compute expression annotation is not PrimExpr");
+        annotations.Set(
+            "tt.expression",
+            OperandIndexRewriter(dfb_inputs, value_inputs)(typed.value()));
+      }
+
+      if (device_compute) {
+        auto kind = annotations.Get("tt.compute_kind");
+        auto expression = annotations.Get("tt.expression");
+        if (kind.has_value() && expression.has_value() &&
+            Downcast<StringImm>(kind.value())->value == "typecast") {
+          const auto *operand = expression.value().as<CallNode>();
+          if (operand && operand->op.same_as(tenstorrent::dfb_operand()) &&
+              operand->args.size() == 1 && is_zero(operand->args[0]) &&
+              call->args.size() == 2 && value_inputs.empty()) {
+            annotations.Set("tt.compute_kind", StringImm("copy"));
+            annotations.erase("tt.expression");
+          }
+        }
+        auto clear = annotations.Get("tt.clear");
+        auto current_kind = annotations.Get("tt.compute_kind");
+        bool accumulative =
+            current_kind.has_value() &&
+            (Downcast<StringImm>(current_kind.value())->value == "gemm" ||
+             Downcast<StringImm>(current_kind.value())->value == "reduce");
+        if (clear.has_value() && accumulative)
+          annotations.erase("tt.clear");
+        auto nan = annotations.Get("tt.nan_propagate");
+        if (nan.has_value() && is_zero(Downcast<PrimExpr>(nan.value())))
+          annotations.erase("tt.nan_propagate");
+        auto accumulation = annotations.Get("tt.accum_dtype");
+        auto output_dtype = annotations.Get("tt.compute_dtype");
+        current_kind = annotations.Get("tt.compute_kind");
+        if (accumulation.has_value() && output_dtype.has_value() &&
+            current_kind.has_value() &&
+            Downcast<StringImm>(current_kind.value())->value == "reduce" &&
+            Downcast<StringImm>(accumulation.value())->value ==
+                Downcast<StringImm>(output_dtype.value())->value)
+          annotations.erase("tt.accum_dtype");
+      }
+
       annotations.erase("tt.compute_dtype");
       annotations.erase("tt.compute_tile_shape");
-      annotations.erase("tt.logical_domain");
+      if (derived_compute_value)
+        annotations.erase("tt.logical_domain");
       auto input_shapes = annotations.Get("tt.input_shapes")
                               .value_or(ffi::Array<ffi::Array<PrimExpr>>())
                               .as<ffi::Array<ffi::Array<PrimExpr>>>();
       if (input_shapes.has_value() && input_shapes.value().empty())
         annotations.erase("tt.input_shapes");
-      auto value_inputs = annotations.Get("tt.value_inputs")
-                              .value_or(ffi::Array<PrimExpr>())
-                              .as<ffi::Array<PrimExpr>>();
-      if (value_inputs.has_value() && value_inputs.value().empty())
+      auto retained_value_inputs = annotations.Get("tt.value_inputs")
+                                       .value_or(ffi::Array<PrimExpr>())
+                                       .as<ffi::Array<PrimExpr>>();
+      if (retained_value_inputs.has_value() &&
+          retained_value_inputs.value().empty())
         annotations.erase("tt.value_inputs");
-      auto value_shapes = annotations.Get("tt.value_input_shapes")
-                              .value_or(ffi::Array<ffi::Array<PrimExpr>>())
-                              .as<ffi::Array<ffi::Array<PrimExpr>>>();
-      if (value_shapes.has_value() && value_shapes.value().empty())
-        annotations.erase("tt.value_input_shapes");
+      annotations.erase("tt.value_input_shapes");
     }
     return Call(call->dtype, call->op, call->args, annotations, call->span);
   }

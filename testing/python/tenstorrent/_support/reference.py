@@ -233,9 +233,16 @@ def interpret_values(mod, tensors):
             return np.logical_not(expression(expr.a, maps))
         if isinstance(expr, tirx.Call):
             name = expr.op.name
-            if name in ("tl.tt.dfb_load", "tl.tt.compute_value_load"):
+            if name in (
+                "tl.tt.dfb_operand",
+                "tl.tt.compute_value_operand",
+                "tl.tt.dfb_load",
+                "tl.tt.compute_value_load",
+            ):
                 identifier = int(expr.args[0])
-                return current_dfb(identifier) if name == "tl.tt.dfb_load" else values[identifier]
+                if name in ("tl.tt.dfb_operand", "tl.tt.compute_value_operand"):
+                    identifier = maps[(name, identifier)]
+                return current_dfb(identifier) if name in ("tl.tt.dfb_operand", "tl.tt.dfb_load") else values[identifier]
             if name == "tl.tt.compute_broadcast":
                 source = expression(expr.args[0], maps)
                 axes = {int(axis) for axis in expr.args[1:]}
@@ -302,6 +309,13 @@ def interpret_values(mod, tensors):
                     {
                         ("tl.tt.compute_value_load", int(identifier)): tuple(map(int, axes))
                         for identifier, axes in zip(attrs.get("tt.value_inputs", []), attrs.get("tt.value_access_maps", []))
+                    }
+                )
+                maps.update({("tl.tt.dfb_operand", position): identifier for position, identifier in enumerate(args[1:])})
+                maps.update(
+                    {
+                        ("tl.tt.compute_value_operand", position): int(identifier)
+                        for position, identifier in enumerate(attrs.get("tt.value_inputs", []))
                     }
                 )
                 kind = str(attrs["tt.compute_kind"].value)
@@ -381,9 +395,16 @@ def interpret(mod, inputs, seed=0):
         if isinstance(expr, tirx.Cast):
             return _round(expression(expr.value, maps), expr.dtype)
         if isinstance(expr, tirx.Call):
-            if expr.op.name in ("tl.tt.dfb_load", "tl.tt.compute_value_load"):
+            if expr.op.name in (
+                "tl.tt.dfb_operand",
+                "tl.tt.compute_value_operand",
+                "tl.tt.dfb_load",
+                "tl.tt.compute_value_load",
+            ):
                 identifier = int(expr.args[0])
-                return dfbs[identifier] if expr.op.name == "tl.tt.dfb_load" else values[identifier]
+                if expr.op.name in ("tl.tt.dfb_operand", "tl.tt.compute_value_operand"):
+                    identifier = maps[(expr.op.name, identifier)]
+                return dfbs[identifier] if expr.op.name in ("tl.tt.dfb_operand", "tl.tt.dfb_load") else values[identifier]
             if expr.op.name == "tl.tt.compute_broadcast":
                 source = expression(expr.args[0], maps)
                 axes = {int(axis) for axis in expr.args[1:]}
@@ -496,6 +517,13 @@ def interpret(mod, inputs, seed=0):
                         {
                             ("tl.tt.compute_value_load", int(identifier)): tuple(map(int, axes))
                             for identifier, axes in zip(attrs.get("tt.value_inputs", []), attrs.get("tt.value_access_maps", []))
+                        }
+                    )
+                    maps.update({("tl.tt.dfb_operand", position): identifier for position, identifier in enumerate(args[1:])})
+                    maps.update(
+                        {
+                            ("tl.tt.compute_value_operand", position): int(identifier)
+                            for position, identifier in enumerate(attrs.get("tt.value_inputs", []))
                         }
                     )
                     result = expression(attrs["tt.expression"], maps)

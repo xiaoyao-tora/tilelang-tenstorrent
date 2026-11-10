@@ -97,6 +97,20 @@ TIR_DEFINE_TT_BUILTIN(dfb_compute)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TT_BUILTIN(dfb_operand)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure))
+    .set_attr<TScriptDtypePrintLocation>(
+        "TScriptDtypePrintLocation", Integer(ScriptDtypePrintLocation::kFirst));
+
+TIR_DEFINE_TT_BUILTIN(compute_value_operand)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure))
+    .set_attr<TScriptDtypePrintLocation>(
+        "TScriptDtypePrintLocation", Integer(ScriptDtypePrintLocation::kFirst));
+
 TIR_DEFINE_TT_BUILTIN(dfb_load)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",

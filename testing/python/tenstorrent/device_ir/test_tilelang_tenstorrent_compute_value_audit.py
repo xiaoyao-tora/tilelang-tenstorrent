@@ -89,11 +89,13 @@ def forge_fp32_output(mod):
         tirx.stmt_functor.post_order_visit(
             function.body,
             lambda node: (
-                resource_refs.setdefault(node.var, (node.value.op.name, int(node.value.args[0]))),
-                resource_ref_names.setdefault(str(node.var.name), (node.value.op.name, int(node.value.args[0]))),
-            )
-            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call)
-            else None,
+                (
+                    resource_refs.setdefault(node.var, (node.value.op.name, int(node.value.args[0]))),
+                    resource_ref_names.setdefault(str(node.var.name), (node.value.op.name, int(node.value.args[0]))),
+                )
+                if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call)
+                else None
+            ),
         )
 
     def resource_id(expr, kind):
@@ -140,7 +142,6 @@ def forge_fp32_output(mod):
                 if isinstance(expression, tirx.Cast) and str(expression.value.dtype) == "float32"
                 else tirx.Cast("float32", expression)
             )
-            attrs["tt.compute_dtype"] = tirx.StringImm("float32")
             attrs["tt.compute_kind"] = tirx.StringImm("elementwise")
             return tirx.Call(call.dtype, call.op, call.args, attrs, call.span)
         return None
