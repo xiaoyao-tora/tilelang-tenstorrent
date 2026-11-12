@@ -73,6 +73,21 @@ TIR_DEFINE_TT_BUILTIN(accumulator_ref)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));
 
+TIR_DEFINE_TT_BUILTIN(compute_value_ref)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
+
+TIR_DEFINE_TT_BUILTIN(compute_state_ref)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
+
+TIR_DEFINE_TT_BUILTIN(pipe_record_ref)
+    .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
+
 TIR_DEFINE_TT_BUILTIN(transfer).set_num_inputs(10).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
@@ -143,7 +158,6 @@ TIR_DEFINE_TT_BUILTIN(compute_value_store)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TT_BUILTIN(compute_value_gemm)
-    .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TT_BUILTIN(compute_value_state_init)
@@ -205,17 +219,14 @@ TIR_DEFINE_TT_BUILTIN(dfb_pipe_wait)
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TT_BUILTIN(dfb_pipe_send_record)
-    .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TT_BUILTIN(dfb_pipe_recv_record)
-    .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TT_BUILTIN(dfb_pipe_wait_record)
-    .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

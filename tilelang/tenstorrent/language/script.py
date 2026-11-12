@@ -19,6 +19,9 @@ _FIXED_DTYPES = {
     "dfb_stream_ref": "handle",
     "pipe_net_ref": "handle",
     "accumulator_ref": "handle",
+    "compute_value_ref": "handle",
+    "compute_state_ref": "handle",
+    "pipe_record_ref": "handle",
 }
 
 _DYNAMIC_DTYPE = {

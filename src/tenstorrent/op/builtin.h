@@ -49,6 +49,10 @@ TVM_DLL const Op &tensor_ref();
 TVM_DLL const Op &dfb_stream_ref();
 TVM_DLL const Op &pipe_net_ref();
 TVM_DLL const Op &accumulator_ref();
+TVM_DLL const Op &compute_value_ref();
+TVM_DLL const Op &compute_state_ref();
+/*! \brief Pure reference to one PipeNet record selected by record index. */
+TVM_DLL const Op &pipe_record_ref();
 
 /*!
  * \brief Describe one logically synchronous Core transfer.
@@ -57,9 +61,9 @@ TVM_DLL const Op &accumulator_ref();
  * destination begin x/y and end x/y, contract (point_to_point or collective),
  * and an operation-local call-site ID. Point destinations use a singleton
  * rectangle without changing their contract. Collective rectangles may include
- * the source, which requests loopback delivery into the source-local destination.
- * Enclosing loops retain repeated occurrences. Endpoint expressions and buffer
- * identity survive until lowering.
+ * the source, which requests loopback delivery into the source-local
+ * destination. Enclosing loops retain repeated occurrences. Endpoint
+ * expressions and buffer identity survive until lowering.
  */
 TVM_DLL const Op &transfer();
 
@@ -165,7 +169,9 @@ TVM_DLL const Op &dfb_pipe_wait();
 /*!
  * \brief Current record-level PipeNet delivery and completion operations.
  *
- * Arguments are (PipeNet ID, dense record index, local logical DFB stream ID).
+ * Current arguments are (pipe_record_ref, local logical DFB stream ref).
+ * pipe_record_ref carries the PipeNet ref and dense record index. Legacy
+ * artifacts retain (PipeNet ID, record index, DFB ID).
  * Structured control flow represents repeated executions. One source operation
  * covers the record's complete destination range; each matching destination
  * Core executes one receive. Source operations run on BRISC and destination
@@ -186,8 +192,9 @@ TVM_DLL const Op &dfb_collective_reduce();
 /*!
  * \brief Schema v2 transfers with rank-preserving Tensor slices.
  *
- * Arguments are tensor/DFB (or DFB/tensor), then (minimum, extent) pairs
- * for every logical Tensor axis. The entire logical DFB value is transferred.
+ * Current arguments are tensor/DFB (or DFB/tensor); tt.starts and tt.extents
+ * carry one expression per logical Tensor axis. Legacy artifacts retain flat
+ * (minimum, extent) pairs. The entire logical DFB value is transferred.
  */
 TVM_DLL const Op &tensor_to_dfb_nd();
 TVM_DLL const Op &dfb_to_tensor_nd();

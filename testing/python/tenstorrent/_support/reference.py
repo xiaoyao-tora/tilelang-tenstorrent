@@ -34,6 +34,8 @@ def _specialize_expr(expr, bindings, core, *, collapse_resource_refs=True):
                 "tl.tt.dfb_stream_ref",
                 "tl.tt.pipe_net_ref",
                 "tl.tt.accumulator_ref",
+                "tl.tt.compute_value_ref",
+                "tl.tt.compute_state_ref",
             ):
                 assert len(node.args) == 1 and isinstance(node.args[0], tirx.IntImm)
                 return tirx.IntImm("int32", int(node.args[0]))
@@ -60,6 +62,34 @@ def _specialize_call(call, bindings, core, *, collapse_resource_refs=True):
         annotations["tt.value_inputs"] = [specialize(value) for value in annotations["tt.value_inputs"]]
     if "tt.expression" in annotations:
         annotations["tt.expression"] = specialize(annotations["tt.expression"])
+    for key in ("tt.starts", "tt.extents"):
+        if key in annotations:
+            annotations[key] = [specialize(value) for value in annotations[key]]
+
+    if collapse_resource_refs:
+        name = str(call.op.name)
+        if name == "tl.tt.compute_value_gemm" and len(args) == 4:
+            args.extend([annotations.pop("tt.transpose_a"), annotations.pop("tt.transpose_b")])
+        elif name in ("tl.tt.tensor_to_dfb_nd", "tl.tt.dfb_to_tensor_nd") and len(args) == 2:
+            starts = annotations.pop("tt.starts")
+            extents = annotations.pop("tt.extents")
+            assert len(starts) == len(extents)
+            for start, extent in zip(starts, extents):
+                args.extend([start, extent])
+        elif (
+            name
+            in (
+                "tl.tt.dfb_pipe_send_record",
+                "tl.tt.dfb_pipe_recv_record",
+                "tl.tt.dfb_pipe_wait_record",
+            )
+            and len(args) == 2
+        ):
+            record = args[0]
+            assert isinstance(record, tirx.Call) and record.op.name == "tl.tt.pipe_record_ref" and len(record.args) == 2
+            args = [record.args[0], record.args[1], args[1]]
+        annotations.pop("tt.debug_dfb_operands", None)
+        annotations.pop("tt.debug_value_operands", None)
     return tirx.Call(call.dtype, call.op, args, annotations, call.span)
 
 

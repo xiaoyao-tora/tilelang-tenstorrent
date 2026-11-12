@@ -207,6 +207,12 @@ def device_ir_to_tirx(mod: IRModule) -> str:
         index += 1
 
     result = tokenize.untokenize(encoded)
+    legend = (
+        "# Device ABI legend: calling_conv=2 is DEVICE_KERNEL_LAUNCH; "
+        "tt.noc_index=0/1 selects NOC0/NOC1; tt.tensor_arg_indices indexes "
+        "tt.tensor_table.\n"
+    )
+    result = legend + result
     ast.parse(result)
     return result
 

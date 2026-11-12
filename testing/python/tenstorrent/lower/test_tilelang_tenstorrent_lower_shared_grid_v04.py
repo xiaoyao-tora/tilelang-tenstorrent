@@ -164,19 +164,13 @@ def test_loopback_transfer_defines_a_distinct_destination_on_source():
     assert record.destination_begin == (0, 0)
     assert record.destination_end == (2, 1)
     slots = {str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()}
-    assert not any(
-        call.op.name == "tl.tt.dfb_pipe_recv_record" for call in calls(slots["brisc"].body)
-    )
-    assert sum(
-        call.op.name == "tl.tt.dfb_pipe_recv_record" for call in calls(slots["ncrisc"].body)
-    ) == 1
+    assert not any(call.op.name == "tl.tt.dfb_pipe_recv_record" for call in calls(slots["brisc"].body))
+    assert sum(call.op.name == "tl.tt.dfb_pipe_recv_record" for call in calls(slots["ncrisc"].body)) == 1
 
 
 def test_symbolic_core_tensor_offsets_remain_one_shared_body():
     mod = lower(symbolic_core_tensor_offsets)
-    functions = {
-        str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()
-    }
+    functions = {str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()}
     ncrisc = functions["ncrisc"]
     assert _body_counts(ncrisc)["if"] == 0
     work = []
@@ -190,6 +184,14 @@ def test_symbolic_core_tensor_offsets_remain_one_shared_body():
             loops.append(node)
         elif isinstance(node, tirx.Call) and hasattr(node.op, "name"):
             operation_names.add(node.op.name)
+            for key in ("tt.starts", "tt.extents"):
+                for expression in node.annotations.get(key, []):
+                    tirx.stmt_functor.post_order_visit(
+                        expression,
+                        lambda nested: (
+                            operation_names.add(nested.op.name) if isinstance(nested, tirx.Call) and hasattr(nested.op, "name") else None
+                        ),
+                    )
 
     tirx.stmt_functor.post_order_visit(ncrisc.body, collect)
     assert len(work) == 1
@@ -454,9 +456,7 @@ def producer_forwarded_broadcast(
 
 def test_loopback_broadcast_splits_source_and_destination_slots():
     mod = lower(producer_forwarded_broadcast)
-    functions = {
-        str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()
-    }
+    functions = {str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()}
     sends = [
         (str(function.attrs["tt.kernel_slot"]), call.op.name)
         for function in mod.functions.values()
@@ -576,18 +576,12 @@ def test_flash_attention_loopback_unifies_kv_compute_streams():
             accum_dtype="bfloat16",
         )
     )
-    functions = {
-        str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()
-    }
+    functions = {str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()}
     assert _body_counts(functions["trisc"])["if"] == 0
     kv_loops = []
     tirx.stmt_functor.post_order_visit(
         functions["trisc"].body,
-        lambda node: (
-            kv_loops.append(node)
-            if isinstance(node, tirx.For) and str(node.loop_var.name) == "kv_tile"
-            else None
-        ),
+        lambda node: kv_loops.append(node) if isinstance(node, tirx.For) and str(node.loop_var.name) == "kv_tile" else None,
     )
     assert len(kv_loops) == 1
     assert int(kv_loops[0].extent) == 2
@@ -600,12 +594,8 @@ def test_flash_attention_loopback_unifies_kv_compute_streams():
         for pipe_records in records.values()
         for record in pipe_records
     )
-    assert not any(
-        call.op.name == "tl.tt.dfb_pipe_recv_record" for call in calls(functions["brisc"].body)
-    )
-    assert not any(
-        call.op.name == "tl.tt.dfb_pipe_send_record" for call in calls(functions["ncrisc"].body)
-    )
+    assert not any(call.op.name == "tl.tt.dfb_pipe_recv_record" for call in calls(functions["brisc"].body))
+    assert not any(call.op.name == "tl.tt.dfb_pipe_send_record" for call in calls(functions["ncrisc"].body))
 
 
 def test_summa_device_body_uses_kind_resource_aliases():
@@ -626,6 +616,8 @@ def test_summa_device_body_uses_kind_resource_aliases():
                     "tl.tt.dfb_stream_ref",
                     "tl.tt.pipe_net_ref",
                     "tl.tt.accumulator_ref",
+                    "tl.tt.compute_value_ref",
+                    "tl.tt.compute_state_ref",
                 )
             ):
                 resource_binds.append(node)
@@ -650,8 +642,8 @@ def test_summa_device_body_uses_kind_resource_aliases():
             ),
         )
     assert aliases["A_tensor"] == "tl.tt.tensor_ref"
-    assert aliases["a_panel_stream"] == "tl.tt.dfb_stream_ref"
-    assert aliases["b_panel_stream"] == "tl.tt.dfb_stream_ref"
+    assert aliases["a_panel_ncrisc_to_trisc_recurrent_stream"] == "tl.tt.dfb_stream_ref"
+    assert aliases["b_panel_ncrisc_to_trisc_recurrent_stream"] == "tl.tt.dfb_stream_ref"
     assert aliases["a_panel_pipe"] == "tl.tt.pipe_net_ref"
     assert aliases["c_local_acc"] == "tl.tt.accumulator_ref"
     trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
@@ -704,9 +696,7 @@ def test_codegen_record_resolver_accepts_collective_loopback_only():
         int(pipe.payload_dfb_id),
         pipe.source_span,
     )
-    families[0] = D.DeviceIRDescriptorFamily(
-        prototype, family.positions, family.fields, family.source_parts
-    )
+    families[0] = D.DeviceIRDescriptorFamily(prototype, family.positions, family.fields, family.source_parts)
     malformed = mod.with_attr("tt.transport_families", families)
     with pytest.raises(RecordResolutionError, match="cannot include its source"):
         resolve_transport_records(malformed)
@@ -873,7 +863,7 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
         brisc_blocks = []
         tirx.stmt_functor.post_order_visit(
             functions["brisc"].body,
-            lambda node: brisc_blocks.append(node) if isinstance(node, tirx.SBlock) else None,
+            lambda node, brisc_blocks=brisc_blocks: brisc_blocks.append(node) if isinstance(node, tirx.SBlock) else None,
         )
         assert sum(block.name_hint == "tt_device_core_work" for block in brisc_blocks) == 1
         assert sum(block.name_hint == "tt_device_stream_work" for block in brisc_blocks) == 2
@@ -978,7 +968,11 @@ def test_device_verifier_rejects_missing_pipe_record_identity():
             return None
         changed = True
         args = list(call.args)
-        args[1] = tirx.IntImm(args[1].dtype, 999)
+        record = args[0]
+        assert isinstance(record, tirx.Call) and record.op.name == "tl.tt.pipe_record_ref"
+        record_args = list(record.args)
+        record_args[1] = tirx.IntImm(record_args[1].dtype, 999)
+        args[0] = tirx.Call(record.dtype, record.op, record_args, record.annotations, record.span)
         return tirx.Call(call.dtype, call.op, args, call.annotations, call.span)
 
     for global_var, function in list(mod.functions.items()):
@@ -1367,8 +1361,104 @@ def test_stateful_loop_preserves_the_source_iteration_domain():
     assert [int(loop.extent) for loop in structured_loops] == [8]
     assert not any(str(node.loop_var.name).startswith("tt_compact_") for node in structured_loops)
     assert sum(call.op.name == "tl.tt.compute_value_gemm" for call in calls(trisc.body)) == 2
-    assert sum("state_" in call.op.name for call in calls(trisc.body)) == 4
+    assert sum(call.op.name.startswith("tl.tt.compute_value_state_") for call in calls(trisc.body)) == 4
     assert not _dynamic_dfb_operands(mod)
+
+
+def test_flash_attention_device_body_uses_readable_identity_contracts():
+    from examples.tenstorrent.flash_attn import make_flash_attention
+    from tvm.script import from_source
+
+    mod = lower(
+        make_flash_attention(
+            batch=1,
+            heads=1,
+            seq_q=64,
+            seq_kv=64,
+            head_dim=32,
+            core_q=2,
+            core_bh=1,
+        )
+    )
+    source = D.device_ir_to_tirx(mod)
+    assert source.startswith("# Device ABI legend:")
+    restored = from_source(source)
+    assert transform.VerifyTenstorrentDeviceIR()(restored).same_as(restored)
+
+    found = {
+        "compute_value_ref": 0,
+        "compute_state_ref": 0,
+        "pipe_record_ref": 0,
+        "gemm": 0,
+        "tensor_region": 0,
+        "debug_names": 0,
+    }
+    for function in mod.functions.values():
+        for node in calls(function.body):
+            name = str(node.op.name)
+            if name == "tl.tt.compute_value_ref":
+                found["compute_value_ref"] += 1
+            elif name == "tl.tt.compute_state_ref":
+                found["compute_state_ref"] += 1
+            elif name == "tl.tt.pipe_record_ref":
+                found["pipe_record_ref"] += 1
+            elif name == "tl.tt.compute_value_gemm":
+                found["gemm"] += 1
+                assert len(node.args) == 4
+                assert all(node.annotations[key].dtype == "bool" for key in ("tt.transpose_a", "tt.transpose_b"))
+            elif name in ("tl.tt.tensor_to_dfb_nd", "tl.tt.dfb_to_tensor_nd"):
+                found["tensor_region"] += 1
+                assert len(node.args) == 2
+                assert len(node.annotations["tt.starts"]) == len(node.annotations["tt.extents"])
+            if "tt.debug_dfb_operands" in node.annotations or "tt.debug_value_operands" in node.annotations:
+                found["debug_names"] += 1
+    assert all(found.values()), found
+
+    for function in mod.functions.values():
+        statements = list(function.body.seq) if isinstance(function.body, tirx.SeqStmt) else [function.body]
+        for statement in statements:
+            if not isinstance(statement, tirx.Bind):
+                break
+            if statement.value.op.name == "tl.tt.dfb_stream_ref":
+                name = str(statement.var.name)
+                assert not (name.startswith("stream_") and name[7:].isdigit())
+
+
+def test_device_verifier_rejects_non_boolean_compute_gemm_flag():
+    from examples.tenstorrent.flash_attn import make_flash_attention
+
+    mod = ir.load_json(
+        ir.save_json(
+            lower(
+                make_flash_attention(
+                    batch=1,
+                    heads=1,
+                    seq_q=32,
+                    seq_kv=64,
+                    head_dim=32,
+                    core_q=1,
+                    core_bh=1,
+                )
+            )
+        )
+    )
+    changed = False
+
+    def corrupt(call):
+        nonlocal changed
+        if changed or call.op.name != "tl.tt.compute_value_gemm":
+            return None
+        changed = True
+        annotations = dict(call.annotations)
+        annotations["tt.transpose_b"] = tirx.IntImm("int32", 1)
+        return tirx.Call(call.dtype, call.op, call.args, annotations, call.span)
+
+    for global_var, function in list(mod.functions.items()):
+        body = tirx.stmt_functor.ir_transform(function.body, None, corrupt, ["tirx.Call"])
+        mod.update_func(global_var, function.with_body(body))
+    assert changed
+    with pytest.raises(ValueError, match="Boolean tt.transpose_b"):
+        transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 def test_mixed_precision_flash_uses_full_fp32_accumulation():

@@ -83,7 +83,11 @@ def test_cross_core_value_definition_is_rejected():
             return None
         changed = True
         args = list(call.args)
-        args[0] = tirx.IntImm(args[0].dtype, 0)
+        args[0] = tirx.Call(
+            "handle",
+            tvm.ir.Op.get("tl.tt.compute_value_ref"),
+            [tirx.IntImm("int32", 0)],
+        )
         return tirx.Call(call.dtype, call.op, args, call.annotations, call.span)
 
     malformed = rewrite_calls(mod, edit)

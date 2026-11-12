@@ -17,9 +17,9 @@ _DFB_OPERAND_POSITIONS = {
     "tl.tt.dfb_copy_wait": (0,),
     "tl.tt.dfb_release": (0,),
     "tl.tt.dfb_load": (0,),
-    "tl.tt.dfb_pipe_send_record": (2,),
-    "tl.tt.dfb_pipe_recv_record": (2,),
-    "tl.tt.dfb_pipe_wait_record": (2,),
+    "tl.tt.dfb_pipe_send_record": (1,),
+    "tl.tt.dfb_pipe_recv_record": (1,),
+    "tl.tt.dfb_pipe_wait_record": (1,),
     "tl.tt.tensor_to_dfb_nd": (1,),
     "tl.tt.dfb_to_tensor_nd": (0,),
     "tl.tt.gemm_update": (0, 1),
@@ -37,6 +37,8 @@ _RESOURCE_REF_NAMES = frozenset(
         "tl.tt.dfb_stream_ref",
         "tl.tt.pipe_net_ref",
         "tl.tt.accumulator_ref",
+        "tl.tt.compute_value_ref",
+        "tl.tt.compute_state_ref",
     }
 )
 

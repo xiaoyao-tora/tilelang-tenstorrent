@@ -52,9 +52,11 @@ The TRISC body owns the definitions and actual dependencies:
 
 | Intrinsic | Contract |
 | --- | --- |
-| `compute_value(output, dfb_inputs...)` | Define a typed pure elementwise/fill/typecast value |
+| `compute_value_ref(id)` | Pure, handle-typed readable reference to one Core-local canonical value ID |
+| `compute_state_ref(id)` | Pure, handle-typed readable reference to one abstract loop-state ID |
+| `compute_value(output, dfb_inputs...)` | Define a typed pure elementwise/fill/typecast value through refs |
 | `compute_value_operand(index)` | Pure expression reference through `tt.value_inputs[index]` |
-| `compute_value_gemm(output, lhs_dfb, rhs_dfb, old, transpose_a, transpose_b)` | Produce a new accumulator version |
+| `compute_value_gemm(output, lhs_dfb, rhs_dfb, old)` | Produce a new accumulator version; Boolean `tt.transpose_a/b` are named annotations |
 | `compute_value_store(value, output_dfb)` | Exact-dtype compute store to a reserved DFB |
 
 The output `ComputeValueDescriptor` is authoritative for logical domain, dtype
@@ -66,6 +68,13 @@ value-input views are derived from each input descriptor plus explicit
 `compute_value_operand` leaves, so it never duplicates resource IDs. Tensor
 exports use an explicit compute cast when their storage dtype differs; they
 never silently retag a value.
+
+The canonical integer remains inside each function-entry `compute_value_ref` or
+`compute_state_ref`; body operations use the readable handle alias. Formation
+also emits derived `tt.debug_dfb_operands` and `tt.debug_value_operands` names so
+an expression's local operand indices can be audited without duplicating
+identity in the expression DAG. These names are deterministic diagnostics only:
+the verifier checks their shape and type, while Codegen uses refs and descriptors.
 
 The verifier resolves value and accumulator IDs using the active Core before it
 checks definitions, predecessor chains, exact expression effects, geometry,

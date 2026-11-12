@@ -51,10 +51,11 @@ def test_tensor_rank_mapping_rejects_non_singleton_axis(cores):
         if changed or call.op.name != "tl.tt.tensor_to_dfb_nd":
             return None
         changed = True
-        args = list(call.args)
-        args[2] = tirx.IntImm(args[2].dtype, 0)
-        args[3] = tirx.IntImm(args[3].dtype, 2)
-        return tirx.Call(call.dtype, call.op, args, call.annotations, call.span)
+        annotations = dict(call.annotations)
+        extents = list(annotations["tt.extents"])
+        extents[0] = tirx.IntImm(extents[0].dtype, 2)
+        annotations["tt.extents"] = extents
+        return tirx.Call(call.dtype, call.op, call.args, annotations, call.span)
 
     corrupted = rewrite_calls(attention_row_program(cores=cores), edit)
     assert changed
@@ -71,10 +72,11 @@ def test_shared_only_tensor_rank_mapping_keeps_slice_checks():
     def edit(call):
         if call.op.name != "tl.tt.tensor_to_dfb_nd":
             return None
-        args = list(call.args)
-        args[2] = tirx.IntImm(args[2].dtype, 0)
-        args[3] = tirx.IntImm(args[3].dtype, 2)
-        return tirx.Call(call.dtype, call.op, args, call.annotations, call.span)
+        annotations = dict(call.annotations)
+        extents = list(annotations["tt.extents"])
+        extents[0] = tirx.IntImm(extents[0].dtype, 2)
+        annotations["tt.extents"] = extents
+        return tirx.Call(call.dtype, call.op, call.args, annotations, call.span)
 
     check_rejected(rewrite_calls(mod, edit), "leading singleton")
 

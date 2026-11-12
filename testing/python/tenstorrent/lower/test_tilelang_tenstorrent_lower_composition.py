@@ -171,7 +171,16 @@ def test_multicore_values_use_spmd_local_definition_ids():
 
     tirx.stmt_functor.post_order_visit(trisc.body, visit)
     assert value_operands
-    assert all(isinstance(operand, tirx.IntImm) for operand in value_operands)
+    aliases = {}
+
+    def collect_alias(node):
+        if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.compute_value_ref":
+            aliases[node.var] = node.value
+
+    tirx.stmt_functor.post_order_visit(trisc.body, collect_alias)
+    assert aliases
+    assert all(isinstance(operand, tirx.Var) and operand in aliases for operand in value_operands)
+    assert all(isinstance(reference.args[0], tirx.IntImm) for reference in aliases.values())
 
 
 def pipe_values():

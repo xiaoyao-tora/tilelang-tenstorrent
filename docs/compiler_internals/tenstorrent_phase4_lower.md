@@ -69,11 +69,12 @@ schema version，再按对应契约消费 operation。
 | Operation | 参数与属性 |
 | --- | --- |
 | `tl.tt.tile_compute` | 参数为 `[output BufferRegion, input BufferRegions...]`；仅 Legalize→Form 中间层存在 |
-| `tl.tt.dfb_compute` | 参数为 `[output dfb_id, input dfb_ids...]`；output 必须是新的 generation，只有 TRISC 可执行 |
+| `tl.tt.dfb_compute` | 参数为 `[output dfb_ref, input dfb_refs...]`；ref 内保留 canonical ID，output 必须是新的 generation，只有 TRISC 可执行 |
 | `tl.tt.dfb_operand` | 单一零基 operand index；result dtype 等于 `dfb_compute/compute_value` 对应 DFB operand dtype |
 | `tl.tt.compute_value_operand` | 单一零基 operand index；通过 `tt.value_inputs[index]` 解析 dominating compute value |
-| `tl.tt.tensor_to_dfb_nd` | `[tensor_id, dfb_id, min0, extent0, ...]`；普通 load 由 NCRISC 发布，source-inclusive collective 的私有 send staging load 由 BRISC 发布 |
-| `tl.tt.dfb_to_tensor_nd` | `[dfb_id, tensor_id, min0, extent0, ...]`；NCRISC 消费已 wait 的 DFB |
+| `tl.tt.compute_value_ref` / `compute_state_ref` | 函数入口的纯 handle alias；内部整数分别是 Core-local value/state canonical ID |
+| `tl.tt.tensor_to_dfb_nd` | `[tensor_ref, dfb_ref]` 加等长 `tt.starts` / `tt.extents`；普通 load 由 NCRISC 发布，source-inclusive collective 的私有 send staging load 由 BRISC 发布 |
+| `tl.tt.dfb_to_tensor_nd` | `[dfb_ref, tensor_ref]` 加等长 `tt.starts` / `tt.extents`；NCRISC 消费已 wait 的 DFB |
 | `tl.tt.dfb_reserve` / `tl.tt.dfb_wait` | 单一 logical stream operand；结构化循环和 stream descriptor 保存总 transaction cardinality |
 
 current `dfb_compute` 的公共 annotations 是 `tt.compute_kind`、`tt.logical_domain` 和非空时的
@@ -82,6 +83,8 @@ current `dfb_compute` 的公共 annotations 是 `tt.compute_kind`、`tt.logical_
 `ComputeValueDescriptor`。两者都不得重复保存 `tt.compute_dtype`、
 `tt.compute_tile_shape` 或 `tt.value_input_shapes`，空的 `tt.input_shapes` / `tt.value_inputs`
 也必须省略。
+非空 operand 同时带有派生的 `tt.debug_dfb_operands` / `tt.debug_value_operands` 名称数组；
+它们只改善 TIRX 可读性，不能参与 identity、shape、dtype、lifetime 或 Codegen 决策。
 `tt.input_shapes` 按 input 参数保存逻辑 shape，不能用 tile-grid 代替：Reduction
 移除轴后，原本 untiled 的 batch 轴可能进入最后两轴，需要重新推导 output tile-grid。
 `tt.access_maps` 是按

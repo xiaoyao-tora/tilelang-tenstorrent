@@ -60,7 +60,8 @@ collective source record into per-destination `ttl.copy` operations.
 Transport families carry a dense `pipe_net_id`, a parent `communication_id`,
 and a dense per-PipeNet `record_index`; Codegen uses those indices directly for
 `PipeNetRecordsAttr` without coordinate-based renumbering. Record operations
-carry only the selected PipeNet record and local logical DFB stream. Structured
+carry `pipe_record_ref(pipe_net_ref, record_index)` and the local logical DFB
+stream. Structured
 control flow represents repeated execution; the final Device body is the
 communication schedule and does not persist a duplicate step table.
 
@@ -77,9 +78,10 @@ capacity relation. The pure resolver binds the finite groups required by
 each kernel slot from typed producer/consumer ownership without expanding the
 body or materializing concrete descriptor tables.
 
-Current Device bodies distinguish resource identities from ordinary scalar
-integers with pure, handle-typed `tensor_ref`, `dfb_stream_ref`, `pipe_net_ref`,
-and `accumulator_ref` expressions. Each function places its static aliases in
+Current Device bodies distinguish identities from ordinary scalar integers with
+pure, handle-typed `tensor_ref`, `dfb_stream_ref`, `pipe_net_ref`,
+`accumulator_ref`, `compute_value_ref` and `compute_state_ref` expressions. Each
+function places its static aliases in
 one contiguous PrimFunc prologue, with at most one alias per resource kind and
 canonical ID; a canonical parser-created root block is transparent to this
 rule. Names are diagnostic only and do not emit TTL operations. The resolver
@@ -96,6 +98,12 @@ them by zero-based position. Output dtype/tile geometry and compute-value shapes
 come from typed descriptors. The current emitter must resolve these indices
 before building TTL SSA and must not recover dependencies from duplicated IDs in
 expression leaves.
+
+Current value GEMMs carry only output/lhs/rhs/old operands and use named Boolean
+`tt.transpose_a/b` annotations. ND Tensor transfers carry Tensor/DFB operands
+plus `tt.starts` and `tt.extents` arrays. The preflight resolves refs and checks
+these structured forms; it does not recover their meaning from positional magic
+integers. Derived `tt.debug_*_operands` arrays are ignored by TTL semantics.
 
 TT-Lang's current DFB identity analysis only traces a CB operand directly to
 `ttl.bind_cb` through unrealized casts. The current emitter must therefore add a

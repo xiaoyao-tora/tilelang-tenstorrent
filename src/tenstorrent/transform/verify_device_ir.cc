@@ -143,6 +143,9 @@ bool IsCurrentDeviceOp(const std::string &op_name) {
       "tl.tt.dfb_stream_ref",
       "tl.tt.pipe_net_ref",
       "tl.tt.accumulator_ref",
+      "tl.tt.compute_value_ref",
+      "tl.tt.compute_state_ref",
+      "tl.tt.pipe_record_ref",
       "tl.tt.dfb_compute",
       "tl.tt.dfb_operand",
       "tl.tt.compute_broadcast",
@@ -174,16 +177,24 @@ bool IsCurrentDeviceOp(const std::string &op_name) {
   return allowed.count(op_name) != 0;
 }
 
+bool IsRecordPipeOperation(const tirx::CallNode *call) {
+  return call->op.same_as(dfb_pipe_send_record()) ||
+         call->op.same_as(dfb_pipe_recv_record()) ||
+         call->op.same_as(dfb_pipe_wait_record());
+}
+
 enum class DeviceResourceKind : int {
   kTensor = 0,
   kDFBStream = 1,
   kPipeNet = 2,
   kAccumulator = 3,
+  kComputeValue = 4,
+  kComputeState = 5,
 };
 
 struct DeviceResourceRef {
   DeviceResourceKind kind;
-  int64_t id;
+  PrimExpr id;
 };
 
 using DeviceResourceAliases =
@@ -199,7 +210,34 @@ ffi::Optional<DeviceResourceKind> ResourceRefKind(const RelaxExpr &op) {
     return DeviceResourceKind::kPipeNet;
   if (op.same_as(accumulator_ref()))
     return DeviceResourceKind::kAccumulator;
+  if (op.same_as(compute_value_ref()))
+    return DeviceResourceKind::kComputeValue;
+  if (op.same_as(compute_state_ref()))
+    return DeviceResourceKind::kComputeState;
   return std::nullopt;
+}
+
+PrimExpr ResolveResourceRefExpr(const PrimExpr &expr,
+                                DeviceResourceKind expected,
+                                const DeviceResourceAliases &aliases,
+                                const std::string &label);
+
+std::pair<PrimExpr, PrimExpr>
+ResolvePipeRecordRefExpr(const PrimExpr &expr,
+                         const DeviceResourceAliases &aliases,
+                         const std::string &label) {
+  const auto *record = expr.as<tirx::CallNode>();
+  Check(record && record->op.same_as(pipe_record_ref()) &&
+            record->args.size() == 2 && record->annotations.empty(),
+        label + " must use pipe_record_ref(pipe, index)");
+  PrimExpr pipe =
+      ResolveResourceRefExpr(record->args[0], DeviceResourceKind::kPipeNet,
+                             aliases, label + " PipeNet");
+  const PrimExpr &index = record->args[1];
+  Check(index.dtype().is_int() && index.dtype().lanes() == 1 &&
+            tirx::SideEffect(index) <= tirx::CallEffectKind::kPure,
+        label + " index must be a pure scalar integer");
+  return {pipe, index};
 }
 
 DeviceResourceAliases VerifyResourceAliasPrologues(const tirx::PrimFunc &func) {
@@ -228,14 +266,19 @@ DeviceResourceAliases VerifyResourceAliasPrologues(const tirx::PrimFunc &func) {
     Check(prologue_open,
           "Device resource aliases must form the PrimFunc prologue");
     Check(bind->var.dtype().is_handle() && call->dtype.is_handle() &&
-              call->args.size() == 1 && tirx::as_const_int(call->args[0]) &&
-              *tirx::as_const_int(call->args[0]) >= 0,
-          "Device resource alias must bind one static handle ref");
-    int64_t id = *tirx::as_const_int(call->args[0]);
+              call->args.size() == 1 && call->args[0].dtype().is_int() &&
+              call->args[0].dtype().lanes() == 1 &&
+              tirx::SideEffect(call->args[0]) <= tirx::CallEffectKind::kPure,
+          "Device resource alias must bind one pure integer handle ref");
+    PrimExpr id = call->args[0];
+    Check(!tirx::as_const_int(id) || *tirx::as_const_int(id) >= 0,
+          "Device resource alias has a negative ID");
     Check(aliases.emplace(bind->var, DeviceResourceRef{*kind, id}).second,
           "Device resource alias variable is bound more than once");
-    Check(identities.emplace(std::make_pair(*kind, id), bind->var).second,
-          "Device resource kind/ID has more than one function alias");
+    if (const int64_t *constant = tirx::as_const_int(id))
+      Check(identities.emplace(std::make_pair(*kind, *constant), bind->var)
+                .second,
+            "Device resource kind/ID has more than one function alias");
     prologue_bindings.insert(bind);
   }
   tirx::PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
@@ -263,7 +306,7 @@ PrimExpr ResolveResourceRefExpr(const PrimExpr &expr,
           label + " is not a bound Device resource ref");
     reference = found->second;
     Check(reference.kind == expected, label + " has the wrong resource kind");
-    return Integer(reference.id);
+    return reference.id;
   } else if (const auto *call = expr.as<tirx::CallNode>()) {
     auto kind = ResourceRefKind(call->op);
     Check(kind.has_value() && call->args.size() == 1,
@@ -302,7 +345,7 @@ private:
     auto found = aliases_->find(variable);
     if (found == aliases_->end())
       return variable;
-    return Integer(found->second.id);
+    return found->second.id;
   }
 
   PrimExpr VisitExpr_(const tirx::CallNode *op) final {
@@ -4456,13 +4499,12 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               PrimExpr value = bind_core.VisitExpr(Substitute(expr, bindings));
               if (current_resource_aliases)
                 value = ResourceRefEraser(current_resource_aliases)(value);
+              value = bind_core.VisitExpr(value);
               return arith::Analyzer().Simplify(value);
             };
             auto args = concrete->args;
             for (size_t index = 0; index < args.size(); ++index)
               args.Set(index, concretize(args[index]));
-            concrete = Call(concrete->dtype, concrete->op, args, annotations,
-                            concrete->span);
             auto value_inputs = annotations.Get("tt.value_inputs");
             if (value_inputs.has_value()) {
               ffi::Array<PrimExpr> rewritten;
@@ -4475,9 +4517,63 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             if (expression.has_value())
               annotations.Set("tt.expression", concretize(Downcast<PrimExpr>(
                                                    expression.value())));
-            if (!ffi::StructuralEqual()(annotations, concrete->annotations))
-              concrete = Call(concrete->dtype, concrete->op, concrete->args,
-                              annotations, concrete->span);
+            for (const char *key : {"tt.starts", "tt.extents"}) {
+              auto values = annotations.Get(key);
+              if (!values.has_value())
+                continue;
+              ffi::Array<PrimExpr> rewritten;
+              for (const PrimExpr &value :
+                   Downcast<ffi::Array<PrimExpr>>(values.value()))
+                rewritten.push_back(concretize(value));
+              annotations.Set(key, rewritten);
+            }
+
+            if (concrete->op.same_as(compute_value_gemm()) &&
+                args.size() == 4) {
+              auto transpose = [&](const char *key) {
+                auto value = annotations.Get(key);
+                Check(value.has_value(),
+                      std::string("compute-value GEMM missing ") + key);
+                const auto *flag = value.value().as<IntImmNode>();
+                Check(flag && flag->dtype == DataType::Bool(),
+                      std::string(key) + " must be Boolean");
+                return Integer(flag->value != 0);
+              };
+              args.push_back(transpose("tt.transpose_a"));
+              args.push_back(transpose("tt.transpose_b"));
+              annotations.erase("tt.transpose_a");
+              annotations.erase("tt.transpose_b");
+            } else if ((concrete->op.same_as(tensor_to_dfb_nd()) ||
+                        concrete->op.same_as(dfb_to_tensor_nd())) &&
+                       args.size() == 2) {
+              auto starts = annotations.Get("tt.starts");
+              auto extents = annotations.Get("tt.extents");
+              Check(starts.has_value() && extents.has_value(),
+                    "ND Tensor transfer is missing starts/extents");
+              auto start_values =
+                  Downcast<ffi::Array<PrimExpr>>(starts.value());
+              auto extent_values =
+                  Downcast<ffi::Array<PrimExpr>>(extents.value());
+              Check(start_values.size() == extent_values.size(),
+                    "ND Tensor transfer starts/extents size mismatch");
+              for (size_t index = 0; index < start_values.size(); ++index) {
+                args.push_back(start_values[index]);
+                args.push_back(extent_values[index]);
+              }
+              annotations.erase("tt.starts");
+              annotations.erase("tt.extents");
+            } else if (IsRecordPipeOperation(concrete.get()) &&
+                       args.size() == 2) {
+              const auto *record = args[0].as<CallNode>();
+              Check(record && record->op.same_as(pipe_record_ref()) &&
+                        record->args.size() == 2 && record->annotations.empty(),
+                    "Pipe record operation requires pipe_record_ref");
+              args = {record->args[0], record->args[1], args[1]};
+            }
+            annotations.erase("tt.debug_dfb_operands");
+            annotations.erase("tt.debug_value_operands");
+            concrete = Call(concrete->dtype, concrete->op, args, annotations,
+                            concrete->span);
             PostOrderVisit(concrete, [&](const ffi::ObjectRef &object) {
               if (const auto *nested = object.as<CallNode>()) {
                 calls->push_back(ffi::GetRef<Call>(nested));
@@ -4519,7 +4615,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       Check(name != "tl.tt.transfer" && name != "tl.tt.all_gather" &&
                 name != "tl.tt.all_reduce" &&
                 (name.rfind("tl.tt.pipe_", 0) != 0 ||
-                 name == "tl.tt.pipe_net_ref"),
+                 name == "tl.tt.pipe_net_ref" ||
+                 name == "tl.tt.pipe_record_ref"),
             "Device body retains a frontend communication operation");
       auto check_resource = [&](size_t index, DeviceResourceKind kind,
                                 const char *label) {
@@ -4541,6 +4638,14 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 "Device operation references missing DFB " +
                     std::to_string(*constant));
       };
+      auto check_compute_value = [&](const PrimExpr &value, const char *label) {
+        raw_resource_operand |= as_const_int(value) != nullptr;
+        PrimExpr id = ResolveResourceRefExpr(
+            value, DeviceResourceKind::kComputeValue, resource_aliases, label);
+        if (const int64_t *constant = as_const_int(id))
+          Check(*constant >= 0,
+                std::string(label) + " resolves to a negative ID");
+      };
       if (call->op.same_as(dfb_reserve()) || call->op.same_as(dfb_wait()) ||
           call->op.same_as(dfb_release()) ||
           call->op.same_as(dfb_copy_wait())) {
@@ -4556,11 +4661,37 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
         for (size_t index = 0; index < call->args.size(); ++index)
           check_dfb(index);
       } else if (call->op.same_as(compute_value())) {
+        check_compute_value(call->args[0], "Device compute value");
         for (size_t index = 1; index < call->args.size(); ++index)
           check_dfb(index);
       } else if (call->op.same_as(compute_value_gemm())) {
+        Check(call->args.size() == 4,
+              "current compute-value GEMM requires output/lhs/rhs/old");
+        check_compute_value(call->args[0], "Device compute value output");
         check_dfb(1);
         check_dfb(2);
+        check_compute_value(call->args[3], "Device compute value predecessor");
+        for (const char *key : {"tt.transpose_a", "tt.transpose_b"}) {
+          auto value = call->annotations.Get(key);
+          const auto *flag =
+              value.has_value() ? value.value().as<IntImmNode>() : nullptr;
+          Check(flag && flag->dtype == DataType::Bool(),
+                std::string("current compute-value GEMM requires Boolean ") +
+                    key);
+        }
+      } else if (call->op.same_as(compute_value_store())) {
+        check_compute_value(call->args[0], "stored compute value");
+        check_dfb(1);
+      } else if (call->op.same_as(compute_value_state_init()) ||
+                 call->op.same_as(compute_value_state_yield())) {
+        check_resource(0, DeviceResourceKind::kComputeState,
+                       "Device compute state");
+        check_compute_value(call->args[1], "Device compute state value");
+      } else if (call->op.same_as(compute_value_state_input()) ||
+                 call->op.same_as(compute_value_state_result())) {
+        check_compute_value(call->args[0], "Device compute state value");
+        check_resource(1, DeviceResourceKind::kComputeState,
+                       "Device compute state");
       } else if (call->op.same_as(tensor_to_dfb_nd()) ||
                  call->op.same_as(dfb_pipe_send()) ||
                  call->op.same_as(dfb_pipe_recv()) ||
@@ -4569,11 +4700,13 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       else if (call->op.same_as(dfb_pipe_send_record()) ||
                call->op.same_as(dfb_pipe_recv_record()) ||
                call->op.same_as(dfb_pipe_wait_record())) {
-        check_resource(0, DeviceResourceKind::kPipeNet, "Device PipeNet");
-        check_dfb(2);
-      } else if (call->op.same_as(dfb_to_tensor_nd()) ||
-                 call->op.same_as(compute_value_store()))
-        check_dfb(call->op.same_as(dfb_to_tensor_nd()) ? 0 : 1);
+        Check(call->args.size() == 2,
+              "current Pipe record operation requires record/stream");
+        ResolvePipeRecordRefExpr(call->args[0], resource_aliases,
+                                 "Device Pipe record");
+        check_dfb(1);
+      } else if (call->op.same_as(dfb_to_tensor_nd()))
+        check_dfb(0);
       else if (call->op.same_as(gemm_update())) {
         check_dfb(0);
         check_dfb(1);
@@ -4595,6 +4728,36 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
         check_dfb(1);
         check_dfb(2);
       }
+      if (auto inputs = call->annotations.Get("tt.value_inputs")) {
+        for (const PrimExpr &input :
+             Downcast<ffi::Array<PrimExpr>>(inputs.value())) {
+          raw_resource_operand |= as_const_int(input) != nullptr;
+          check_compute_value(input, "Device compute-value input");
+        }
+      }
+      auto validate_debug_names = [&](const char *key, size_t expected) {
+        auto names = call->annotations.Get(key);
+        if (!names.has_value())
+          return;
+        auto values = names.value().as<ffi::Array<PrimExpr>>();
+        Check(values.has_value() && values.value().size() == expected,
+              std::string(key) + " must cover every corresponding operand");
+        for (const PrimExpr &value : values.value()) {
+          const auto *name = value.as<StringImmNode>();
+          Check(name && !name->value.empty(),
+                std::string(key) + " entries must be nonempty strings");
+        }
+      };
+      size_t dfb_debug_count =
+          call->op.same_as(dfb_compute()) || call->op.same_as(compute_value())
+              ? call->args.size() - 1
+              : 0;
+      size_t value_debug_count = 0;
+      if (auto inputs = call->annotations.Get("tt.value_inputs"))
+        value_debug_count =
+            Downcast<ffi::Array<PrimExpr>>(inputs.value()).size();
+      validate_debug_names("tt.debug_dfb_operands", dfb_debug_count);
+      validate_debug_names("tt.debug_value_operands", value_debug_count);
       if (call->op.same_as(tensor_to_dfb_nd()) ||
           call->op.same_as(dfb_to_tensor_nd())) {
         bool load = call->op.same_as(tensor_to_dfb_nd());
@@ -4620,18 +4783,27 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
           Check(dfb->tensor_backing.has_value() &&
                     dfb->tensor_backing.value()->global_arg_index == tensor_id,
                 "Tensor transfer disagrees with DFB Tensor backing");
-        Check(call->args.size() == 2 + 2 * tensor->shape.size(),
-              "Tensor transfer rank/arity mismatch");
+        Check(call->args.size() == 2,
+              "current Tensor transfer requires Tensor/DFB operands only");
+        auto starts_attr = call->annotations.Get("tt.starts");
+        auto extents_attr = call->annotations.Get("tt.extents");
+        Check(starts_attr.has_value() && extents_attr.has_value(),
+              "current Tensor transfer is missing starts/extents");
+        auto starts = Downcast<ffi::Array<PrimExpr>>(starts_attr.value());
+        auto extents = Downcast<ffi::Array<PrimExpr>>(extents_attr.value());
+        Check(starts.size() == tensor->shape.size() &&
+                  extents.size() == tensor->shape.size(),
+              "Tensor transfer region rank mismatch");
         Check(tensor->shape.size() >= dfb->block_shape_in_tiles.size(),
               "Tensor transfer rank is smaller than DFB rank");
         size_t leading =
             tensor->shape.size() - dfb->block_shape_in_tiles.size();
         for (size_t axis = 0; axis < leading; ++axis)
-          Check(is_one(call->args[3 + 2 * axis]),
+          Check(is_one(extents[axis]),
                 "Tensor transfer may remove only leading singleton slice axes");
         for (size_t axis = 0; axis < tensor->shape.size(); ++axis) {
-          const PrimExpr &start = call->args[2 + 2 * axis];
-          const PrimExpr &extent = call->args[3 + 2 * axis];
+          const PrimExpr &start = starts[axis];
+          const PrimExpr &extent = extents[axis];
           if (as_const_int(start) && as_const_int(extent) &&
               as_const_int(tensor->shape[axis]))
             Check(*as_const_int(start) >= 0 && *as_const_int(extent) > 0 &&
@@ -4891,9 +5063,13 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             if (call->op.same_as(dfb_pipe_send_record()) ||
                 call->op.same_as(dfb_pipe_recv_record()) ||
                 call->op.same_as(dfb_pipe_wait_record())) {
-              int64_t pipe_net = ResolveResourceRef(
-                  call->args[0], DeviceResourceKind::kPipeNet, resource_aliases,
-                  "stream-work PipeNet");
+              Check(call->args.size() == 2,
+                    "stream-work Pipe record requires record/stream");
+              auto record = ResolvePipeRecordRefExpr(
+                  call->args[0], resource_aliases, "stream-work Pipe record");
+              int64_t pipe_net =
+                  RequireStaticInteger(arith::Analyzer().Simplify(record.first),
+                                       "stream-work PipeNet");
               auto transport =
                   std::find_if(transport_records.begin(),
                                transport_records.end(), [&](const auto &item) {

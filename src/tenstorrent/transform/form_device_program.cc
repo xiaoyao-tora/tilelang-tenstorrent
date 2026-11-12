@@ -597,7 +597,15 @@ public:
   ffi::String ResourceDebugName(int64_t id) const {
     if (id < 0 || id >= static_cast<int64_t>(resources_.size()))
       ThrowMalformed("resource debug-name index is out of range");
-    return resources_[id].metadata->buffer->name;
+    const ResourceVersion &resource = resources_[id];
+    std::string consumer = resource.consumer.empty()
+                               ? "unconsumed"
+                               : std::string(resource.consumer);
+    return resource.metadata->buffer->name + "_" + resource.producer + "_to_" +
+           consumer + "_g" + std::to_string(resource.generation);
+  }
+  const std::map<int64_t, std::string> &LoopStateDebugNames() const {
+    return loop_state_debug_names_;
   }
   std::string ResourceStorageIdentity(int64_t id) const {
     if (id < 0 || id >= static_cast<int64_t>(resources_.size()))
@@ -1329,8 +1337,10 @@ private:
           entry_value >= static_cast<int64_t>(values_.size()))
         ThrowMalformed("loop-carried compute value is missing its descriptor");
       const ComputeValueDescriptor &entry = values_[entry_value];
-      result.push_back({next_loop_state_id_++, entry_value, entry->buffer,
-                        entry->source_span});
+      int64_t state_id = next_loop_state_id_++;
+      result.push_back(
+          {state_id, entry_value, entry->buffer, entry->source_span});
+      loop_state_debug_names_[state_id] = entry->buffer->name;
     }
     std::sort(result.begin(), result.end(),
               [](const auto &left, const auto &right) {
@@ -1720,8 +1730,8 @@ private:
       return;
     ResourceVersion &resource = resources_.at(id);
     if (resource.producer != "ncrisc" || !resource.consumer.empty())
-      ThrowUnsupported(
-          "loopback source Tensor load is not an unconsumed NCRISC transaction");
+      ThrowUnsupported("loopback source Tensor load is not an unconsumed "
+                       "NCRISC transaction");
 
     ffi::Array<Stmt> retained, moved;
     int stage = 0;
@@ -2685,18 +2695,12 @@ private:
   void PlanHighLevelTransfer(const Call &call) {
     if (call->args.size() != 10)
       ThrowMalformed("high-level transfer arity mismatch");
-    int64_t sx =
-        RequireCurrentCoreInteger(call->args[2], "transfer source x");
-    int64_t sy =
-        RequireCurrentCoreInteger(call->args[3], "transfer source y");
-    int64_t bx =
-        RequireCurrentCoreInteger(call->args[4], "transfer begin x");
-    int64_t by =
-        RequireCurrentCoreInteger(call->args[5], "transfer begin y");
-    int64_t ex =
-        RequireCurrentCoreInteger(call->args[6], "transfer end x");
-    int64_t ey =
-        RequireCurrentCoreInteger(call->args[7], "transfer end y");
+    int64_t sx = RequireCurrentCoreInteger(call->args[2], "transfer source x");
+    int64_t sy = RequireCurrentCoreInteger(call->args[3], "transfer source y");
+    int64_t bx = RequireCurrentCoreInteger(call->args[4], "transfer begin x");
+    int64_t by = RequireCurrentCoreInteger(call->args[5], "transfer begin y");
+    int64_t ex = RequireCurrentCoreInteger(call->args[6], "transfer end x");
+    int64_t ey = RequireCurrentCoreInteger(call->args[7], "transfer end y");
     int64_t site = RequireStaticInteger(call->args[9], "transfer site_id");
     const auto *contract = call->args[8].as<StringImmNode>();
     if (!contract)
@@ -2836,14 +2840,10 @@ private:
         NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
     FullRegion(source);
     FullRegion(destination);
-    int64_t bx =
-        RequireCurrentCoreInteger(call->args[2], "all_gather begin x");
-    int64_t by =
-        RequireCurrentCoreInteger(call->args[3], "all_gather begin y");
-    int64_t ex =
-        RequireCurrentCoreInteger(call->args[4], "all_gather end x");
-    int64_t ey =
-        RequireCurrentCoreInteger(call->args[5], "all_gather end y");
+    int64_t bx = RequireCurrentCoreInteger(call->args[2], "all_gather begin x");
+    int64_t by = RequireCurrentCoreInteger(call->args[3], "all_gather begin y");
+    int64_t ex = RequireCurrentCoreInteger(call->args[4], "all_gather end x");
+    int64_t ey = RequireCurrentCoreInteger(call->args[5], "all_gather end y");
     int64_t axis = RequireStaticInteger(call->args[6], "all_gather axis");
     int64_t site = RequireStaticInteger(call->args[7], "all_gather site_id");
     if (!(bx <= core_x_ && core_x_ < ex && by <= core_y_ && core_y_ < ey))
@@ -2902,14 +2902,10 @@ private:
         NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
     FullRegion(source);
     FullRegion(destination);
-    int64_t bx =
-        RequireCurrentCoreInteger(call->args[2], "all_reduce begin x");
-    int64_t by =
-        RequireCurrentCoreInteger(call->args[3], "all_reduce begin y");
-    int64_t ex =
-        RequireCurrentCoreInteger(call->args[4], "all_reduce end x");
-    int64_t ey =
-        RequireCurrentCoreInteger(call->args[5], "all_reduce end y");
+    int64_t bx = RequireCurrentCoreInteger(call->args[2], "all_reduce begin x");
+    int64_t by = RequireCurrentCoreInteger(call->args[3], "all_reduce begin y");
+    int64_t ex = RequireCurrentCoreInteger(call->args[4], "all_reduce end x");
+    int64_t ey = RequireCurrentCoreInteger(call->args[5], "all_reduce end y");
     const auto *reduction = call->args[6].as<StringImmNode>();
     if (!reduction)
       ThrowMalformed("all_reduce reduction operation is not a string");
@@ -3070,8 +3066,8 @@ private:
         MoveTensorLoadToPipe(current->second);
         id = Read(region->buffer, "brisc");
       } else {
-        Buffer transport = MakeTransportBuffer(
-            region->buffer, record[0]->value, occurrence, call->span);
+        Buffer transport = MakeTransportBuffer(region->buffer, record[0]->value,
+                                               occurrence, call->span);
         // NCRISC owns every payload move and BRISC owns the inter-core
         // transfer.
         id = FillTransportPayload(transport, region, record[0]->value,
@@ -3163,6 +3159,7 @@ private:
   TransportBufferCache local_transport_buffers_;
   std::unordered_map<int64_t, ffi::Array<PrimExpr>> tensor_load_args_;
   int64_t next_loop_state_id_{0};
+  std::map<int64_t, std::string> loop_state_debug_names_;
   TransferKeys *transfers_;
   int64_t core_x_, core_y_, grid_x_{1}, grid_y_{1};
   std::vector<PipeEndpoint> endpoints_;
@@ -3619,12 +3616,14 @@ enum class DeviceResourceKind : int {
   kDFBStream = 1,
   kPipeNet = 2,
   kAccumulator = 3,
+  kComputeValue = 4,
+  kComputeState = 5,
 };
 
 using DeviceResourceKey = std::pair<DeviceResourceKind, int64_t>;
 
 struct DeviceResourceNames {
-  std::array<std::map<int64_t, std::string>, 4> by_kind;
+  std::array<std::map<int64_t, std::string>, 6> by_kind;
 
   const std::string &Get(DeviceResourceKind kind, int64_t id) const {
     const auto &names = by_kind[static_cast<size_t>(kind)];
@@ -3653,9 +3652,27 @@ BuildResourceNames(const std::map<int64_t, std::set<std::string>> &sources,
   std::map<int64_t, std::string> result;
   std::set<std::string> used;
   for (const auto &[id, names] : sources) {
-    std::string name = names.size() == 1
-                           ? SanitizeResourceName(*names.begin()) + suffix
-                           : ResourceFallbackName(kind, id);
+    std::string name;
+    if (names.size() == 1) {
+      name = SanitizeResourceName(*names.begin()) + suffix;
+    } else {
+      std::set<std::string> recurrence_names;
+      for (const std::string &source : names) {
+        size_t generation = source.rfind("_g");
+        bool numeric = generation != std::string::npos &&
+                       generation + 2 < source.size() &&
+                       std::all_of(source.begin() + generation + 2,
+                                   source.end(), [](unsigned char character) {
+                                     return std::isdigit(character);
+                                   });
+        recurrence_names.insert(numeric ? source.substr(0, generation)
+                                        : source);
+      }
+      name = recurrence_names.size() == 1
+                 ? SanitizeResourceName(*recurrence_names.begin()) +
+                       "_recurrent" + suffix
+                 : ResourceFallbackName(kind, id);
+    }
     if (!used.insert(name).second) {
       name += "_" + std::to_string(id);
       used.insert(name);
@@ -3675,15 +3692,22 @@ const Op &ResourceRefOp(DeviceResourceKind kind) {
     return tenstorrent::pipe_net_ref();
   case DeviceResourceKind::kAccumulator:
     return tenstorrent::accumulator_ref();
+  case DeviceResourceKind::kComputeValue:
+    return tenstorrent::compute_value_ref();
+  case DeviceResourceKind::kComputeState:
+    return tenstorrent::compute_state_ref();
   }
   TVM_FFI_UNREACHABLE();
 }
 
 std::string ResourceFallbackName(DeviceResourceKind kind, int64_t id) {
-  const char *prefix = kind == DeviceResourceKind::kTensor      ? "tensor"
-                       : kind == DeviceResourceKind::kDFBStream ? "stream"
-                       : kind == DeviceResourceKind::kPipeNet   ? "pipe_net"
-                                                                : "accumulator";
+  const char *prefix =
+      kind == DeviceResourceKind::kTensor         ? "tensor"
+      : kind == DeviceResourceKind::kDFBStream    ? "stream"
+      : kind == DeviceResourceKind::kPipeNet      ? "pipe_net"
+      : kind == DeviceResourceKind::kAccumulator  ? "accumulator"
+      : kind == DeviceResourceKind::kComputeValue ? "compute_value"
+                                                  : "compute_state";
   return std::string(prefix) + "_" + std::to_string(id);
 }
 
@@ -3697,13 +3721,25 @@ ResourceOperands(const Call &call) {
     for (size_t index = 0; index < call->args.size(); ++index)
       add(index, DeviceResourceKind::kDFBStream);
   } else if (call->op.same_as(tenstorrent::compute_value())) {
+    add(0, DeviceResourceKind::kComputeValue);
     for (size_t index = 1; index < call->args.size(); ++index)
       add(index, DeviceResourceKind::kDFBStream);
   } else if (call->op.same_as(tenstorrent::compute_value_gemm())) {
+    add(0, DeviceResourceKind::kComputeValue);
     add(1, DeviceResourceKind::kDFBStream);
     add(2, DeviceResourceKind::kDFBStream);
+    add(3, DeviceResourceKind::kComputeValue);
   } else if (call->op.same_as(tenstorrent::compute_value_store())) {
+    add(0, DeviceResourceKind::kComputeValue);
     add(1, DeviceResourceKind::kDFBStream);
+  } else if (call->op.same_as(tenstorrent::compute_value_state_init()) ||
+             call->op.same_as(tenstorrent::compute_value_state_yield())) {
+    add(0, DeviceResourceKind::kComputeState);
+    add(1, DeviceResourceKind::kComputeValue);
+  } else if (call->op.same_as(tenstorrent::compute_value_state_input()) ||
+             call->op.same_as(tenstorrent::compute_value_state_result())) {
+    add(0, DeviceResourceKind::kComputeValue);
+    add(1, DeviceResourceKind::kComputeState);
   } else if (call->op.same_as(tenstorrent::dfb_load()) ||
              call->op.same_as(tenstorrent::dfb_reserve()) ||
              call->op.same_as(tenstorrent::dfb_wait()) ||
@@ -3760,6 +3796,15 @@ private:
         ThrowMalformed(
             "parameterized resource ID must be a pure scalar integer");
     }
+    if (auto inputs = call->annotations.Get("tt.value_inputs")) {
+      for (const PrimExpr &input :
+           Downcast<ffi::Array<PrimExpr>>(inputs.value())) {
+        const int64_t *id = as_const_int(input);
+        if (!id || *id < 0)
+          ThrowMalformed("compute-value input identity must be static");
+        ++counts_[{DeviceResourceKind::kComputeValue, *id}];
+      }
+    }
     StmtExprVisitor::VisitExpr_(op);
   }
 
@@ -3769,8 +3814,9 @@ private:
 class DeviceResourceRefRewriter : public StmtExprMutator {
 public:
   explicit DeviceResourceRefRewriter(
-      const std::map<DeviceResourceKey, Var> *aliases)
-      : aliases_(aliases) {}
+      const std::map<DeviceResourceKey, Var> *aliases,
+      const DeviceResourceNames *names)
+      : aliases_(aliases), names_(names) {}
 
 private:
   PrimExpr ResourceRef(DeviceResourceKind kind, const PrimExpr &id,
@@ -3786,13 +3832,75 @@ private:
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     auto args = call->args;
+    auto annotations = call->annotations;
+
+    auto debug_name = [&](DeviceResourceKind kind, const PrimExpr &identity) {
+      const int64_t *id = as_const_int(identity);
+      if (!id || *id < 0)
+        ThrowMalformed("debug resource identity must be static");
+      return StringImm(names_->Get(kind, *id));
+    };
+    if (call->op.same_as(tenstorrent::dfb_compute()) ||
+        call->op.same_as(tenstorrent::compute_value())) {
+      ffi::Array<PrimExpr> names;
+      for (size_t index = 1; index < call->args.size(); ++index)
+        names.push_back(
+            debug_name(DeviceResourceKind::kDFBStream, call->args[index]));
+      if (!names.empty())
+        annotations.Set("tt.debug_dfb_operands", names);
+    }
+    if (auto inputs = annotations.Get("tt.value_inputs")) {
+      ffi::Array<PrimExpr> rewritten, names;
+      for (const PrimExpr &input :
+           Downcast<ffi::Array<PrimExpr>>(inputs.value())) {
+        names.push_back(debug_name(DeviceResourceKind::kComputeValue, input));
+        rewritten.push_back(
+            ResourceRef(DeviceResourceKind::kComputeValue, input, input->span));
+      }
+      annotations.Set("tt.value_inputs", rewritten);
+      if (!names.empty())
+        annotations.Set("tt.debug_value_operands", names);
+    }
+
     for (const auto &[index, kind] : ResourceOperands(call)) {
       args.Set(index, ResourceRef(kind, args[index], args[index]->span));
     }
-    return Call(call->dtype, call->op, args, call->annotations, op->span);
+
+    if (call->op.same_as(tenstorrent::compute_value_gemm())) {
+      if (args.size() != 6 || !as_const_int(call->args[4]) ||
+          !as_const_int(call->args[5]))
+        ThrowMalformed("compute-value GEMM requires static transpose flags");
+      int64_t ta = *as_const_int(call->args[4]);
+      int64_t tb = *as_const_int(call->args[5]);
+      if ((ta != 0 && ta != 1) || (tb != 0 && tb != 1))
+        ThrowMalformed("compute-value GEMM transpose flags must be boolean");
+      annotations.Set("tt.transpose_a", make_const(DataType::Bool(), ta != 0));
+      annotations.Set("tt.transpose_b", make_const(DataType::Bool(), tb != 0));
+      args = {args[0], args[1], args[2], args[3]};
+    } else if (call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
+               call->op.same_as(tenstorrent::dfb_to_tensor_nd())) {
+      if (args.size() < 2 || (args.size() - 2) % 2)
+        ThrowMalformed("ND Tensor transfer has malformed region operands");
+      ffi::Array<PrimExpr> starts, extents;
+      for (size_t index = 2; index < args.size(); index += 2) {
+        starts.push_back(args[index]);
+        extents.push_back(args[index + 1]);
+      }
+      annotations.Set("tt.starts", starts);
+      annotations.Set("tt.extents", extents);
+      args = {args[0], args[1]};
+    } else if (IsRecordPipeOperation(call.get())) {
+      if (args.size() != 3)
+        ThrowMalformed("Pipe record operation requires PipeNet/index/stream");
+      PrimExpr record = Call(DataType::Handle(), tenstorrent::pipe_record_ref(),
+                             {args[0], args[1]}, {}, call->span);
+      args = {record, args[2]};
+    }
+    return Call(call->dtype, call->op, args, annotations, op->span);
   }
 
   const std::map<DeviceResourceKey, Var> *aliases_;
+  const DeviceResourceNames *names_;
 };
 
 class DeviceResourceAliasMaterializer {
@@ -3821,7 +3929,7 @@ private:
       }
       aliases.emplace(key, Var(candidate, DataType::Handle()));
     }
-    DeviceResourceRefRewriter rewrite(&aliases);
+    DeviceResourceRefRewriter rewrite(&aliases, names_);
     Stmt body = rewrite(input);
     if (!aliases.empty()) {
       ffi::Array<Stmt> sequence;
@@ -4373,6 +4481,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   std::map<std::string, int64_t> logical_resource_ids;
   std::map<int64_t, std::string> resource_storage_keys;
   std::map<int64_t, std::set<std::string>> resource_debug_names;
+  std::map<int64_t, std::set<std::string>> loop_state_debug_names;
   StaticValueSubstituter bind_core_x(
       core_x_var, Call(core_x_var.dtype(), tenstorrent::core_x(), {}));
   Stmt symbolic_kernel_body = bind_core_x(kernel_body);
@@ -4390,8 +4499,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                                    &transport_buffers);
     std::vector<For> independent_loops =
         FindIndependentLoops(symbolic_kernel_body);
-    planner.Plan(
-        IndependentLoopBody(independent_loops, symbolic_kernel_body));
+    planner.Plan(IndependentLoopBody(independent_loops, symbolic_kernel_body));
     planner.EliminateDeadWrites();
     planner.FinalizeMulticore();
     if (planner.IsPipeline()) {
@@ -4485,6 +4593,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
           value->owner_slot, domain, value->materialization_refs,
           value->source_span));
     }
+    for (const auto &[state_id, name] : planner.LoopStateDebugNames())
+      loop_state_debug_names[state_id].insert(name);
     for (PipeEndpoint endpoint : planner.Endpoints()) {
       if (endpoint.dfb_id < 0 ||
           endpoint.dfb_id >= static_cast<int64_t>(resource_ids.size()) ||
@@ -4496,14 +4606,11 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     auto core_effects = planner.Effects();
     std::set<int64_t> used_tensors;
     for (const char *slot : {"ncrisc", "brisc"})
-      for (const Integer &tensor :
-           planner.UsedTensorIndices(ffi::String(slot)))
+      for (const Integer &tensor : planner.UsedTensorIndices(ffi::String(slot)))
         used_tensors.insert(tensor->value);
     for (int64_t tensor : used_tensors) {
       const auto &effect = core_effects[tensor];
-      effects[tensor] |= effect == "inout"    ? 3
-                         : effect == "output" ? 2
-                                              : 1;
+      effects[tensor] |= effect == "inout" ? 3 : effect == "output" ? 2 : 1;
     }
     DeviceIDRemapper remap(0, &resource_ids);
     size_t slot_index = 0;
@@ -4733,6 +4840,22 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       .by_kind[static_cast<size_t>(DeviceResourceKind::kAccumulator)] =
       BuildResourceNames(accumulator_name_sources,
                          DeviceResourceKind::kAccumulator, "_acc");
+
+  std::map<int64_t, std::set<std::string>> value_name_sources;
+  for (const ComputeValueDescriptor &value : compute_values) {
+    value_name_sources[value->value_id].insert(
+        std::string(value->buffer->name) + "_v" +
+        std::to_string(value->version));
+  }
+  resource_names
+      .by_kind[static_cast<size_t>(DeviceResourceKind::kComputeValue)] =
+      BuildResourceNames(value_name_sources, DeviceResourceKind::kComputeValue,
+                         "_value");
+
+  resource_names
+      .by_kind[static_cast<size_t>(DeviceResourceKind::kComputeState)] =
+      BuildResourceNames(loop_state_debug_names,
+                         DeviceResourceKind::kComputeState, "_state");
 
   const std::array<ffi::String, 3> slots = {"trisc", "ncrisc", "brisc"};
   for (size_t index = 0; index < slots.size(); ++index) {

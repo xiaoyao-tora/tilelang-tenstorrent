@@ -937,14 +937,23 @@ public:
     } else if (call->op.same_as(compute_value_state_input()) ||
                call->op.same_as(compute_value_state_result())) {
       shift(0, value_offsets_, "loop-state value");
+    } else if (call->op.same_as(compute_value_ref())) {
+      Check(args.size() == 1,
+            "compute-value ref must contain one identity expression");
+      args.Set(0, Shift(args[0], value_offsets_));
     }
     ffi::Map<ffi::String, ffi::ObjectRef> annotations = call->annotations;
     auto value_inputs = annotations.Get("tt.value_inputs");
     if (value_inputs.has_value()) {
       ffi::Array<PrimExpr> shifted;
       for (const PrimExpr &input :
-           Downcast<ffi::Array<PrimExpr>>(value_inputs.value()))
-        shifted.push_back(Shift(input, value_offsets_));
+           Downcast<ffi::Array<PrimExpr>>(value_inputs.value())) {
+        if (input.dtype().is_handle()) {
+          shifted.push_back(input);
+        } else {
+          shifted.push_back(Shift(input, value_offsets_));
+        }
+      }
       annotations.Set("tt.value_inputs", shifted);
     }
     return tirx::Call(call->dtype, call->op, args, annotations, op->span);
