@@ -1,5 +1,9 @@
 """Lower regressions for the shared-grid v04 Device IR contract."""
 
+import ast
+import inspect
+import textwrap
+
 import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import codegen, device_ir as D
@@ -1363,6 +1367,22 @@ def test_stateful_loop_preserves_the_source_iteration_domain():
     assert sum(call.op.name == "tl.tt.compute_value_gemm" for call in calls(trisc.body)) == 2
     assert sum(call.op.name.startswith("tl.tt.compute_value_state_") for call in calls(trisc.body)) == 4
     assert not _dynamic_dfb_operands(mod)
+
+
+def test_flash_attention_tiles_scopes_keep_one_store_each():
+    from examples.tenstorrent.flash_attn import make_flash_attention
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(make_flash_attention)))
+    tiles_loops = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Call)
+        and isinstance(node.iter.func, ast.Attribute)
+        and node.iter.func.attr == "Tiles"
+    ]
+    assert tiles_loops
+    assert all(len(loop.body) == 1 for loop in tiles_loops)
 
 
 def test_flash_attention_device_body_uses_readable_identity_contracts():
