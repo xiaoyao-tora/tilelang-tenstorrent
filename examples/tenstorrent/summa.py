@@ -9,11 +9,13 @@ The frontend captures the following contract for subsequent lowering:
 * ``dst_cores`` as one Core coordinate selects a point-to-point contract.
 * ``dst_cores`` as ``CoreRange`` selects a collective contract. A singleton
   ``CoreRange`` remains collective and is not rewritten as point-to-point.
-* ``transfer`` is source-exclusive. The source keeps its local ``src`` block;
-  every selected remote Core receives into its local ``dst`` block.
+* The collective destination range includes the source. Lowering keeps the
+  source payload in a private send generation and delivers the multicast into
+  the same logical compute buffer on every Core.
 * The same symbolic shared buffer may appear as ``src`` and ``dst`` because it
-  denotes a different Core-local instance on every Core. The source does not
-  copy the buffer to itself.
+  denotes a different Core-local instance on every Core. Source-inclusive
+  delivery creates a new local generation instead of sharing one transaction
+  between the send and compute consumers.
 * The statement is logically synchronous. Transfer handles, waits, DFB
   lifecycle operations, Pipe records, and physical NoC details are generated
   by the backend.
@@ -115,19 +117,19 @@ def make_summa(
             for stage in T.serial(k_stages):
                 k_begin = stage * block_k
 
-                # A: the leftmost Core loads and broadcasts along its row,
-                # retaining the local panel for GEMM.
+                # A: the leftmost Core loads and broadcasts along its complete
+                # row, including loopback delivery to the source.
                 if core_x == 0:
                     T.copy(A[row_begin : row_begin + block_m, k_begin : k_begin + block_k], a_panel)
                 if core_n > 1:
-                    T.comm.broadcast(src=a_panel, dst=a_panel, src_core=(0, core_y), dst_cores=T.comm.CoreRange(begin=(1, core_y), end=(core_n, core_y + 1)))
+                    T.comm.broadcast(src=a_panel, dst=a_panel, src_core=(0, core_y), dst_cores=T.comm.CoreRange(begin=(0, core_y), end=(core_n, core_y + 1)))
 
-                # B: the topmost Core loads and broadcasts along its column,
-                # retaining the local panel for GEMM.
+                # B: the topmost Core loads and broadcasts along its complete
+                # column, including loopback delivery to the source.
                 if core_y == 0:
                     T.copy(B[k_begin : k_begin + block_k, col_begin : col_begin + block_n], b_panel)
                 if core_m > 1:
-                    T.comm.broadcast(src=b_panel, dst=b_panel, src_core=(core_x, 0), dst_cores=T.comm.CoreRange(begin=(core_x, 1), end=(core_x + 1, core_m)))
+                    T.comm.broadcast(src=b_panel, dst=b_panel, src_core=(core_x, 0), dst_cores=T.comm.CoreRange(begin=(core_x, 0), end=(core_x + 1, core_m)))
 
                 T.gemm(a_panel, b_panel, c_local, clear_accum=False)
 

@@ -43,16 +43,16 @@ Phase 4 serial 行为。显式 `order`/`stage`/`sync`/`group` 手工调度不在
 | capacity | 一个池可同时持有的 payload block 数；不是 tile-grid 大小，也不是总 transaction 数 |
 | release | consumer 最后使用且异步读取完成后归还 block；`dfb_wait` 本身不释放 |
 
-Phase 4 保留的独立 Device For 使用 `(dfb_id, iteration epoch)`，descriptor relation
-为 loop extent。v3 改用每个展开 generation 一个 `dfb_id`，descriptor relation 为 1，
-迭代关系在独立 metadata 中表达。不得将 v2 的 extent relation 机械复制到每个 v3
-展开 generation，否则 transaction 总数会被重复计算。
+Current Device For 使用 `(dfb_id, iteration epoch)`，descriptor relation 为 loop extent。
+每个 lexical transaction site 只有一个 `dfb_id`；不得为每轮创建 generation ID，否则
+transaction relation 和资源数量都会被重复计算。
 
 每个 storage group 的 requested/inferred `block_count` 必须一致。窗口调度默认每池
 推导 D 个 block；显式容量须至少 D，足够时保留。两种 wait 策略沿用这一保守窗口
 预算，不声明为实际最小容量。容量依据是同时 reserve 尚未 release 的 transaction；
-copy 完成但未消费、保守 wait 以及 nested acquire 持有的旧 block 都必须计入。不同 write-site 不共享物理池。内部普通静态循环若被展开，其各次写入也视作不同
-位置；这里的 write-site 指展开后的计划位置，不是只按原始源码行合并。
+copy 完成但未消费、保守 wait 以及 nested acquire 持有的旧 block 都必须计入。不同
+write-site 不共享物理池。普通/Pipelined loop 不展开；write-site 是结构化 body 中的
+lexical transaction site，各轮由 epoch relation 区分。
 因此本轮没有实现跨变量/跨写入点的 lifetime coloring 或 L1 地址分配。
 
 ## 3. 跨 slot 调度与生命周期闭合
@@ -127,14 +127,15 @@ BindTarget -> ValidateTenstorrentFrontendIR -> CanonicalizeTTElementwise
  -> InferTenstorrentComputeRequirements -> VerifyTenstorrentDeviceIR
 ```
 
-- Canonicalize/compute verifier 允许外层静态 serial/unrolled loop binder 作为表达式
-  标量模板参数，按 lexical context 验证；elementwise 坐标和未绑定 Var 仍拒绝。
-  Form 展开后将 binder 代入常量并保留 source span，不允许自由 Var 泄漏到 Device IR。
+- Canonicalize/compute verifier 允许外层静态 serial/unrolled/Pipelined loop binder 作为
+  表达式标量模板参数，按 lexical context 验证；elementwise 坐标和未绑定 Var 仍拒绝。
+  Form 保留 binder 和 Device For，不允许自由 Var 泄漏到其 lexical scope 外。
 - Legalize 继续消费计算 operation，允许已由 lexical scope verifier 认证的 Var 叶
   dtype，最终由 Form 替换为常量；其余 storage/computation FP 类型检查不变。它保留
   pipeline 迭代边界与调度信息，不决定 processor/pool；流水循环本身由 Form 消费。
-- Form 在已有通用 DFB def-use 规划基础上生成窗口调度、不可变 generation、storage
-  group、copy completion、last-use release 和容量 metadata，产出三个 Device slot。
+- Form 在已有通用 DFB def-use 规划基础上生成结构化 pipeline transaction template、
+  storage group、copy completion、last-use release 和容量 metadata，产出三个 Device slot；
+  delayed/conservative 具体窗口调度由 TTL/TT-Lang 消费 policy 后形成。
 - Verify 接受最终 Device IR，独立检查 transaction、生命周期、容量和显式预算；
   不补发缺失 wait/release，不修补错误的 relation 或不够用的容量。
 - 共享 operation 注册及 schema 常量由主 agent 整合；完整 pipeline 仍由

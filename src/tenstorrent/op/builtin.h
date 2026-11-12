@@ -51,13 +51,15 @@ TVM_DLL const Op &pipe_net_ref();
 TVM_DLL const Op &accumulator_ref();
 
 /*!
- * \brief Describe one source-exclusive, logically synchronous Core transfer.
+ * \brief Describe one logically synchronous Core transfer.
  *
  * Operands are source/destination read/write regions, source x/y, half-open
  * destination begin x/y and end x/y, contract (point_to_point or collective),
  * and an operation-local call-site ID. Point destinations use a singleton
- * rectangle without changing their contract. Enclosing loops retain repeated
- * occurrences. Endpoint expressions and buffer identity survive until lowering.
+ * rectangle without changing their contract. Collective rectangles may include
+ * the source, which requests loopback delivery into the source-local destination.
+ * Enclosing loops retain repeated occurrences. Endpoint expressions and buffer
+ * identity survive until lowering.
  */
 TVM_DLL const Op &transfer();
 
@@ -166,7 +168,8 @@ TVM_DLL const Op &dfb_pipe_wait();
  * Arguments are (PipeNet ID, dense record index, local logical DFB stream ID).
  * Structured control flow represents repeated executions. One source operation
  * covers the record's complete destination range; each matching destination
- * Core executes one receive.
+ * Core executes one receive. Source operations run on BRISC and destination
+ * operations run on NCRISC, including a collective loopback destination.
  */
 TVM_DLL const Op &dfb_pipe_send_record();
 TVM_DLL const Op &dfb_pipe_recv_record();

@@ -1,6 +1,21 @@
 # Tenstorrent Device IR size
 
-## Why FlashAttention expanded
+## Current structured-loop contract
+
+Current stage-marked Device IR no longer specializes ordinary or pipelined loop
+iterations. `FormTenstorrentDeviceProgram` plans one lexical body, retains the
+source `tirx.For`, and represents repetition with stream transaction counts,
+communication occurrence extents, accumulator full-K relations, and explicit
+compute-value/DFB recurrence state. Device body and descriptor counts therefore
+do not grow with a representable loop extent, and current Lower does not emit
+`tt_compact_iteration`.
+
+The v7/v8/v9 materialization and compaction measurements below are retained as
+historical migration evidence. `compact_device_ir`/`expand_device_ir` remain
+legacy artifact compatibility helpers; they are not part of current Lower,
+verification, or production Codegen.
+
+## Historical: why FlashAttention expanded
 
 `hyf-test/kernel/flash_attn_03.py` has a small frontend loop nest, but the
 v7/v8 Device contract assigns distinct IDs to static transactions.
@@ -119,7 +134,4 @@ independent verification and comparison against the saved complete v9 artifact
 all passed with the final native build. Native build and pre-commit checks also
 passed.
 
-Static formation and semantic verification
-still temporarily materialize the expanded schedule; this change does not make
-compiler peak memory constant in kernel work. No Tenstorrent hardware run was
-performed.
+No Tenstorrent hardware run was performed for the historical measurements.

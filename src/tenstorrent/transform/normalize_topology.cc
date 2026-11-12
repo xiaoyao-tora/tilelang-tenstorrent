@@ -342,12 +342,12 @@ public:
                             !analyzer_.CanProve(source_coord[axis] < limit)))
         Reject("communication source is not statically in the launch grid");
     }
-    if (transfer_call) {
+    if (transfer_call && contract != "collective") {
       PrimExpr source_in_destination =
           source_coord[0] >= begin[0] && source_coord[0] < end[0] &&
           source_coord[1] >= begin[1] && source_coord[1] < end[1];
       if (analyzer_.CanProve(source_in_destination))
-        Reject("source-exclusive transfer destination includes its source");
+        Reject("point transfer destination equals its source");
     }
     int64_t site_id = *as_const_int(call->args[expected_arity - 1]);
     if (!sites_.insert(site_id).second)

@@ -47,8 +47,14 @@ the current TTL operation/control-flow/transport emitter is not.
 Current Device communication bodies use record-level
 `dfb_pipe_send_record`/`dfb_pipe_recv_record`/`dfb_pipe_wait_record` operations.
 One source operation represents the complete `PipeDescriptor` destination
-range; destination Cores execute one receive role each. The current emitter must
-map source/destination `tt_device_stream_work` regions to
+range; destination Cores execute one receive role each. Collective ranges may
+include the source. In that case Lower keeps the source send staging generation
+separate from the source-local receive/compute generation, emits the complete
+source Tensor-load/send transaction on BRISC and destination work on NCRISC,
+and represents the loopback in the same PipeNet record. Each slot's
+`tt.tensor_arg_indices` contains exactly the Tensor values used by that function.
+Point-to-point records remain non-loopback. The current emitter
+must map source/destination `tt_device_stream_work` regions to
 `ttl.pipenet_foreach_src`/`ttl.pipenet_foreach_dst` and must not expand a
 collective source record into per-destination `ttl.copy` operations.
 Transport families carry a dense `pipe_net_id`, a parent `communication_id`,
@@ -60,13 +66,14 @@ communication schedule and does not persist a duplicate step table.
 
 The pinned finalizer can recolor many static logical DFB declarations into at
 most the target's physical CB-index capacity; therefore logical storage-group
-count alone is not a preflight failure. Current Lower keeps compiler-made
-compact loops and affine Core-dependent generation operands. Non-pipeline
+count alone is not a preflight failure. Current Lower preserves source
+structured loops and uses static stream operands plus loop epochs; it does not
+generate `tt_compact_iteration` or iteration-specific resources. Non-pipeline
 generations share a logical group only when the formation transaction DAG proves
 reserve/publication/wait/release FIFO order and remains acyclic after adding each
-release-before-reserve reuse edge. Loop-carried transactions that are not
-expanded for proof remain independent; pipelined families retain the planner's
-explicit pool relation. The pure resolver binds the finite groups required by
+release-before-reserve reuse edge. Loop-carried transactions use typed
+recurrence/state relations, and pipelined lexical sites retain the planner's
+capacity relation. The pure resolver binds the finite groups required by
 each kernel slot from typed producer/consumer ownership without expanding the
 body or materializing concrete descriptor tables.
 

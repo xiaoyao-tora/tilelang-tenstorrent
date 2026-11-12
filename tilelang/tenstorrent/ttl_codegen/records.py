@@ -81,11 +81,12 @@ def resolve_transport_records(mod: IRModule) -> dict[int, tuple[ResolvedPipeReco
             )
             if record.destination_begin[0] >= record.destination_end[0] or record.destination_begin[1] >= record.destination_end[1]:
                 raise RecordResolutionError("transport record has an empty destination range")
-            if (
+            source_in_destination = (
                 record.destination_begin[0] <= record.source[0] < record.destination_end[0]
                 and record.destination_begin[1] <= record.source[1] < record.destination_end[1]
-            ):
-                raise RecordResolutionError("source-exclusive transport record includes its source")
+            )
+            if source_in_destination and record.contract != "collective":
+                raise RecordResolutionError("point-to-point transport record cannot include its source")
             records.setdefault(pipe_net, []).append(record)
     pipe_net_ids = sorted(records)
     if pipe_net_ids != list(range(len(pipe_net_ids))):

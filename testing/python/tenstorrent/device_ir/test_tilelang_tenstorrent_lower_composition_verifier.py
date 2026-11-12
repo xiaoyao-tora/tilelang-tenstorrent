@@ -213,54 +213,47 @@ def test_value_cannot_borrow_foreign_core_dfb():
     check_rejected(malformed, "borrows a DFB owned by another Core")
 
 
-def test_pipeline_value_cannot_resurrect_released_previous_epoch():
+def test_pipeline_value_cannot_yield_the_stale_entry_epoch():
     @T.prim_func
     def main(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "float32")):
         with T.Kernel(1, 1, threads=1):
             a = T.alloc_shared((32, 32), "float32", annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 2})
             f = T.alloc_fragment((32, 32), "float32")
-            for _k in T.Pipelined(3, num_stages=2):
+            T.clear(f)
+            for _k in T.serial(3):
                 T.copy(A, a)
                 for i, j in T.Tiles(32, 32):
-                    f[i, j] = a[i, j] * 2
-                for i, j in T.Tiles(32, 32):
-                    f[i, j] = f[i, j] + 1
-                T.copy(f, C)
+                    f[i, j] = f[i, j] + a[i, j]
+            T.copy(f, C)
 
     mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET))
-    for global_var, function in list(mod.functions.items()):
-        if str(function.attrs["tt.kernel_slot"]) == "trisc":
-            concrete = [tirx.Evaluate(call) for call in _calls(function.body)]
-            mod.update_func(global_var, _with_core_statements(function, concrete))
-    first = None
+    entry = None
+    for function in mod.functions.values():
+        if str(function.attrs["tt.kernel_slot"]) != "trisc":
+            continue
+        for call in _calls(function.body):
+            if call.op.name == "tl.tt.compute_value_state_init":
+                entry = int(call.args[1])
+                break
+    assert entry is not None
     changed = False
 
     def edit(call):
-        nonlocal first, changed
-        if call.op.name != "tl.tt.compute_value" or not len(call.annotations.get("tt.value_inputs", [])):
-            return None
-        if first is None:
-            first = int(call.args[0])
-            return None
-        if changed:
+        nonlocal changed
+        if changed or call.op.name != "tl.tt.compute_value_state_yield":
             return None
         changed = True
-        attrs = dict(call.annotations)
-        attrs["tt.value_inputs"] = [tirx.IntImm("int64", first)]
-
-        def replace_load(node):
-            if node.op.name == "tl.tt.compute_value_load":
-                return tirx.Call(node.dtype, node.op, [tirx.IntImm("int64", first)], node.annotations, node.span)
-            return None
-
-        attrs["tt.expression"] = tirx.stmt_functor.ir_transform(
-            tirx.Evaluate(attrs["tt.expression"]), None, replace_load, ["tirx.Call"]
-        ).value
-        return tirx.Call(call.dtype, call.op, call.args, attrs, call.span)
+        return tirx.Call(
+            call.dtype,
+            call.op,
+            [call.args[0], tirx.IntImm("int64", entry)],
+            call.annotations,
+            call.span,
+        )
 
     malformed = rewrite_calls(mod, edit)
     assert changed
-    check_rejected(malformed, "after release")
+    check_rejected(malformed, "loop-state value predecessor disagrees")
 
 
 @pytest.mark.parametrize("mutation", ["transaction_count", "duplicate_id"])

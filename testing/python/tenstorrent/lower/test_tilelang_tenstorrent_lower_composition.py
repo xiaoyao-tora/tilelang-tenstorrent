@@ -229,7 +229,9 @@ def test_independent_fragment_pipeline_prefetch_and_semantics(stages, extent):
     transfer = next(func for func in mod.functions.values() if str(func.attrs["tt.kernel_slot"]) == "ncrisc")
     calls = list(_calls(transfer.body))
     first_completion = next(i for i, call in enumerate(calls) if call.op.name == "tl.tt.dfb_copy_wait")
-    assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in calls[:first_completion]) == min(stages, extent)
+    # Lower preserves one lexical copy/completion site. TT-Lang consumes the
+    # pipeline policy and stage count when it forms a physical prefetch window.
+    assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in calls[:first_completion]) == 1
     assert len(mod.attrs["tt.dfb_storage_groups"]) == len(mod.attrs["tt.dfb_table"])
 
 
@@ -266,7 +268,7 @@ def test_full_k_pipeline_preserves_fp32_and_finite_pools(seed):
     assert len(mod.attrs["tt.dfb_storage_groups"]) == len(mod.attrs["tt.dfb_table"])
     transfers = [call for f in mod.functions.values() if str(f.attrs["tt.kernel_slot"]) == "ncrisc" for call in _calls(f.body)]
     first_completion = next(i for i, call in enumerate(transfers) if call.op.name == "tl.tt.dfb_copy_wait")
-    assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in transfers[:first_completion]) == 4
+    assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in transfers[:first_completion]) == 1
 
 
 def pipeline_pipe_values(extent=5, stages=2):
@@ -472,5 +474,5 @@ def pipeline_carried_fragment():
 
 
 def test_loop_carried_ordinary_fragment_requires_explicit_spill_plan():
-    with pytest.raises(NotImplementedError, match="carries a value across iterations"):
+    with pytest.raises(NotImplementedError, match="carries a value across iterations|must be independently initialized"):
         lower_result(pipeline_carried_fragment())

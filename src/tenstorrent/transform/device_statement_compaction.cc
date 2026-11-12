@@ -24,8 +24,7 @@
 namespace tvm {
 namespace tl {
 namespace tenstorrent {
-static tirx::Stmt
-CompactGeneratedDeviceStatementsRecursive(const tirx::Stmt &body);
+static tirx::Stmt ScheduleLocalDFBWaits(const tirx::Stmt &body);
 namespace {
 using namespace tirx;
 
@@ -690,7 +689,10 @@ void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
   }
   if (!parameterized.has_value())
     Invalid("singleton Core body could not be parameterized");
-  Stmt body = CompactGeneratedDeviceStatementsRecursive(parameterized.value());
+  // Current formation preserves source structured loops. Keep only the local
+  // wait scheduling normalization here; statement compaction is a legacy
+  // artifact compatibility operation, not a current Lower reconstruction step.
+  Stmt body = ScheduleLocalDFBWaits(parameterized.value());
   Span span = body->span.defined() ? body->span : fallback_span;
   CoreDomain domain(CoreCoord(rectangle.begin_x, rectangle.begin_y),
                     CoreCoord(rectangle.end_x, rectangle.end_y));
@@ -1330,20 +1332,6 @@ Stmt CompactDeviceStatementsRecursive(const Stmt &body) {
   return nested(compact);
 }
 
-static Stmt CompactGeneratedDeviceStatementsRecursive(const Stmt &body) {
-  Stmt scheduled = ScheduleLocalDFBWaits(body);
-  Stmt compact =
-      CompactDeviceStatementsImpl(scheduled, /*semantic_core_locals=*/true,
-                                  /*allow_dfb_variants=*/false);
-  compact = ExtendGeneratedCompactLoops(compact);
-  NestedDeviceStatementCompactor nested(/*semantic_core_locals=*/true);
-  return nested(compact);
-}
-
-static Stmt CompactDeviceRoleStatements(const Stmt &body) {
-  return CompactGeneratedDeviceStatementsRecursive(body);
-}
-
 namespace {
 
 Stmt ParameterizeDeviceCoreStatementsImpl(
@@ -1454,9 +1442,47 @@ ffi::Optional<Stmt>
 TryParameterizeDFBComponents(const std::vector<DeviceCoreBody> &bodies,
                              int64_t grid_x, int64_t grid_y,
                              const ffi::String &owner_slot, const Span &span) {
-  if (owner_slot == "trisc" ||
-      bodies.size() != static_cast<size_t>(grid_x * grid_y))
+  if (owner_slot == "trisc" || bodies.empty())
     return std::nullopt;
+
+  std::vector<For> common_loops;
+  Stmt prototype = bodies.front().body;
+  while (auto loop = prototype.as<For>()) {
+    if (loop.value()->kind != ForKind::kSerial)
+      return std::nullopt;
+    common_loops.push_back(loop.value());
+    prototype = loop.value()->body;
+  }
+
+  std::vector<DeviceCoreBody> leaves;
+  leaves.reserve(bodies.size());
+  for (const DeviceCoreBody &core : bodies) {
+    Stmt current = core.body;
+    for (const For &expected : common_loops) {
+      auto loop = current.as<For>();
+      if (!loop.has_value() || loop.value()->kind != expected->kind ||
+          !ffi::StructuralEqual()(loop.value()->min, expected->min) ||
+          !ffi::StructuralEqual()(loop.value()->extent, expected->extent) ||
+          !ffi::StructuralEqual()(loop.value()->annotations,
+                                  expected->annotations) ||
+          loop.value()->thread_binding.defined() !=
+              expected->thread_binding.defined() ||
+          (loop.value()->thread_binding.defined() &&
+           !ffi::StructuralEqual()(loop.value()->thread_binding.value(),
+                                   expected->thread_binding.value())) ||
+          loop.value()->step.defined() != expected->step.defined() ||
+          (loop.value()->step.defined() &&
+           !ffi::StructuralEqual()(loop.value()->step.value(),
+                                   expected->step.value())))
+        return std::nullopt;
+      current = Substitute(
+          loop.value()->body,
+          {{loop.value()->loop_var, PrimExpr(expected->loop_var)}});
+    }
+    if (current.as<For>())
+      return std::nullopt;
+    leaves.push_back({core.x, core.y, current});
+  }
 
   std::map<int64_t, int64_t> parent;
   std::vector<std::vector<Stmt>> statements;
@@ -1478,7 +1504,7 @@ TryParameterizeDFBComponents(const std::vector<DeviceCoreBody> &bodies,
     parent[right] = left;
   };
 
-  for (const DeviceCoreBody &core : bodies) {
+  for (const DeviceCoreBody &core : leaves) {
     ffi::Array<Stmt> flat;
     if (auto sequence = core.body.as<SeqStmt>())
       flat = sequence.value()->seq;
@@ -1502,11 +1528,12 @@ TryParameterizeDFBComponents(const std::vector<DeviceCoreBody> &bodies,
   std::set<int64_t> components;
   for (const auto &[id, _] : parent)
     components.insert(find(find, id));
-  if (components.size() < 2)
-    return std::nullopt;
-
-  std::vector<std::vector<StatementSegment>> segmented;
-  for (const auto &local : statements) {
+  std::map<int64_t, std::vector<DeviceCoreBody>> component_points;
+  std::map<int64_t, std::set<int64_t>> successors;
+  std::map<int64_t, int64_t> indegree;
+  bool sparse = bodies.size() != static_cast<size_t>(grid_x * grid_y);
+  for (size_t core = 0; core < statements.size(); ++core) {
+    const auto &local = statements[core];
     std::vector<StatementSegment> segments;
     for (const Stmt &statement : local) {
       std::vector<int64_t> ids;
@@ -1523,30 +1550,63 @@ TryParameterizeDFBComponents(const std::vector<DeviceCoreBody> &bodies,
         segments.push_back({component, statement});
       }
     }
-    if (segments.empty())
-      return std::nullopt;
-    if (!segmented.empty()) {
-      if (segments.size() != segmented.front().size())
+    std::set<int64_t> seen;
+    for (const StatementSegment &segment : segments) {
+      if (!seen.insert(segment.component).second)
         return std::nullopt;
-      for (size_t index = 0; index < segments.size(); ++index)
-        if (segments[index].component != segmented.front()[index].component)
-          return std::nullopt;
+      component_points[segment.component].push_back(
+          {leaves[core].x, leaves[core].y, segment.body});
+      indegree.try_emplace(segment.component, 0);
     }
-    segmented.push_back(std::move(segments));
+    for (size_t index = 1; index < segments.size(); ++index) {
+      int64_t before = segments[index - 1].component;
+      int64_t after = segments[index].component;
+      if (successors[before].insert(after).second)
+        ++indegree[after];
+    }
+    sparse |= segments.size() != components.size();
   }
-  if (segmented.front().size() < 2)
+  if (component_points.empty() || (!sparse && component_points.size() < 2))
+    return std::nullopt;
+
+  if (sparse) {
+    for (const auto &[component, points] : component_points) {
+      bool has_pipe = false;
+      for (const DeviceCoreBody &point : points)
+        PostOrderVisit(point.body, [&](const ffi::ObjectRef &object) {
+          const auto *call = object.as<CallNode>();
+          has_pipe |= call &&
+                      (call->op.same_as(tenstorrent::dfb_pipe_send()) ||
+                       call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+                       call->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
+                       call->op.same_as(tenstorrent::dfb_pipe_recv_record()));
+        });
+      if (!has_pipe)
+        return std::nullopt;
+    }
+  }
+
+  std::set<int64_t> ready;
+  for (const auto &[component, degree] : indegree)
+    if (degree == 0)
+      ready.insert(component);
+  std::vector<int64_t> component_order;
+  while (!ready.empty()) {
+    int64_t component = *ready.begin();
+    ready.erase(ready.begin());
+    component_order.push_back(component);
+    for (int64_t successor : successors[component])
+      if (--indegree[successor] == 0)
+        ready.insert(successor);
+  }
+  if (component_order.size() != component_points.size())
     return std::nullopt;
 
   ffi::Array<Stmt> ordered;
-  for (size_t segment = 0; segment < segmented.front().size(); ++segment) {
-    std::vector<DeviceCoreBody> points;
-    points.reserve(bodies.size());
-    for (size_t core = 0; core < bodies.size(); ++core)
-      points.push_back(
-          {bodies[core].x, bodies[core].y, segmented[core][segment].body});
+  for (int64_t component : component_order) {
     Stmt role = ParameterizeDeviceCoreStatementsImpl(
-        points, grid_x, grid_y, owner_slot, span, "tt_device_stream_work",
-        Integer(segmented.front()[segment].component));
+        component_points.at(component), grid_x, grid_y, owner_slot, span,
+        "tt_device_stream_work", Integer(component));
     if (auto sequence = role.as<SeqStmt>()) {
       for (const Stmt &statement : sequence.value()->seq)
         ordered.push_back(statement);
@@ -1555,7 +1615,11 @@ TryParameterizeDFBComponents(const std::vector<DeviceCoreBody> &bodies,
     }
   }
   Stmt scheduled = ordered.size() == 1 ? ordered[0] : SeqStmt(ordered, span);
-  scheduled = CompactDeviceRoleStatements(scheduled);
+  for (auto loop = common_loops.rbegin(); loop != common_loops.rend(); ++loop)
+    scheduled = For((*loop)->loop_var, (*loop)->min, (*loop)->extent,
+                    (*loop)->kind, scheduled, (*loop)->thread_binding,
+                    (*loop)->annotations, (*loop)->step, (*loop)->span);
+  scheduled = ScheduleLocalDFBWaits(scheduled);
   CoreDomain domain(CoreCoord(0, 0), CoreCoord(grid_x, grid_y));
   SBlock work({}, {}, {}, "tt_device_core_work", scheduled, std::nullopt, {},
               {}, {{"tt.core_domain", domain}, {"tt.owner_slot", owner_slot}},

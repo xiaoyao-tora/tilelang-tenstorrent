@@ -91,7 +91,7 @@ def test_stream_capacity_and_closed_lifetimes(stages, extent):
     depth = min(stages, extent)
     groups = list(mod.attrs["tt.dfb_storage_groups"])
     dfbs = list(mod.attrs["tt.dfb_table"])
-    assert len(groups) == len(dfbs) == 4 * extent
+    assert len(groups) == len(dfbs) == 4
     assert [int(group.storage_group_id) for group in groups] == list(range(len(groups)))
     assert all(int(group.block_count) == depth for group in groups)
     releases = [
@@ -100,17 +100,17 @@ def test_stream_capacity_and_closed_lifetimes(stages, extent):
         for stmt in statements(mod, slot)
         if operation(stmt) == "tl.tt.dfb_release"
     ]
-    assert sorted(releases) == list(range(len(groups)))
+    assert sorted(releases) == sorted(list(range(len(groups))) * extent)
     transform.VerifyTenstorrentDeviceIR()(ir.load_json(ir.save_json(mod)))
 
 
-def test_nested_reservations_and_multiple_inflight_copies():
+def test_pipeline_keeps_one_lexical_copy_completion_per_site():
     mod = pipeline(3, 4)
     body = statements(mod, "ncrisc")
     first_completion = next(i for i, stmt in enumerate(body) if operation(stmt) == "tl.tt.dfb_copy_wait")
     prefix = body[:first_completion]
-    assert sum(operation(stmt) == "tl.tt.tensor_to_dfb_nd" for stmt in prefix) == 6
-    assert sum(operation(stmt) == "tl.tt.dfb_reserve" for stmt in prefix) == 6
+    assert sum(operation(stmt) == "tl.tt.tensor_to_dfb_nd" for stmt in prefix) == 1
+    assert sum(operation(stmt) == "tl.tt.dfb_reserve" for stmt in prefix) == 1
     assert all(operation(stmt) != "tl.tt.dfb_release" for stmt in prefix)
 
 
@@ -169,7 +169,7 @@ def test_legacy_lifecycle_transaction_count_rejected():
     "name,match",
     [
         ("tl.tt.dfb_wait", "missing consumer wait|no active acquisition"),
-        ("tl.tt.dfb_release", "missing release"),
+        ("tl.tt.dfb_release", "missing release|no matching producer publication"),
     ],
 )
 def test_missing_consumer_synchronization(name, match):
@@ -185,7 +185,7 @@ def test_missing_copy_completion():
     body = statements(mod, "ncrisc")
     body.pop(next(i for i, stmt in enumerate(body) if operation(stmt) == "tl.tt.dfb_copy_wait"))
     replace_statements(mod, "ncrisc", body)
-    rejected(mod, "no matching producer|missing completion")
+    rejected(mod, "no matching producer|missing completion|nested producer reservations")
 
 
 def test_output_release_before_completion():

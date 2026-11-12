@@ -24,10 +24,10 @@ artifacts keep their historical globally unique IDs. Static K-loop expansion
 propagates scalar aliases such as `k_begin = stage * block_k` before validating
 transfer regions.
 
-SUMMA source Cores forward a completed Tensor load from NCRISC using the same
-DFB that local TRISC consumes. The local consumer's `dfb_wait` observes publication
-only after all outgoing sends of that DFB complete. This preserves the order
-reserve → Tensor load → send/completion → local consumption without a TRISC
+For source-inclusive SUMMA multicast, BRISC owns the complete source transaction:
+reserve, Tensor load, copy completion, and send completion. NCRISC publishes a
+separate loopback/remote receive generation, and every TRISC instance consumes
+that uniform generation. This preserves local SPSC ownership without a TRISC
 snapshot copy. Releases follow the final local computation or output write
 completion. These are logical Device IR scheduling contracts; physical circular
 buffer allocation and hardware synchronization remain code-generation work.

@@ -93,20 +93,47 @@ def test_duplicate_value_definition():
 def test_missing_release_and_release_before_read():
     mod = device()
     func = next(f for f in mod.functions.values() if f.attrs["tt.kernel_slot"] == "trisc")
-    statements = _core_statements(func)
-    bindings = [stmt for stmt in statements if isinstance(stmt, tirx.Bind)]
-    actions = [stmt for stmt in statements if not isinstance(stmt, tirx.Bind)]
-    release = next(i for i, stmt in enumerate(actions) if stmt.value.op.name == "tl.tt.dfb_release")
+
+    def mutate_release(body, *, remove):
+        changed = False
+
+        def rewrite(node):
+            nonlocal changed
+            if changed or not isinstance(node, tirx.SeqStmt):
+                return None
+            statements = list(node.seq)
+            release = next(
+                (
+                    index
+                    for index, statement in enumerate(statements)
+                    if isinstance(statement, tirx.Evaluate)
+                    and isinstance(statement.value, tirx.Call)
+                    and statement.value.op.name == "tl.tt.dfb_release"
+                ),
+                None,
+            )
+            if release is None:
+                return None
+            changed = True
+            statement = statements.pop(release)
+            if not remove:
+                statements.insert(0, statement)
+            return tirx.SeqStmt(statements)
+
+        result = tirx.stmt_functor.ir_transform(body, None, rewrite, ["tirx.SeqStmt"])
+        assert changed
+        return result
+
     missing = ir.load_json(ir.save_json(mod))
     missing.update_func(
         missing.get_global_var(str(func.attrs["global_symbol"])),
-        _with_core_statements(func, [*bindings, *actions[:release], *actions[release + 1 :]]),
+        func.with_body(mutate_release(func.body, remove=True)),
     )
     check_rejected(missing, "missing release")
     premature = ir.load_json(ir.save_json(mod))
     premature.update_func(
         premature.get_global_var(str(func.attrs["global_symbol"])),
-        _with_core_statements(func, [*bindings, actions[release], *actions[:release], *actions[release + 1 :]]),
+        func.with_body(mutate_release(func.body, remove=False)),
     )
     check_rejected(premature, "must follow wait|release precedes|no active acquisition")
 

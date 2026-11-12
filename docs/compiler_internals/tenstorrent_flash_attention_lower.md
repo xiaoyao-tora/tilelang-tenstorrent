@@ -63,12 +63,16 @@ accumulator，并执行 JSON round-trip 和独立 verifier。
 不完整 K、伪造 DFB/value provenance、精度区域和 Pipe transfer 编号。
 完整回归运行方式见 [Lower 组合能力](tenstorrent_lower_composition.md)。
 
-2026-09-17：原生重建和 pre-commit 通过。常规 Lower 回归为 **1082 passed**
+历史记录（2026-09-17）：原生重建和 pre-commit 通过。常规 Lower 回归为 **1082 passed**
 （33 条既有 Python typing 弃用警告）；将默认大尺寸用例从该次 pytest 中单独
 选出，直接导入原始 kernel 做完整导出。默认 BF16 的公开 Lower 和独立 Device
 verifier 通过，Lower 耗时约 **129 秒**；完整 JSON 往返后的结构比较及 verifier
-也通过。静态展开后的默认 JSON 约 2.7 GiB，检查文本时可先使用相同 kernel 的
-较小配置。
+也通过。当时静态展开后的默认 JSON 约 2.7 GiB。
+
+当前 Lower 已改为保留 batch/head、query 和 KV 结构化循环：每个 lexical transaction
+site 只形成一个 logical stream，循环 extent 进入 transaction/occurrence relation，不再
+生成逐 KV iteration descriptor 或 `tt_compact_iteration`。新的 artifact 大小与验证结果
+应以当前分支重新生成的数据为准，不能继续引用上述历史 2.7 GiB 数字。
 
 `device_ir.tir` 是带完整 metadata 的诊断文本；无损重载使用已验证的
 `device_ir.json`。当前通用 TVM TIRX printer 会将 `tt.compute_kind` 等带点的

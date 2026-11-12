@@ -55,9 +55,7 @@ def value_chain():
 
 
 def test_old_values_survive_updates_broadcast_loop_and_input_release():
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": value_chain()}), TARGET)
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": value_chain()}), TARGET))
     assert str(mod.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in mod.attrs
     rng = np.random.default_rng(12)
@@ -115,9 +113,7 @@ def gemm_snapshots():
 
 
 def test_full_k_accumulator_fresh_epilogue_and_multiple_consumers():
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": gemm_snapshots()}), TARGET)
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": gemm_snapshots()}), TARGET))
     rng = np.random.default_rng(31)
     a = _round(rng.normal(size=(32, 64)), "bfloat16")
     b = _round(rng.normal(size=(64, 32)), "bfloat16")
@@ -151,9 +147,7 @@ def gemm_fragment_operand():
 
 
 def test_fragment_dfb_only_consumer_materializes_exactly_when_needed():
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": gemm_fragment_operand()}), TARGET)
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": gemm_fragment_operand()}), TARGET))
     stores = [call for func in mod.functions.values() for call in _calls(func.body) if call.op.name == "tl.tt.compute_value_store"]
     assert len(stores) == 1
     descriptors = {int(value.value_id): value for value in mod.attrs["tt.compute_value_table"]}
@@ -185,12 +179,10 @@ def independent_gemm_lifetimes():
     return main
 
 
-def test_outer_serial_iterations_have_distinct_accumulator_lifetimes():
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": independent_gemm_lifetimes()}), TARGET)
-    )
-    assert len(mod.attrs["tt.accumulator_table"]) == 2
-    assert {int(value.accumulator_id) for value in mod.attrs["tt.compute_value_table"]} == {0, 1}
+def test_outer_serial_iterations_share_one_lexical_accumulator_descriptor():
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": independent_gemm_lifetimes()}), TARGET))
+    assert len(mod.attrs["tt.accumulator_table"]) == 1
+    assert {int(value.accumulator_id) for value in mod.attrs["tt.compute_value_table"]} == {0}
     rng = np.random.default_rng(71)
     a = _round(rng.normal(size=(64, 32)), "bfloat16")
     b = _round(rng.normal(size=(32, 32)), "bfloat16")
@@ -222,9 +214,7 @@ def combined_gemm_roots():
 
 
 def test_two_accumulator_roots_combine_and_preserve_transitive_provenance():
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": combined_gemm_roots()}), TARGET)
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": combined_gemm_roots()}), TARGET))
     assert len(mod.attrs["tt.accumulator_table"]) == 2
     derived = [value for value in mod.attrs["tt.compute_value_table"] if value.buffer.name in ("combined", "epilogue")]
     assert len(derived) == 2
@@ -240,47 +230,52 @@ def test_two_accumulator_roots_combine_and_preserve_transitive_provenance():
 def _interpreter_expression_module(expr, output_dtype):
     calls = [
         tirx.Call(
-            "handle", tvm.ir.Op.get("tl.tt.compute_value"), [0],
-            {"tt.compute_kind": tirx.StringImm("elementwise"), "tt.expression": expr,
-             "tt.logical_domain": [1, 1]},
+            "handle",
+            tvm.ir.Op.get("tl.tt.compute_value"),
+            [0],
+            {"tt.compute_kind": tirx.StringImm("elementwise"), "tt.expression": expr, "tt.logical_domain": [1, 1]},
         ),
         tirx.Call("handle", tvm.ir.Op.get("tl.tt.compute_value_store"), [0, 0]),
         tirx.Call("handle", tvm.ir.Op.get("tl.tt.dfb_to_tensor_nd"), [0, 0, 0, 1, 0, 1]),
     ]
     return SimpleNamespace(
         attrs={
-            "tt.compute_value_table": [SimpleNamespace(
-                value_id=0, buffer=SimpleNamespace(dtype=expr.dtype))],
+            "tt.compute_value_table": [SimpleNamespace(value_id=0, buffer=SimpleNamespace(dtype=expr.dtype))],
             "tt.dfb_table": [SimpleNamespace(dfb_id=0, element_dtype=output_dtype)],
         },
-        functions={"compute": SimpleNamespace(
-            body=tirx.SeqStmt([tirx.Evaluate(call) for call in calls]))},
+        functions={"compute": SimpleNamespace(body=tirx.SeqStmt([tirx.Evaluate(call) for call in calls]))},
     )
 
 
-@pytest.mark.parametrize("dtype, inputs, expected", [
-    ("int32", [1.75, -1.75, 0.25, -0.25], [1, -1, 0, 0]),
-    ("int64", [2**40 + 1, -(2**40 + 1)], [2**40 + 1, -(2**40 + 1)]),
-    ("uint32", [0, 2**24 + 1], [0, 2**24 + 1]),
-    ("bool", [0, 1, -1], [False, True, True]),
-    ("float16", [1.0001], [1.0]),
-    ("float32", [1.0 + 2**-30], [1.0]),
-    ("float64", [1.0 + 2**-30], [1.0 + 2**-30]),
-])
+@pytest.mark.parametrize(
+    "dtype, inputs, expected",
+    [
+        ("int32", [1.75, -1.75, 0.25, -0.25], [1, -1, 0, 0]),
+        ("int64", [2**40 + 1, -(2**40 + 1)], [2**40 + 1, -(2**40 + 1)]),
+        ("uint32", [0, 2**24 + 1], [0, 2**24 + 1]),
+        ("bool", [0, 1, -1], [False, True, True]),
+        ("float16", [1.0001], [1.0]),
+        ("float32", [1.0 + 2**-30], [1.0]),
+        ("float64", [1.0 + 2**-30], [1.0 + 2**-30]),
+    ],
+)
 def test_interpreter_dtype_casts(dtype, inputs, expected):
     actual = _round(inputs, dtype)
     assert actual.dtype == np.dtype(dtype)
     np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.parametrize("expr, expected", [
-    (tirx.Cast("int32", tirx.FloatImm("float32", 1.75)), 1),
-    (tirx.Cast("int32", tirx.FloatImm("float32", -1.75)), -1),
-    (tirx.Cast("bool", tirx.IntImm("int32", -1)), True),
-    (tirx.Cast("bool", tirx.IntImm("int32", 0)), False),
-    (tirx.IntImm("int64", 2**40 + 1), 2**40 + 1),
-    (tirx.FloatImm("float64", 1.0 + 2**-30), 1.0 + 2**-30),
-])
+@pytest.mark.parametrize(
+    "expr, expected",
+    [
+        (tirx.Cast("int32", tirx.FloatImm("float32", 1.75)), 1),
+        (tirx.Cast("int32", tirx.FloatImm("float32", -1.75)), -1),
+        (tirx.Cast("bool", tirx.IntImm("int32", -1)), True),
+        (tirx.Cast("bool", tirx.IntImm("int32", 0)), False),
+        (tirx.IntImm("int64", 2**40 + 1), 2**40 + 1),
+        (tirx.FloatImm("float64", 1.0 + 2**-30), 1.0 + 2**-30),
+    ],
+)
 @pytest.mark.parametrize("interpreter", [interpret_values, interpret])
 def test_interpreter_typed_expressions(monkeypatch, expr, expected, interpreter):
     monkeypatch.setattr(D, "expand_current_device_tables", lambda mod: mod)
@@ -293,18 +288,26 @@ def test_interpreter_typed_expressions(monkeypatch, expr, expected, interpreter)
     assert arrays[0][0, 0] == expected
 
 
-@pytest.mark.parametrize("value, expression_dtype, output_dtype, expected", [
-    (1.00390625, "float32", "bfloat16", 1.0),
-    (1.01171875, "float32", "bfloat16", 1.015625),
-    (-1.00390625, "float32", "bfloat16", -1.0),
-    (1.75, "float32", "int32", 1),
-    (-1.75, "float32", "int32", -1),
-    (1.0001, "float64", "float16", 1.0),
-    (1.0 + 2**-30, "float64", "float64", 1.0 + 2**-30),
-])
+@pytest.mark.parametrize(
+    "value, expression_dtype, output_dtype, expected",
+    [
+        (1.00390625, "float32", "bfloat16", 1.0),
+        (1.01171875, "float32", "bfloat16", 1.015625),
+        (-1.00390625, "float32", "bfloat16", -1.0),
+        (1.75, "float32", "int32", 1),
+        (-1.75, "float32", "int32", -1),
+        (1.0001, "float64", "float16", 1.0),
+        (1.0 + 2**-30, "float64", "float64", 1.0 + 2**-30),
+    ],
+)
 @pytest.mark.parametrize("interpreter", [interpret_values, interpret])
 def test_interpreter_explicit_cast_materializes_exact_dtype(
-    monkeypatch, value, expression_dtype, output_dtype, expected, interpreter,
+    monkeypatch,
+    value,
+    expression_dtype,
+    output_dtype,
+    expected,
+    interpreter,
 ):
     monkeypatch.setattr(D, "expand_current_device_tables", lambda mod: mod)
     expression = tirx.Cast(output_dtype, tirx.FloatImm(expression_dtype, value))

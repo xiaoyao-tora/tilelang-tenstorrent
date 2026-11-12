@@ -2143,7 +2143,8 @@ public:
         active->second == transaction)
       active_dfb_transactions_.erase(active);
   }
-  std::set<int64_t> Expression(const Call &call, const DFBTable &dfbs) {
+  std::set<int64_t> Expression(const Call &call, const DFBTable &dfbs,
+                               int64_t loop_multiplicity = 1) {
     arith::Analyzer analyzer;
     auto static_integer = [&](const PrimExpr &value, const char *label) {
       CoreCoordinateSubstituter bind_core(current_core_x_, current_core_y_);
@@ -2218,6 +2219,8 @@ public:
               "accumulator initial value must be a unique zero definition");
         Check(initialized_.insert(entry->accumulator_id).second,
               "accumulator has multiple initial definitions");
+        accumulator_epoch_multiplicity_[entry->accumulator_id] =
+            loop_multiplicity;
         completed_k[entry->accumulator_id] = 0;
       } else {
         bool owns_accumulator =
@@ -2306,7 +2309,8 @@ public:
               defined_.count(entry->previous_value_id),
           "compute value predecessor is not defined");
   }
-  std::set<int64_t> Gemm(const Call &call, const DFBTable &dfbs) {
+  std::set<int64_t> Gemm(const Call &call, const DFBTable &dfbs,
+                         int64_t loop_multiplicity = 1) {
     Check(call->args.size() == 6 && call->annotations.empty(),
           "compute_value_gemm requires six IDs/flags without annotations");
     arith::Analyzer analyzer;
@@ -2348,13 +2352,23 @@ public:
               size(b->block_shape_in_tiles[tb ? 0 : 1]) * 32 ==
                   size(value->buffer->shape[1]),
           "value GEMM M/N/K mismatch");
-    Check(k > 0 && k_tiles_[value->accumulator_id] <= acc->full_k_tiles - k,
+    Check(loop_multiplicity > 0 &&
+              k <= std::numeric_limits<int64_t>::max() / loop_multiplicity,
+          "value GEMM loop K contribution overflows");
+    int64_t effective_multiplicity =
+        accumulator_epoch_multiplicity_[value->accumulator_id] ==
+                loop_multiplicity
+            ? 1
+            : loop_multiplicity;
+    int64_t contribution = k * effective_multiplicity;
+    Check(k > 0 && k_tiles_[value->accumulator_id] <=
+                       acc->full_k_tiles - contribution,
           "value GEMM updates exceed full K");
     Check(value_k_.at(old).count(value->accumulator_id) &&
               value_k_.at(old).at(value->accumulator_id) ==
                   k_tiles_[value->accumulator_id],
           "value GEMM uses a stale K accumulator version");
-    k_tiles_[value->accumulator_id] += k;
+    k_tiles_[value->accumulator_id] += contribution;
     value_k_[out] = value_k_.at(old);
     value_k_[out][value->accumulator_id] = k_tiles_[value->accumulator_id];
     sources_[out] = sources_.at(old);
@@ -2431,6 +2445,7 @@ private:
   std::map<int64_t, PrimFunc> accumulator_owners_;
   ComputeValueTable values_;
   std::map<int64_t, AccumulatorDescriptor> accumulators_;
+  std::map<int64_t, int64_t> accumulator_epoch_multiplicity_;
   std::map<int64_t, int64_t> k_tiles_;
   std::set<int64_t> defined_;
   std::set<int64_t> initialized_;
@@ -4363,6 +4378,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   std::map<SlotKey, int64_t> last_slot_event;
   std::map<int64_t, int> accumulator_state;
   std::map<int64_t, int64_t> accumulator_k_tiles;
+  std::map<int64_t, int64_t> accumulator_init_multiplicity;
   std::vector<std::vector<int64_t>> event_successors;
   ComputeValueVerifier compute_values(mod);
   std::vector<std::pair<int64_t, DataType>> value_exports;
@@ -4489,6 +4505,10 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               domain->end->x == launch_grid->x &&
               domain->end->y == launch_grid->y,
           "shared slot tt.core_domain must equal the complete launch grid");
+    std::set<int64_t> declared_tensors, used_tensors;
+    for (const Integer &tensor :
+         func->GetAttr<ffi::Array<Integer>>(kTensorArgIndicesAttr).value())
+      declared_tensors.insert(tensor->value);
     PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
       const auto *node = object.as<CallNode>();
       if (!node)
@@ -4582,6 +4602,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
         size_t dfb_operand = load ? 1 : 0;
         int64_t tensor_id = check_resource(
             tensor_operand, DeviceResourceKind::kTensor, "Device Tensor");
+        used_tensors.insert(tensor_id);
         PrimExpr dfb_expr = arith::Analyzer().Simplify(ResolveResourceRefExpr(
             call->args[dfb_operand], DeviceResourceKind::kDFBStream,
             resource_aliases, "Device DFB stream"));
@@ -4620,6 +4641,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
         }
       }
     });
+    Check(used_tensors == declared_tensors,
+          "shared slot Tensor ABI must contain exactly its used Tensor "
+          "arguments");
     bool compute =
         func->GetAttr<ffi::String>(kKernelSlotAttr).value() == "trisc";
     auto requirements =
@@ -5203,6 +5227,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 Check(accumulator_state[accumulator] == 0,
                       "accumulator initialized more than once");
                 accumulator_state[accumulator] = 1;
+                accumulator_init_multiplicity[accumulator] =
+                    call_multipliers[call_index];
               } else if (call->op.same_as(dfb_reserve())) {
                 int64_t resource = id(call, 0);
                 LocalKey key = begin_producer(resource);
@@ -5333,10 +5359,17 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                       "GEMM update K shapes disagree");
                 const AccumulatorDescriptor &descriptor =
                     current_accumulators.at(accumulator);
+                int64_t updates = call_multipliers[call_index];
+                if (accumulator_init_multiplicity[accumulator] == updates)
+                  updates = 1;
+                Check(updates > 0 &&
+                          k <= std::numeric_limits<int64_t>::max() / updates,
+                      "GEMM loop K contribution overflows");
+                int64_t contribution = k * updates;
                 Check(accumulator_k_tiles[accumulator] <=
-                          descriptor->full_k_tiles - k,
+                          descriptor->full_k_tiles - contribution,
                       "GEMM updates exceed accumulator full-K updates");
-                accumulator_k_tiles[accumulator] += k;
+                accumulator_k_tiles[accumulator] += contribution;
               } else if (call->op.same_as(accumulator_materialize())) {
                 int64_t accumulator = accumulator_id(call, 0);
                 Check(current_accumulators.count(accumulator),
@@ -5453,9 +5486,11 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               if (compute_values.Enabled()) {
                 if (call->op.same_as(compute_value()) ||
                     call->op.same_as(dfb_compute()))
-                  compute_values.Expression(call, dfb_table);
+                  compute_values.Expression(call, dfb_table,
+                                            call_multipliers[call_index]);
                 else if (call->op.same_as(compute_value_gemm()))
-                  compute_values.Gemm(call, dfb_table);
+                  compute_values.Gemm(call, dfb_table,
+                                      call_multipliers[call_index]);
                 else if (call->op.same_as(compute_value_store()))
                   compute_values.Store(call, dfb_table);
                 else if (call->op.same_as(compute_value_state_init()) ||
@@ -5702,8 +5737,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
         for (int64_t dx = record->dst_begin->x; dx < record->dst_end->x; ++dx)
           for (int64_t dy = record->dst_begin->y; dy < record->dst_end->y;
                ++dy) {
-            Check(dx != source->x || dy != source->y,
-                  "Pipe record has a loopback destination");
+            bool loopback = dx == source->x && dy == source->y;
+            Check(!loopback || record->contract == "collective",
+                  "point-to-point Pipe record cannot loop back to its source");
             Check(actual.insert({source->x, source->y, dx, dy}).second,
                   "communication has a duplicate transport endpoint");
             Check(record_receive_counts[{key.first, key.second, dx, dy}] ==

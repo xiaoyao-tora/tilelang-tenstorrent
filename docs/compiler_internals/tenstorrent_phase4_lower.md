@@ -72,7 +72,7 @@ schema version，再按对应契约消费 operation。
 | `tl.tt.dfb_compute` | 参数为 `[output dfb_id, input dfb_ids...]`；output 必须是新的 generation，只有 TRISC 可执行 |
 | `tl.tt.dfb_operand` | 单一零基 operand index；result dtype 等于 `dfb_compute/compute_value` 对应 DFB operand dtype |
 | `tl.tt.compute_value_operand` | 单一零基 operand index；通过 `tt.value_inputs[index]` 解析 dominating compute value |
-| `tl.tt.tensor_to_dfb_nd` | `[tensor_id, dfb_id, min0, extent0, ...]`；NCRISC 发布已 reserve 的 DFB |
+| `tl.tt.tensor_to_dfb_nd` | `[tensor_id, dfb_id, min0, extent0, ...]`；普通 load 由 NCRISC 发布，source-inclusive collective 的私有 send staging load 由 BRISC 发布 |
 | `tl.tt.dfb_to_tensor_nd` | `[dfb_id, tensor_id, min0, extent0, ...]`；NCRISC 消费已 wait 的 DFB |
 | `tl.tt.dfb_reserve` / `tl.tt.dfb_wait` | 单一 logical stream operand；结构化循环和 stream descriptor 保存总 transaction cardinality |
 
@@ -136,16 +136,17 @@ generation 同时拥有 TRISC 和 NCRISC 两种 consumer。对 immutable generat
 多次 wait/read 不等于多次生产；直线程序 descriptor 的 transaction relation 为单次发布。
 后续 TTL 消费者必须保证值活到最后一次使用，不能把每次 wait 都解释为释放资源。
 
-本轮静态 serial/unrolled loop 通过代入常量展开，extent 上限为 1024，整个规划
-过程上限为 65536 个 statement；常量条件在展开后选择分支。动态 loop/条件及需要
-跨 slot phi/guard 平衡的动态控制流明确拒绝；下一节限定独立迭代 For 的保留范围。
+正静态 unit-step serial/unrolled loop 只规划一次 lexical body，并在 active slot 中保留
+Device `For`。extent 上限为 1024，规划过程上限为 65536 个 lexical statement；循环变量
+可用于 Tensor offset 和纯 scalar expression。动态 loop/条件及需要未建模跨 slot
+phi/guard 平衡的动态控制流明确拒绝。
 
-### 2.4 独立迭代的结构化 For（Device Lower 已验证）
+### 2.4 结构化 For 与 Transaction Epoch（Device Lower 已验证）
 
-允许保留的窄范围是：整个 kernel body 由单个正静态 serial loop 包围，loop variable
-不被 body 引用，body 本身包含完整的 Tensor→DFB→compute→Tensor 数据流，每次迭代
-均可独立规划，不读取任何前一迭代的 DFB generation。所有 active slot 使用相同
-loop 边界；idle BRISC 保持 idle。其他静态循环使用有界展开，不据此扩展动态控制流。
+所有受支持的正静态 serial/unrolled loop 都保留，不要求 loop 包围整个 kernel，也不要求
+loop variable 未使用。每个 lexical write site 形成一个 logical stream，实际 transaction
+identity 为 `(stream_id, Core, loop epoch)`；所有 active slot 保留对应 loop 边界，idle
+slot 保持 idle。Lower 不调用 `UnrollLoop`，也不生成 `tt_compact_iteration` 恢复循环。
 
 此时 `dfb_id` 是 lexical resource ID；实际值身份为 `(dfb_id, iteration epoch)`。
 descriptor 的 `transaction_count_or_loop_relation` 等于 loop extent，而每次
@@ -154,7 +155,7 @@ reserve/wait 仍请求一个 transaction。单迭代中的 immutable publication
 
 Device verifier 必须检查 active slot loop 边界一致、所有资源 transaction relation
 一致，并对 loop body 的完整 def-use 和跨 slot wait-for DAG 执行同样验证。
-在这些前提下，每轮从 Tensor 重新构造全部 DFB 值，以迭代归纳证明资源依赖闭合。
+在这些前提下，以一次 body summary 和循环归纳证明资源依赖闭合。
 即使 Tensor 参数是 读写，NCRISC 的前一轮输出 transfer 也必须排在下一轮输入
 transfer 前面。
 
@@ -251,6 +252,6 @@ PY
 | Reduction | sum/max/min，单 axis、移除该 axis，clear/accumulate；sum 用 FP32 accumulator | 输出 dtype 与输入相同或 FP32；无 keepdims、source/output alias 或任意 reducer；结果仍须满足 layout 条件 |
 | batch dimension | elementwise、Fill/Typecast、末两轴 Transpose 及满足结果布局的 Reduction | 不等于已支持 batched GEMM；batch 轴在成为最后两轴时也须满足 32 整除约束 |
 | dtype/accumulation | BF16/FP32 storage，DAG 保留显式 cast 和舍入点，GEMM FP32 accumulator | integer/FP16/vector storage、任意混合精度策略不支持 |
-| 结构化控制流 | 正静态 serial/unrolled loop 展开，常量条件及展开后可化简条件选择；完整独立 whole-body serial loop 保留为 Device For，已验证 epoch 和 Tensor 读写 | 展开单 loop extent ≤ 1024、累计 ≤ 65536 个 statement；保留 loop 须同 slot 边界且无跨迭代 DFB；动态 loop/条件、`T.Pipelined` 不支持 |
+| 结构化控制流 | 正静态 serial/unrolled/Pipelined loop 只规划一次并保留为 Device For；loop epoch、compute-value state、shared DFB recurrence seed 和 Tensor offset 已验证 | 单 loop extent ≤ 1024、累计 ≤ 65536 个 lexical statement；动态 loop/条件和未建模跨 slot recurrence 不支持 |
 | alias/in-place | 同 Buffer 的逐元素更新读取旧 generation，写入新 generation；完整同 shape/dtype 值依赖 | 部分 region、不同 Buffer 的 view/alias、strided storage、transpose/GEMM/reduce 输入输出重叠拒绝 |
 | 通用数据流 | 任意 Tensor 参数顺序、多个 operation、中间 TRISC→TRISC DFB、明确输出 snapshot | 单 Core 1×1；每个 generation 固定 producer/consumer slot；从 Tensor 输出逆追消除 dead 纯计算，read-before-write 明确诊断 |

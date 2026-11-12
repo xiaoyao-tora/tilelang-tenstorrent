@@ -222,11 +222,13 @@ def _validate_payload(value: object, operation: str) -> tirx.Buffer:
 
 
 def transfer(*, src: tirx.Buffer, dst: tirx.Buffer, src_core: CoreEndpoint, dst_cores: CoreEndpoint | CoreRange) -> tirx.PrimExpr:
-    """Describe a logically synchronous, source-exclusive inter-Core transfer.
+    """Describe a logically synchronous inter-Core transfer.
 
     Payloads are complete rank-2 shared buffers with equal shape and dtype.
     A coordinate tuple selects point-to-point communication; a CoreRange selects
-    collective communication even when it contains only one destination.
+    collective communication even when it contains only one destination. A
+    collective range may include the source, in which case the source is also a
+    destination and ``dst`` is defined on that Core by loopback delivery.
     Coordinates may contain integer expressions such as the current Kernel's
     Core coordinates. Lowering must validate symbolic endpoints, participant
     correspondence, and buffer lifetimes before generating the two endpoints.
@@ -261,8 +263,8 @@ def transfer(*, src: tirx.Buffer, dst: tirx.Buffer, src_core: CoreEndpoint, dst_
         if analyzer.can_prove(begin[axis] >= end[axis]):
             raise ValueError("T.comm.transfer destination range must be non-empty")
     source_in_destination = tirx.all(*(condition for s, lo, hi in zip(source_coord, begin, end) for condition in (s >= lo, s < hi)))
-    if analyzer.can_prove(source_in_destination):
-        raise ValueError("T.comm.transfer is source-exclusive: dst_cores must exclude src_core")
+    if kind == "point_to_point" and analyzer.can_prove(source_in_destination):
+        raise ValueError("T.comm.transfer point destination must differ from src_core")
 
     return tirx.call_intrin(
         "handle",
@@ -280,7 +282,7 @@ def transfer(*, src: tirx.Buffer, dst: tirx.Buffer, src_core: CoreEndpoint, dst_
 def put(*, src: tirx.Buffer, dst: tirx.Buffer, src_core: CoreEndpoint, dst_core: CoreEndpoint) -> tirx.PrimExpr:
     """Describe one point-to-point transfer with explicit source and destination.
 
-    This is declaration syntax for transfer, including its source-exclusive,
+    This is declaration syntax for a point-to-point transfer, including its
     logically synchronous contract and compiler-generated receive. Place it in
     the common participant scope, just like transfer; src_core is explicit and
     does not default to the calling Core. dst_core must be one coordinate tuple.
@@ -290,11 +292,13 @@ def put(*, src: tirx.Buffer, dst: tirx.Buffer, src_core: CoreEndpoint, dst_core:
 
 
 def broadcast(*, src: tirx.Buffer, dst: tirx.Buffer, src_core: CoreEndpoint, dst_cores: CoreRange) -> tirx.PrimExpr:
-    """Describe a collective transfer to a source-exclusive CoreRange.
+    """Describe a collective transfer to a CoreRange.
 
     All destinations receive the same source payload. A singleton range retains
-    the collective contract. Participant scope, logical synchronization, and
-    payload restrictions are inherited from transfer.
+    the collective contract. The range may include the source to request
+    loopback delivery into the source Core's local ``dst`` instance.
+    Participant scope, logical synchronization, and payload restrictions are
+    inherited from transfer.
     """
     if not isinstance(dst_cores, CoreRange):
         raise TypeError("T.comm.broadcast dst_cores must be a T.comm.CoreRange")

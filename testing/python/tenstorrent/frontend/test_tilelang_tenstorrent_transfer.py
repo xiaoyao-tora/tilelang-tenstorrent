@@ -49,6 +49,17 @@ def test_point_and_singleton_collective_keep_distinct_contracts():
     assert not point.args[0].args[0].buffer.same_as(point.args[1].args[0].buffer)
 
 
+def test_collective_destination_range_may_include_source():
+    collective = _transfers(
+        _program(
+            api="broadcast",
+            dst_cores=T.comm.CoreRange((0, 0), (2, 1)),
+        )
+    )[0]
+    assert collective.args[8].value == "collective"
+    assert [int(coord.value) for coord in collective.args[2:8]] == [0, 0, 0, 0, 2, 1]
+
+
 def test_symbolic_row_and_column_endpoints_survive_serialization():
     @T.prim_func
     def main():
@@ -105,8 +116,7 @@ def test_call_sites_and_loop_occurrences_are_preserved():
         ({"src_core": (2, 0)}, ValueError, "outside T.Kernel grid"),
         ({"dst_cores": (2, 0)}, ValueError, "outside T.Kernel grid"),
         ({"dst_cores": T.comm.CoreRange((1, 0), (3, 1))}, ValueError, "outside T.Kernel grid"),
-        ({"dst_cores": (0, 0)}, ValueError, "source-exclusive"),
-        ({"dst_cores": T.comm.CoreRange((0, 0), (2, 1))}, ValueError, "source-exclusive"),
+        ({"dst_cores": (0, 0)}, ValueError, "point destination"),
         ({"shape": (32,)}, ValueError, "rank-2"),
         ({"shape": (48, 32)}, ValueError, "static payload extents"),
         ({"dst_shape": (32, 32)}, ValueError, "shape/dtype mismatch"),
@@ -217,10 +227,21 @@ def test_sugar_rejects_wrong_destination_types(api, destination, match):
 
 
 @pytest.mark.parametrize("api", ["put", "broadcast"])
-@pytest.mark.parametrize("bad_payload", [False, True])
-def test_sugar_retains_shared_transfer_validation(api, bad_payload):
+def test_sugar_retains_payload_validation(api):
     destination = (1, 0) if api == "put" else T.comm.CoreRange((1, 0), (2, 1))
-    kwargs = {"dst_dtype": "bfloat16"} if bad_payload else {"src_core": (1, 0)}
-    match = "payload shape/dtype mismatch" if bad_payload else "source-exclusive"
-    with pytest.raises(ValueError, match=match):
-        _program(api=api, dst_cores=destination, **kwargs)
+    with pytest.raises(ValueError, match="payload shape/dtype mismatch"):
+        _program(api=api, dst_cores=destination, dst_dtype="bfloat16")
+
+
+def test_put_still_rejects_self_destination():
+    with pytest.raises(ValueError, match="point destination"):
+        _program(api="put", src_core=(1, 0), dst_cores=(1, 0))
+
+
+def test_broadcast_accepts_source_in_destination_range():
+    program = _program(
+        api="broadcast",
+        src_core=(1, 0),
+        dst_cores=T.comm.CoreRange((1, 0), (2, 1)),
+    )
+    assert _transfers(program)[0].args[8].value == "collective"

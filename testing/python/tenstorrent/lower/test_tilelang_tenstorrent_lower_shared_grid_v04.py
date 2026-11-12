@@ -49,6 +49,37 @@ def point_transfer(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "floa
 
 
 @T.prim_func
+def loopback_transfer(A: T.Tensor((32, 32), "float32"), C: T.Tensor((64, 32), "float32")):
+    with T.Kernel(2, 1, threads=1) as (x, _y):
+        src = T.alloc_shared((32, 32), "float32")
+        dst = T.alloc_shared((32, 32), "float32")
+        if x == 0:
+            T.copy(A, src)
+        T.comm.broadcast(
+            src=src,
+            dst=dst,
+            src_core=(0, 0),
+            dst_cores=T.comm.CoreRange((0, 0), (2, 1)),
+        )
+        T.copy(dst, C[x * 32 : (x + 1) * 32, 0:32])
+
+
+@T.prim_func
+def symbolic_core_tensor_offsets(
+    A: T.Tensor((2, 6, 512, 32), "float32"),
+    C: T.Tensor((2, 6, 512, 32), "float32"),
+):
+    with T.Kernel(4, 3, threads=1) as (x, y):
+        tile = T.alloc_shared((32, 32), "float32")
+        for wave in T.serial(4):
+            batch = wave // 2
+            head = wave % 2 * 3 + y
+            row = wave * 128 + x * 32
+            T.copy(A[batch, head, row : row + 32, 0:32], tile)
+            T.copy(tile, C[batch, head, row : row + 32, 0:32])
+
+
+@T.prim_func
 def local_collective_then_transfer(A: T.Tensor((64, 32), "float32"), C: T.Tensor((64, 32), "float32")):
     with T.Kernel(2, 1, threads=1) as (x, _y):
         local_src = T.alloc_shared((32, 32), "float32")
@@ -124,6 +155,49 @@ def test_high_level_communication_forms_complete_device_program(program, kind, a
     assert resolve_transport_records(mod) or kind in ("all_gather", "all_reduce")
     body_names = {call.op.name for function in mod.functions.values() for call in calls(function.body)}
     assert not {"tl.tt.transfer", "tl.tt.all_gather", "tl.tt.all_reduce"} & body_names
+
+
+def test_loopback_transfer_defines_a_distinct_destination_on_source():
+    mod = lower(loopback_transfer)
+    (record,) = resolve_transport_records(mod)[0]
+    assert record.source == (0, 0)
+    assert record.destination_begin == (0, 0)
+    assert record.destination_end == (2, 1)
+    slots = {str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()}
+    assert not any(
+        call.op.name == "tl.tt.dfb_pipe_recv_record" for call in calls(slots["brisc"].body)
+    )
+    assert sum(
+        call.op.name == "tl.tt.dfb_pipe_recv_record" for call in calls(slots["ncrisc"].body)
+    ) == 1
+
+
+def test_symbolic_core_tensor_offsets_remain_one_shared_body():
+    mod = lower(symbolic_core_tensor_offsets)
+    functions = {
+        str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()
+    }
+    ncrisc = functions["ncrisc"]
+    assert _body_counts(ncrisc)["if"] == 0
+    work = []
+    loops = []
+    operation_names = set()
+
+    def collect(node):
+        if isinstance(node, tirx.SBlock) and node.name_hint == "tt_device_core_work":
+            work.append(node)
+        elif isinstance(node, tirx.For):
+            loops.append(node)
+        elif isinstance(node, tirx.Call) and hasattr(node.op, "name"):
+            operation_names.add(node.op.name)
+
+    tirx.stmt_functor.post_order_visit(ncrisc.body, collect)
+    assert len(work) == 1
+    assert [int(loop.extent) for loop in loops] == [4]
+    assert {"tl.tt.core_x", "tl.tt.core_y"} <= operation_names
+    source = ncrisc.script()
+    assert "% 2 * 3 + T.tt.core_y()" in source
+    assert "wave * 128 + T.tt.core_x() * 32" in source
 
 
 @T.prim_func
@@ -274,7 +348,7 @@ def test_stateful_serial_loop_uses_extent_invariant_device_resources_and_body():
     trisc_functions = [
         next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc") for mod in modules
     ]
-    assert all(_compact_loop_names(mod) for mod in modules)
+    assert all(_structured_loop_names(mod) for mod in modules)
     assert all(not _dynamic_dfb_operands(mod) for mod in modules)
     assert len({_body_counts(function)["evaluate"] for function in trisc_functions}) == 1
     script_sizes = [len(function.script()) for function in trisc_functions]
@@ -371,35 +445,46 @@ def producer_forwarded_broadcast(
             src=panel,
             dst=panel,
             src_core=(0, 0),
-            dst_cores=T.comm.CoreRange((1, 0), (2, 1)),
+            dst_cores=T.comm.CoreRange((0, 0), (2, 1)),
         )
         T.clear(accumulator)
         T.gemm(panel, panel, accumulator, clear_accum=False)
         T.copy(accumulator, C[x * 32 : (x + 1) * 32, 0:32])
 
 
-def test_tensor_panel_producer_transfer_is_owned_by_brisc():
+def test_loopback_broadcast_splits_source_and_destination_slots():
     mod = lower(producer_forwarded_broadcast)
+    functions = {
+        str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()
+    }
     sends = [
         (str(function.attrs["tt.kernel_slot"]), call.op.name)
         for function in mod.functions.values()
         for call in calls(function.body)
         if call.op.name == "tl.tt.dfb_pipe_send_record"
     ]
-    # BRISC owns every inter-core transfer; NCRISC only moves the payload into
-    # its own single-consumer transport generation.
+    # BRISC owns the source side. The original Tensor-backed generation is the
+    # private send staging transaction on the loopback source Core.
     assert sends == [("brisc", "tl.tt.dfb_pipe_send_record")]
+    loads = [
+        str(function.attrs["tt.kernel_slot"])
+        for function in mod.functions.values()
+        for call in calls(function.body)
+        if call.op.name == "tl.tt.tensor_to_dfb_nd"
+    ]
+    assert loads == ["brisc"]
     receives = [
         (str(function.attrs["tt.kernel_slot"]), call.op.name)
         for function in mod.functions.values()
         for call in calls(function.body)
         if call.op.name == "tl.tt.dfb_pipe_recv_record"
     ]
-    # Both directions live in the single shared BRISC body, so per-role
-    # tt_device_stream_work blocks are no longer emitted. Each Core's role is
-    # still fully recoverable from tt.transport_table (src_coord / dst_begin /
-    # dst_end), which is what the emitter consumes.
-    assert receives == [("brisc", "tl.tt.dfb_pipe_recv_record")]
+    # TT-Lang routes if_dst to NCRISC. Keeping loopback receive separate from
+    # the BRISC source also avoids a same-thread send/receive wait cycle.
+    assert receives == [("ncrisc", "tl.tt.dfb_pipe_recv_record")]
+    assert list(map(int, functions["brisc"].attrs["tt.tensor_arg_indices"])) == [0]
+    assert list(map(int, functions["ncrisc"].attrs["tt.tensor_arg_indices"])) == [1]
+    assert _body_counts(functions["ncrisc"])["if"] == 0
     records = resolve_transport_records(mod)
     destinations = {
         (x, y)
@@ -407,7 +492,45 @@ def test_tensor_panel_producer_transfer_is_owned_by_brisc():
         for x in range(record.destination_begin[0], record.destination_end[0])
         for y in range(record.destination_begin[1], record.destination_end[1])
     }
-    assert destinations == {(1, 0)}
+    assert destinations == {(0, 0), (1, 0)}
+    trisc = functions["trisc"]
+    trisc_ifs, trisc_work = [], []
+
+    def collect_trisc_regions(node):
+        if isinstance(node, tirx.IfThenElse):
+            trisc_ifs.append(node)
+        elif isinstance(node, tirx.SBlock) and node.name_hint == "tt_device_core_work":
+            trisc_work.append(node)
+
+    tirx.stmt_functor.post_order_visit(trisc.body, collect_trisc_regions)
+    assert not trisc_ifs
+    assert len(trisc_work) == 1
+
+
+def test_device_verifier_rejects_slot_tensor_abi_mismatch():
+    from examples.tenstorrent.summa import make_summa
+
+    mod = ir.load_json(
+        ir.save_json(
+            lower(
+                make_summa(
+                    core_m=2,
+                    core_n=2,
+                    k_stages=2,
+                    block_m=32,
+                    block_n=32,
+                    block_k=32,
+                )
+            )
+        )
+    )
+    for global_var, function in list(mod.functions.items()):
+        if str(function.attrs["tt.kernel_slot"]) != "brisc":
+            continue
+        mod.update_func(global_var, function.with_attr("tt.tensor_arg_indices", [0, 2]))
+        break
+    with pytest.raises(ValueError, match="exactly its used Tensor arguments"):
+        transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 def test_collective_transport_families_resolve_to_ordered_pipenet_records():
@@ -422,7 +545,7 @@ def test_collective_transport_families_resolve_to_ordered_pipenet_records():
         assert record.communication_id == 0
         assert record.record_index == row
         assert record.source == (0, row)
-        assert record.destination_begin == (1, row)
+        assert record.destination_begin == (0, row)
         assert record.destination_end == (4, row + 1)
         assert record.contract == "collective"
     for column, record in enumerate(records[1]):
@@ -430,9 +553,59 @@ def test_collective_transport_families_resolve_to_ordered_pipenet_records():
         assert record.communication_id == 1
         assert record.record_index == column
         assert record.source == (column, 0)
-        assert record.destination_begin == (column, 1)
+        assert record.destination_begin == (column, 0)
         assert record.destination_end == (column + 1, 4)
         assert record.contract == "collective"
+
+
+def test_flash_attention_loopback_unifies_kv_compute_streams():
+    from examples.tenstorrent.flash_attn import make_flash_attention
+
+    mod = lower(
+        make_flash_attention(
+            batch=1,
+            heads=1,
+            seq_q=64,
+            seq_kv=64,
+            head_dim=32,
+            core_q=2,
+            core_bh=1,
+            block_q=32,
+            block_kv=32,
+            input_dtype="bfloat16",
+            accum_dtype="bfloat16",
+        )
+    )
+    functions = {
+        str(function.attrs["tt.kernel_slot"]): function for function in mod.functions.values()
+    }
+    assert _body_counts(functions["trisc"])["if"] == 0
+    kv_loops = []
+    tirx.stmt_functor.post_order_visit(
+        functions["trisc"].body,
+        lambda node: (
+            kv_loops.append(node)
+            if isinstance(node, tirx.For) and str(node.loop_var.name) == "kv_tile"
+            else None
+        ),
+    )
+    assert len(kv_loops) == 1
+    assert int(kv_loops[0].extent) == 2
+
+    records = resolve_transport_records(mod)
+    assert set(records) == {0, 1}
+    assert all(
+        record.destination_begin[0] <= record.source[0] < record.destination_end[0]
+        and record.destination_begin[1] <= record.source[1] < record.destination_end[1]
+        for pipe_records in records.values()
+        for record in pipe_records
+    )
+    assert not any(
+        call.op.name == "tl.tt.dfb_pipe_recv_record" for call in calls(functions["brisc"].body)
+    )
+    assert not any(
+        call.op.name == "tl.tt.dfb_pipe_send_record" for call in calls(functions["ncrisc"].body)
+    )
 
 
 def test_summa_device_body_uses_kind_resource_aliases():
@@ -511,6 +684,34 @@ def test_codegen_record_resolver_rejects_sparse_record_indices():
         resolve_transport_records(malformed)
 
 
+def test_codegen_record_resolver_accepts_collective_loopback_only():
+    mod = lower(producer_forwarded_broadcast)
+    records = resolve_transport_records(mod)
+    assert records[0][0].source == (0, 0)
+    assert records[0][0].destination_begin == (0, 0)
+
+    families = list(mod.attrs["tt.transport_families"])
+    family = families[0]
+    pipe = family.prototype
+    prototype = D.PipeDescriptor(
+        int(pipe.pipe_net_id),
+        int(pipe.communication_id),
+        int(pipe.record_index),
+        pipe.src_coord,
+        pipe.dst_begin,
+        pipe.dst_end,
+        "point_to_point",
+        int(pipe.payload_dfb_id),
+        pipe.source_span,
+    )
+    families[0] = D.DeviceIRDescriptorFamily(
+        prototype, family.positions, family.fields, family.source_parts
+    )
+    malformed = mod.with_attr("tt.transport_families", families)
+    with pytest.raises(RecordResolutionError, match="cannot include its source"):
+        resolve_transport_records(malformed)
+
+
 def test_device_verifier_rejects_transport_with_wrong_parent_communication():
     mod = lower(point_transfer)
     families = list(mod.attrs["tt.transport_families"])
@@ -540,16 +741,12 @@ def _body_counts(function):
     return counts
 
 
-def _compact_loop_names(mod):
+def _structured_loop_names(mod):
     names = []
     for function in mod.functions.values():
         tirx.stmt_functor.post_order_visit(
             function.body,
-            lambda node: (
-                names.append(str(node.loop_var.name))
-                if isinstance(node, tirx.For) and str(node.loop_var.name).startswith("tt_compact_")
-                else None
-            ),
+            lambda node: names.append(str(node.loop_var.name)) if isinstance(node, tirx.For) else None,
         )
     return names
 
@@ -626,19 +823,18 @@ def _assert_logical_streams(mod):
     assert "tt.dfb_storage_group_relations" not in mod.attrs
 
 
-@pytest.mark.xfail(strict=True, reason="BRISC-owned transport buffers add per-core DFB generations, so the body no longer keeps one static DFB id per Core; see the slot-ownership change in PlanPipe")
 def test_summa_uses_parameterized_core_occurrence_and_resource_families():
     from examples.tenstorrent.summa import make_summa
 
-    configs = ((2, 2), (2, 4), (4, 4))
+    stages = (2, 4, 16)
     modules = []
-    for cores, stages in configs:
+    for extent in stages:
         modules.append(
             lower(
                 make_summa(
-                    core_m=cores,
-                    core_n=cores,
-                    k_stages=stages,
+                    core_m=2,
+                    core_n=2,
+                    k_stages=extent,
                     block_m=32,
                     block_n=32,
                     block_k=32,
@@ -666,90 +862,37 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
         (1, 1),
     ]
 
-    for mod in modules:
-        assert len(mod.attrs["tt.dfb_storage_groups"]) == 3
-        functions = {str(func.attrs["tt.kernel_slot"]): func for func in mod.functions.values()}
-        trisc = _body_counts(functions["trisc"])
-        ncrisc = _body_counts(functions["ncrisc"])
-        assert trisc["if"] == 0
-        assert trisc["block"] == 1
-        assert trisc["for"] >= 1
+    counts = []
+    for mod, extent in zip(modules, stages):
+        assert len(mod.attrs["tt.dfb_storage_groups"]) == 5
         assert "tt.storage_group_statements_specialized" not in mod.attrs
-        assert _compact_loop_names(mod)
-        assert not _dynamic_dfb_operands(mod)
+        loop_names = _structured_loop_names(mod)
+        assert loop_names and set(loop_names) == {"stage"}
         _assert_logical_streams(mod)
-        assert ncrisc["if"] == 4
-        assert ncrisc["block"] == 6
-        stream_blocks = []
-        role_conditions = []
+        functions = {str(func.attrs["tt.kernel_slot"]): func for func in mod.functions.values()}
+        brisc_blocks = []
         tirx.stmt_functor.post_order_visit(
-            functions["ncrisc"].body,
-            lambda node, stream_blocks=stream_blocks, role_conditions=role_conditions: (
-                stream_blocks.append(node)
-                if isinstance(node, tirx.SBlock) and node.name_hint == "tt_device_stream_work"
-                else role_conditions.append(node.condition)
-                if isinstance(node, tirx.IfThenElse)
-                else None
-            ),
+            functions["brisc"].body,
+            lambda node: brisc_blocks.append(node) if isinstance(node, tirx.SBlock) else None,
         )
-        role_blocks = [block for block in stream_blocks if "tt.communication_role" in block.annotations]
-        assert len(role_blocks) == 4
-        assert {
-            (
-                str(block.annotations["tt.communication_role"]),
-                tuple(map(int, block.annotations["tt.communication_ids"])),
-                tuple(map(int, block.annotations["tt.pipe_net_ids"])),
-            )
-            for block in role_blocks
-        } == {
-            ("source", (0,), (0,)),
-            ("destination", (0,), (0,)),
-            ("source", (1,), (1,)),
-            ("destination", (1,), (1,)),
-        }
-        for condition in role_conditions:
-            coordinates = set()
+        assert sum(block.name_hint == "tt_device_core_work" for block in brisc_blocks) == 1
+        assert sum(block.name_hint == "tt_device_stream_work" for block in brisc_blocks) == 2
+        assert _body_counts(functions["brisc"])["if"] == 2
+        for function in functions.values():
+            loops = []
             tirx.stmt_functor.post_order_visit(
-                condition,
-                lambda node, coordinates=coordinates: (
-                    coordinates.add(node.op.name)
-                    if isinstance(node, tirx.Call) and node.op.name in ("tl.tt.core_x", "tl.tt.core_y")
-                    else None
-                ),
+                function.body,
+                lambda node, loops=loops: loops.append(node) if isinstance(node, tirx.For) else None,
             )
-            assert len(coordinates) == 1
-        source_blocks = [block for block in role_blocks if str(block.annotations["tt.communication_role"]) == "source"]
-        for block in source_blocks:
-            source_calls = calls(block.body)
-            assert sum(call.op.name == "tl.tt.dfb_pipe_send_record" for call in source_calls) == 1
-            assert sum(call.op.name == "tl.tt.dfb_pipe_wait_record" for call in source_calls) == 1
-            assert not any(call.op.name == "tl.tt.dfb_pipe_send" for call in source_calls)
-            assert all(
-                len(call.args) == 3 and not call.annotations
-                for call in source_calls
-                if call.op.name in ("tl.tt.dfb_pipe_send_record", "tl.tt.dfb_pipe_wait_record")
-            )
-            nested_loops = []
-            tirx.stmt_functor.post_order_visit(
-                block.body,
-                lambda node, nested_loops=nested_loops: nested_loops.append(node) if isinstance(node, tirx.For) else None,
-            )
-            assert not nested_loops
+            assert all(int(loop.extent) == extent for loop in loops)
+            assert all(not str(loop.loop_var.name).startswith("tt_compact_") for loop in loops)
+        counts.append(tuple(_body_counts(functions[slot])[key] for slot in ("trisc", "ncrisc", "brisc") for key in ("for", "evaluate")))
         assert "tt.communication_step_families" not in mod.attrs
-        blocks = []
-        tirx.stmt_functor.post_order_visit(
-            functions["trisc"].body,
-            lambda node, blocks=blocks: blocks.append(node) if isinstance(node, tirx.SBlock) else None,
-        )
-        assert all("tt.core_domain" in block.annotations for block in blocks)
-        assert all("tt.core_x" not in block.annotations for block in blocks)
-        assert all("tt.core_y" not in block.annotations for block in blocks)
-
-    assert len(tvm.ir.save_json(modules[1])) < 2 * len(tvm.ir.save_json(modules[0]))
+    assert len(set(counts)) == 1
+    assert max(map(lambda mod: len(tvm.ir.save_json(mod)), modules)) - min(map(lambda mod: len(tvm.ir.save_json(mod)), modules)) < 2048
     assert transform.VerifyTenstorrentDeviceIR()(modules[-1]).same_as(modules[-1])
 
 
-@pytest.mark.xfail(strict=True, reason="tt_device_stream_work role blocks are no longer emitted: send and recv share the single BRISC body")
 def test_device_verifier_rejects_mismatched_stream_work_role():
     from examples.tenstorrent.summa import make_summa
 
@@ -777,7 +920,7 @@ def test_device_verifier_rejects_mismatched_stream_work_role():
         )
 
     for global_var, function in list(malformed.functions.items()):
-        # Inter-core transfers live in the BRISC body.
+        # Source communication lives in the BRISC body.
         if str(function.attrs["tt.kernel_slot"]) != "brisc":
             continue
         body = tirx.stmt_functor.ir_transform(function.body, None, corrupt, ["tirx.SBlock"])
@@ -787,7 +930,6 @@ def test_device_verifier_rejects_mismatched_stream_work_role():
         transform.VerifyTenstorrentDeviceIR()(malformed)
 
 
-@pytest.mark.xfail(strict=True, reason="tt_device_stream_work role blocks are no longer emitted: send and recv share the single BRISC body")
 def test_device_verifier_rejects_mismatched_stream_work_pipe_net_summary():
     from examples.tenstorrent.summa import make_summa
 
@@ -814,7 +956,7 @@ def test_device_verifier_rejects_mismatched_stream_work_pipe_net_summary():
         )
 
     for global_var, function in list(malformed.functions.items()):
-        # Inter-core transfers live in the BRISC body.
+        # Source communication lives in the BRISC body.
         if str(function.attrs["tt.kernel_slot"]) != "brisc":
             continue
         body = tirx.stmt_functor.ir_transform(function.body, None, corrupt, ["tirx.SBlock"])
@@ -1094,7 +1236,10 @@ def test_current_codegen_preflight_rejects_before_loading_ttlang(monkeypatch):
     assert not imported
 
 
-@pytest.mark.xfail(strict=True, reason="BRISC-owned transport buffers add per-core DFB generations, so the body no longer keeps one static DFB id per Core; see the slot-ownership change in PlanPipe")
+@pytest.mark.xfail(
+    strict=True,
+    reason="BRISC-owned transport buffers add per-core DFB generations, so the body no longer keeps one static DFB id per Core; see the slot-ownership change in PlanPipe",
+)
 def test_lower_preserves_parameterized_storage_group_selection_for_codegen():
     from examples.tenstorrent.summa import make_summa
     from tilelang.tenstorrent.ttl_codegen.resources import (
@@ -1113,7 +1258,7 @@ def test_lower_preserves_parameterized_storage_group_selection_for_codegen():
         )
     )
     assert "tt.storage_group_statements_specialized" not in mod.attrs
-    assert _compact_loop_names(mod)
+    assert _structured_loop_names(mod)
     assert not _dynamic_dfb_operands(mod)
     _assert_logical_streams(mod)
     assert len(mod.attrs["tt.dfb_storage_groups"]) == len(expanded(mod).attrs["tt.dfb_table"])
@@ -1144,7 +1289,10 @@ def test_core_predicate_must_match_its_typed_work_domain():
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
-@pytest.mark.xfail(strict=True, reason="BRISC-owned transport buffers add per-core DFB generations, so the body no longer keeps one static DFB id per Core; see the slot-ownership change in PlanPipe")
+@pytest.mark.xfail(
+    strict=True,
+    reason="BRISC-owned transport buffers add per-core DFB generations, so the body no longer keeps one static DFB id per Core; see the slot-ownership change in PlanPipe",
+)
 def test_flash_attention_core_and_kv_repetition_remain_parameterized():
     from examples.tenstorrent.flash_attn import make_flash_attention
 
@@ -1193,7 +1341,7 @@ def test_flash_attention_core_and_kv_repetition_remain_parameterized():
     assert sizes[2] < 3 * sizes[1] // 2
 
 
-def test_stateful_loop_compaction_absorbs_the_terminal_steady_state_period():
+def test_stateful_loop_preserves_the_source_iteration_domain():
     from examples.tenstorrent.flash_attn import make_flash_attention
 
     mod = lower(
@@ -1211,16 +1359,13 @@ def test_stateful_loop_compaction_absorbs_the_terminal_steady_state_period():
         )
     )
     trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
-    compact_loops = []
+    structured_loops = []
     tirx.stmt_functor.post_order_visit(
         trisc.body,
-        lambda node: (
-            compact_loops.append(node)
-            if isinstance(node, tirx.For) and str(node.loop_var.name).startswith("tt_compact_iteration")
-            else None
-        ),
+        lambda node: structured_loops.append(node) if isinstance(node, tirx.For) and str(node.loop_var.name) == "kv_tile" else None,
     )
-    assert [int(loop.extent) for loop in compact_loops] == [8]
+    assert [int(loop.extent) for loop in structured_loops] == [8]
+    assert not any(str(node.loop_var.name).startswith("tt_compact_") for node in structured_loops)
     assert sum(call.op.name == "tl.tt.compute_value_gemm" for call in calls(trisc.body)) == 2
     assert sum("state_" in call.op.name for call in calls(trisc.body)) == 4
     assert not _dynamic_dfb_operands(mod)

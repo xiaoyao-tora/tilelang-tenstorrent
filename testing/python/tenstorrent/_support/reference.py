@@ -209,7 +209,7 @@ def interpret_values(mod, tensors):
     """Run streams with waits, preserving snapshots after input DFB release."""
     mod = D.expand_current_device_tables(mod)
     arrays = [np.array(value, copy=True) for value in tensors]
-    dfbs, acquired, values = {}, {}, {}
+    dfbs, acquired, values, loop_states = {}, {}, {}, {}
     descriptors = {int(value.value_id): value for value in mod.attrs["tt.compute_value_table"]}
     dfb_descriptors = {int(dfb.dfb_id): dfb for dfb in mod.attrs["tt.dfb_table"]}
     streams = [list(_calls(func.body)) for func in mod.functions.values()]
@@ -334,7 +334,6 @@ def interpret_values(mod, tensors):
                 )
                 result = np.broadcast_to(result, shape).copy()
                 if name == "tl.tt.compute_value":
-                    assert args[0] not in values, "An immutable value was redefined"
                     values[args[0]] = _round(result, descriptors[args[0]].buffer.dtype)
                 else:
                     dfbs.setdefault(args[0], []).append(_round(result, dfb_descriptors[args[0]].element_dtype))
@@ -344,7 +343,6 @@ def interpret_values(mod, tensors):
                 result = (a.T if ta else a) @ (b.T if tb else b)
                 if old >= 0:
                     result = result + values[old]
-                assert output not in values
                 values[output] = _round(result, descriptors[output].buffer.dtype)
             elif name == "tl.tt.compute_value_store":
                 value_dtype = str(descriptors[args[0]].buffer.dtype)
@@ -356,6 +354,18 @@ def interpret_values(mod, tensors):
             elif name == "tl.tt.dfb_release":
                 dfbs[args[0]].pop(0)
                 acquired[args[0]] -= 1
+            elif name == "tl.tt.compute_value_state_init":
+                state, value = args
+                loop_states[state] = values[value].copy()
+            elif name == "tl.tt.compute_value_state_input":
+                value, state = args
+                values[value] = loop_states[state].copy()
+            elif name == "tl.tt.compute_value_state_yield":
+                state, value = args
+                loop_states[state] = values[value].copy()
+            elif name == "tl.tt.compute_value_state_result":
+                value, state = args
+                values[value] = loop_states[state].copy()
             else:
                 assert name in ("tl.tt.dfb_reserve", "tl.tt.dfb_copy_wait"), name
             cursors[index] += 1
@@ -368,7 +378,7 @@ def interpret(mod, inputs, seed=0):
     """Execute value, DFB, and point-delivery contracts independently of lowering."""
     mod = D.expand_current_device_tables(mod)
     tensors = [np.array(value, copy=True) for value in inputs]
-    values, dfbs, deliveries, accumulators = {}, {}, {}, {}
+    values, dfbs, deliveries, accumulators, loop_states = {}, {}, {}, {}, {}
     record_deliveries, record_receive_cursors = {}, {}
     pending = {}
     occupied = set()
@@ -447,9 +457,10 @@ def interpret(mod, inputs, seed=0):
                     continue
             if name == "tl.tt.dfb_reserve":
                 group = groups.get(args[0], args[0])
+                if args[0] in occupied:
+                    continue
                 if sum(groups.get(resource, resource) == group for resource in occupied) >= int(dfb_info[args[0]].block_count):
                     continue
-                assert args[0] not in occupied
                 occupied.add(args[0])
             elif name == "tl.tt.tensor_to_dfb_nd":
                 region = tuple(slice(args[i], args[i] + args[i + 1]) for i in range(2, len(args), 2))
@@ -529,7 +540,6 @@ def interpret(mod, inputs, seed=0):
                     result = expression(attrs["tt.expression"], maps)
                 result = np.broadcast_to(result, domain).copy()
                 if name == "tl.tt.compute_value":
-                    assert args[0] not in values
                     values[args[0]] = _round(result, value_info[args[0]].buffer.dtype)
                 else:
                     dfbs[args[0]] = _round(result, dfb_info[args[0]].element_dtype)
@@ -557,6 +567,18 @@ def interpret(mod, inputs, seed=0):
                 dfb_dtype = str(dfb_info[args[1]].element_dtype)
                 assert value_dtype == dfb_dtype, "compute_value_store must preserve dtype"
                 dfbs[args[1]] = values[args[0]].copy()
+            elif name == "tl.tt.compute_value_state_init":
+                state, value = args
+                loop_states[state] = values[value].copy()
+            elif name == "tl.tt.compute_value_state_input":
+                value, state = args
+                values[value] = loop_states[state].copy()
+            elif name == "tl.tt.compute_value_state_yield":
+                state, value = args
+                loop_states[state] = values[value].copy()
+            elif name == "tl.tt.compute_value_state_result":
+                value, state = args
+                values[value] = loop_states[state].copy()
             elif name == "tl.tt.dfb_release":
                 assert args[0] not in pending, "Release before copy completion"
                 occupied.remove(args[0])

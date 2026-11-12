@@ -1,4 +1,4 @@
-"""Bounded pipeline lowering and transaction scheduling, without TT toolchains."""
+"""Structured pipeline lowering and transaction scheduling, without TT toolchains."""
 
 import pytest
 
@@ -49,9 +49,31 @@ def slot_calls(mod, slot):
     return list(_calls(func.body))
 
 
+def lexical_slot_calls(mod, slot):
+    func = next(f for f in mod.functions.values() if str(f.attrs["tt.kernel_slot"]) == slot)
+    found = []
+
+    def visit(node):
+        if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
+            found.append(node.value)
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+    return found
+
+
+def slot_loops(mod, slot):
+    func = next(f for f in mod.functions.values() if str(f.attrs["tt.kernel_slot"]) == slot)
+    found = []
+    tirx.stmt_functor.post_order_visit(
+        func.body,
+        lambda node: found.append(node) if isinstance(node, tirx.For) else None,
+    )
+    return found
+
+
 @pytest.mark.parametrize("stages,extent,start", [(1, 1, 0), (1, 5, 0), (2, 5, 0), (3, 7, 4), (8, 2, 3), (32, 1, 0)])
 @pytest.mark.parametrize("arch", ["wormhole_b0", "blackhole"])
-def test_pipeline_materializes_bounded_windows(stages, extent, start, arch):
+def test_pipeline_preserves_structured_transaction_epochs(stages, extent, start, arch):
     func = make_pipeline(stages, extent, start)
     mod = lower_pipeline(func, arch)
     assert str(mod.attrs["tt.ir_stage"]) == "device"
@@ -61,29 +83,33 @@ def test_pipeline_materializes_bounded_windows(stages, extent, start, arch):
     depth = min(stages, extent)
     groups = list(mod.attrs["tt.dfb_storage_groups"])
     dfbs = mod.attrs["tt.dfb_table"]
-    assert len(dfbs) == 4 * extent  # A, B, compute output, export snapshot.
+    assert len(dfbs) == 4  # A, B, compute output, export snapshot lexical sites.
     assert [int(group.storage_group_id) for group in groups] == list(range(len(dfbs)))
     for desc in dfbs:
         assert int(desc.block_count) == depth
-        assert int(desc.transaction_count_or_loop_relation) == 1
-    transfers = slot_calls(mod, "ncrisc")
+        assert int(desc.transaction_count_or_loop_relation) == extent
+    for slot in ("trisc", "ncrisc"):
+        loops = slot_loops(mod, slot)
+        assert [(int(loop.min), int(loop.extent)) for loop in loops] == [(start, extent)]
+        assert all(not str(loop.loop_var.name).startswith("tt_compact_") for loop in loops)
+    assert not slot_loops(mod, "brisc")
+    transfers = lexical_slot_calls(mod, "ncrisc")
     issue = "tl.tt.tensor_to_dfb_nd"
     wait = "tl.tt.dfb_copy_wait"
     first_wait = next(i for i, call in enumerate(transfers) if call.op.name == wait)
-    assert sum(call.op.name == issue for call in transfers[:first_wait]) == 2 * depth
-    calls = transfers + slot_calls(mod, "trisc")
+    assert sum(call.op.name == issue for call in transfers[:first_wait]) == 1
+    assert sum(call.op.name == issue for call in transfers) == 2
+    calls = transfers + lexical_slot_calls(mod, "trisc")
     for call in calls:
-        assert call.span is not None
         if call.op.name == "tl.tt.dfb_compute" and "tt.expression" in call.annotations:
             variables = []
             tirx.stmt_functor.post_order_visit(
                 call.annotations["tt.expression"],
                 lambda node, variables=variables: variables.append(node) if isinstance(node, tirx.Var) else None,
             )
-            assert not variables, "pipeline iteration scalar must be specialized in final Device IR"
+            assert variables, "pipeline iteration scalar must remain bound by Device For"
     assert sum(call.op.name == "tl.tt.dfb_release" for call in calls) == len(dfbs)
-    assert sum(call.op.name == wait for call in calls) == 3 * extent
-    assert not any(isinstance(f.body, tirx.For) for f in mod.functions.values())
+    assert sum(call.op.name == wait for call in calls) == 3
     repeated = lower_pipeline(func, arch)
     ir.assert_structural_equal(mod, repeated)
     assert mod.script() == repeated.script()
@@ -207,13 +233,14 @@ def test_pipeline_rejects_nested_pipeline():
 
 
 @pytest.mark.parametrize("policy", ["conservative", "delayed"])
-def test_pipeline_copy_completion_policy_has_concrete_order(policy):
+def test_pipeline_copy_completion_policy_is_preserved_for_codegen(policy):
     mod = lower_pipeline(make_pipeline(stages=3, extent=5, wait_policy=policy))
     assert str(mod.attrs["tt.pipeline_wait_policy"]) == policy
-    calls = slot_calls(mod, "ncrisc")
+    calls = lexical_slot_calls(mod, "ncrisc")
     first_wait = next(i for i, call in enumerate(calls) if call.op.name == "tl.tt.dfb_copy_wait")
     issues = sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in calls[:first_wait])
-    assert issues == (1 if policy == "conservative" else 6)
+    assert issues == 1
+    assert [(int(loop.min), int(loop.extent)) for loop in slot_loops(mod, "ncrisc")] == [(0, 5)]
 
 
 def test_pipeline_invalid_copy_completion_policy():
@@ -234,9 +261,10 @@ def test_pipeline_copy_only_materializes_snapshot_and_closed_lifetime():
     mod = lower_pipeline(copy_pipeline)
     assert str(mod.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in mod.attrs
-    assert len(mod.attrs["tt.dfb_table"]) == 6
-    computes = [call for call in slot_calls(mod, "trisc") if call.op.name == "tl.tt.dfb_compute"]
-    assert len(computes) == 3
+    assert len(mod.attrs["tt.dfb_table"]) == 2
+    assert {int(desc.transaction_count_or_loop_relation) for desc in mod.attrs["tt.dfb_table"]} == {3}
+    computes = [call for call in lexical_slot_calls(mod, "trisc") if call.op.name == "tl.tt.dfb_compute"]
+    assert len(computes) == 1
     assert all(call.annotations["tt.compute_kind"].value == "copy" for call in computes)
     VerifyTenstorrentDeviceIR()(mod)
 
@@ -248,7 +276,8 @@ def test_pipeline_wait_policy_requires_string():
 
 def test_pipeline_maximum_static_extent_and_stage_boundary():
     mod = lower_pipeline(make_pipeline(stages=32, extent=1024))
-    assert len(mod.attrs["tt.dfb_table"]) == 4096
+    assert len(mod.attrs["tt.dfb_table"]) == 4
     assert {int(desc.block_count) for desc in mod.attrs["tt.dfb_table"]} == {32}
-    assert len(mod.attrs["tt.dfb_storage_groups"]) == 4096
-    assert [int(group.storage_group_id) for group in mod.attrs["tt.dfb_storage_groups"]] == list(range(4096))
+    assert {int(desc.transaction_count_or_loop_relation) for desc in mod.attrs["tt.dfb_table"]} == {1024}
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == 4
+    assert [int(group.storage_group_id) for group in mod.attrs["tt.dfb_storage_groups"]] == list(range(4))

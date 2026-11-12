@@ -29,26 +29,17 @@ def run_pipeline_device(mod, inputs, *, seed=0):
     tensors = [cast(value, desc.dtype).copy() for value, desc in zip(inputs, mod.attrs["tt.tensor_table"])]
     dfbs = {int(d.dfb_id): d for d in mod.attrs["tt.dfb_table"]}
     groups = {identifier: identifier for identifier in dfbs}
+    capacities = {identifier: int(descriptor.block_count) for identifier, descriptor in dfbs.items()}
     next_epoch = defaultdict(int)
-    epochs = {}
-    for identifier, descriptor in dfbs.items():
-        span = descriptor.source_span
-        signature = (
-            str(span.source_name.name) if span is not None else "",
-            int(span.line) if span is not None else 0,
-            str(descriptor.producer_slot),
-            str(descriptor.consumer_slot),
-        )
-        epochs[identifier] = next_epoch[signature]
-        next_epoch[signature] += 1
-    addresses = {identifier: (identifier, 0) for identifier in dfbs}
+    published = defaultdict(list)
+    producer_active, consumer_active = {}, {}
     streams = []
     for slot in ("ncrisc", "trisc", "brisc"):
         func = next(f for f in mod.functions.values() if str(f.attrs["tt.kernel_slot"]) == slot)
         streams.append(list(_calls(func.body)))
     positions = [0] * len(streams)
     owners, storage, pending = {}, {}, {}
-    published, released = set(), set()
+    released_epochs = defaultdict(int)
     high_water = defaultdict(int)
     copy_high_water = 0
     exports = []
@@ -66,53 +57,73 @@ def run_pipeline_device(mod, inputs, *, seed=0):
             args = [int(x) for x in call.args]
             if name == "tl.tt.dfb_reserve":
                 resource = args[0]
-                address = addresses[resource]
+                if resource in producer_active:
+                    continue
+                epoch = next_epoch[resource]
+                address = (resource, epoch % capacities[resource])
                 if address in owners:
                     continue
-                owners[address] = resource
+                producer_active[resource] = epoch
+                owners[address] = (resource, epoch)
                 high_water[groups[resource]] = max(high_water[groups[resource]], sum(g == groups[resource] for g, _ in owners))
             elif name == "tl.tt.dfb_wait":
-                if args[0] not in published:
-                    continue
-                assert owners[addresses[args[0]]] == args[0]
+                resource = args[0]
+                if resource not in consumer_active:
+                    if not published[resource]:
+                        continue
+                    consumer_active[resource] = published[resource][0]
+                epoch = consumer_active[resource]
+                assert owners[(resource, epoch % capacities[resource])] == (resource, epoch)
             elif name in ("tl.tt.tensor_to_dfb_nd", "tl.tt.dfb_to_tensor_nd"):
                 is_input = name == "tl.tt.tensor_to_dfb_nd"
                 tensor, resource = args[:2] if is_input else args[1::-1]
-                assert owners[addresses[resource]] == resource
-                assert resource not in pending
+                epoch = producer_active[resource] if is_input else consumer_active[resource]
+                address = (resource, epoch % capacities[resource])
+                assert owners[address] == (resource, epoch)
+                key = (resource, "producer" if is_input else "consumer")
+                assert key not in pending
                 if not is_input:
-                    assert resource in published
+                    assert published[resource] and published[resource][0] == epoch
                 region = tuple(slice(lo, lo + size) for lo, size in zip(args[2::2], args[3::2]))
                 # Transfer data is read on completion, not eagerly captured at
                 # issue; releasing or overwriting in flight is observable.
-                pending[resource] = (tick + int(rng.integers(1, 8)), is_input, tensor, region)
+                pending[key] = (tick + int(rng.integers(1, 8)), epoch, is_input, tensor, region)
                 copy_high_water = max(copy_high_water, len(pending))
             elif name == "tl.tt.dfb_copy_wait":
                 resource = args[0]
-                ready, is_input, tensor, region = pending[resource]
+                key = (resource, "producer") if (resource, "producer") in pending else (resource, "consumer")
+                ready, epoch, is_input, tensor, region = pending[key]
                 if tick < ready:
                     continue
-                assert owners[addresses[resource]] == resource
+                address = (resource, epoch % capacities[resource])
+                assert owners[address] == (resource, epoch)
                 if is_input:
-                    storage[addresses[resource]] = tensors[tensor][region].copy()
-                    published.add(resource)
+                    storage[address] = tensors[tensor][region].copy()
+                    published[resource].append(epoch)
+                    del producer_active[resource]
+                    next_epoch[resource] += 1
                 else:
-                    tensors[tensor][region] = storage[addresses[resource]]
-                    exports.append((tensor, epochs[resource], tensors[tensor][region].copy()))
-                del pending[resource]
+                    tensors[tensor][region] = storage[address]
+                    exports.append((tensor, epoch, tensors[tensor][region].copy()))
+                del pending[key]
             elif name == "tl.tt.dfb_release":
                 resource = args[0]
-                assert resource in published and resource not in pending
-                assert owners.pop(addresses[resource]) == resource
-                del storage[addresses[resource]]
-                published.remove(resource)
-                assert resource not in released
-                released.add(resource)
+                epoch = consumer_active[resource]
+                assert published[resource] and published[resource][0] == epoch
+                assert (resource, "consumer") not in pending
+                address = (resource, epoch % capacities[resource])
+                assert owners.pop(address) == (resource, epoch)
+                del storage[address]
+                published[resource].pop(0)
+                del consumer_active[resource]
+                released_epochs[resource] += 1
             elif name == "tl.tt.dfb_compute":
                 output, *operands = args
-                assert owners[addresses[output]] == output
-                assert all(i in published and owners[addresses[i]] == i for i in operands)
-                values = {i: storage[addresses[i]] for i in operands}
+                output_epoch = producer_active[output]
+                output_address = (output, output_epoch % capacities[output])
+                assert owners[output_address] == (output, output_epoch)
+                assert all(i in consumer_active for i in operands)
+                values = {i: storage[(i, consumer_active[i] % capacities[i])] for i in operands}
                 attrs = call.annotations
                 kind = str(attrs["tt.compute_kind"].value)
                 domain = tuple(int(x) for x in attrs["tt.logical_domain"])
@@ -144,15 +155,18 @@ def run_pipeline_device(mod, inputs, *, seed=0):
                         result = combine(values[operands[1]], result)
                 else:
                     raise AssertionError(f"Unsupported reference compute: {kind}")
-                storage[addresses[output]] = cast(result, dfbs[output].element_dtype).copy()
-                published.add(output)
+                storage[output_address] = cast(result, dfbs[output].element_dtype).copy()
+                published[output].append(output_epoch)
+                del producer_active[output]
+                next_epoch[output] += 1
             else:
                 raise AssertionError(f"Unsupported reference op: {name}")
             positions[stream_index] += 1
             progressed = True
         assert progressed or pending, "Device streams deadlocked without any in-flight copy"
-    assert not pending and not owners and not published and not storage
-    assert released == set(dfbs)
+    assert not pending and not owners and not producer_active and not consumer_active and not storage
+    assert all(not epochs for epochs in published.values())
+    assert released_epochs == {identifier: int(descriptor.transaction_count_or_loop_relation) for identifier, descriptor in dfbs.items()}
     return tensors, {"exports": exports, "pool_high_water": dict(high_water), "copy_high_water": copy_high_water}
 
 
@@ -176,10 +190,10 @@ def test_pipeline_device_numerics_and_ring_reuse(stages, extent, start, seed, wa
         np.testing.assert_array_equal(value, a + b + np.float32(iteration))
     np.testing.assert_array_equal(actual[-1], a + b + np.float32(start + extent - 1))
     assert max(trace["pool_high_water"].values()) <= min(stages, extent)
-    if wait_policy == "delayed":
-        assert trace["copy_high_water"] >= 2 * min(stages, extent)
-    else:
-        assert trace["copy_high_water"] == 1
+    # Lower preserves the policy on the structured loop; this Device reference
+    # executes lexical order. TTL/TT-Lang owns delayed window scheduling.
+    assert str(mod.attrs["tt.pipeline_wait_policy"]) == wait_policy
+    assert trace["copy_high_water"] == 1
 
 
 def test_pipeline_matches_serial_device_semantics_with_extra_capacity():

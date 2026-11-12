@@ -40,8 +40,19 @@ verifier 独立检查池形状/dtype/归属、容量、copy completion、最后�
 保存的旧值和 identity 链仍借用原 DFB，不能在最后的传递消费者读取前释放。
 诊断包含当前 PrimFunc、operation/resource ID，并在可用时附带源位置。
 
-SUMMA 的 NCRISC 若转发本地加载的 panel，会在首次 send 前完成该 panel 的
-Tensor copy。其余输入保留窗口预取，避免接收端读取尚未发布的数据。
+source-inclusive SUMMA 的 source panel 将完整 Tensor-load/send transaction 放在
+BRISC；NCRISC 只发布 loopback/remote receive generation。其余输入保留窗口预取，
+避免接收端读取尚未发布的数据。
+
+共享 BRISC 保留一个完整 grid core-work 和原 structured stage loop。A、B source
+transaction 分别形成 `x == 0` 与 `y == 0` 的 stream-work；两个 domain 可以在
+`(0, 0)` 重叠，因为它们属于不同 DFB 连通分量并保持共同无环次序。非通信稀疏分量
+不使用该转换。
+
+Core proof 和 Device body commit 共享同一份包含 `tt.core_x()`/`tt.core_y()` 的符号
+statement template。proof evaluator 为当前 Core 临时代入坐标以解析分支、端点和 bounds；
+Tensor slice、loop expression 和其他 scalar operand 在 committed body 中保持原
+`PrimExpr`。因此 Core 0 的 `+0` 化简不会再把同一公式拆成不同 skeleton。
 
 ## 能力查询和保留边界
 
