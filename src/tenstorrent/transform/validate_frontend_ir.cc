@@ -102,6 +102,23 @@ private:
   bool found_{false};
 };
 
+class BufferStoreCounter : public StmtExprVisitor {
+public:
+  static size_t Count(const Stmt &body) {
+    BufferStoreCounter counter;
+    counter.VisitStmt(body);
+    return counter.count_;
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    ++count_;
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+private:
+  size_t count_{0};
+};
+
 class FrontendBodyValidator : public StmtExprVisitor {
 public:
   void Validate(const Stmt &body) { VisitStmt(body); }
@@ -156,8 +173,16 @@ public:
       }
     }
     const bool tiles_scope = op->annotations.count(kTTTilesScope);
-    if (tiles_scope)
+    if (tiles_scope) {
+      const size_t stores = BufferStoreCounter::Count(op->body);
+      if (stores != 1) {
+        ThrowUnsupported(
+            "T.Tiles body must contain exactly one BufferStore assignment; "
+            "found " +
+            std::to_string(stores));
+      }
       ++tiles_depth_;
+    }
     StmtExprVisitor::VisitStmt_(op);
     if (tiles_scope)
       --tiles_depth_;

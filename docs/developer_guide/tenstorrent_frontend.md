@@ -7,6 +7,8 @@ valid only inside its source or destination iteration.
 
 `T.Tiles` retains its logical extents until `CanonicalizeTTElementwise`
 captures the complete expression, access maps, broadcast recipes, and effects.
+Each body must contain exactly one elementwise assignment; use a separate
+`T.Tiles` scope for each additional output or intermediate value.
 The annotations are a structural contract; missing scope/kind markers and
 storage descriptors containing deleted loop variables are rejected.
 The rank-2, 32-by-32 tiled contract is the baseline. Existing supported batch

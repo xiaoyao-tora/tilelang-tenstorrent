@@ -69,8 +69,8 @@ analysis does not partially mutate its input.
 
 ## Supported semantic subset
 
-Scopes must have static, positive domains with at least two axes, last two axes divisible by `(32, 32)`, one
-store, and shared or `shared.dyn` buffers with compatible tile metadata.
+Scopes must have static, positive domains with at least two axes, last two axes divisible by `(32, 32)`, exactly one
+`BufferStore` assignment, and shared or `shared.dyn` buffers with compatible tile metadata.
 Supported expressions include arithmetic, casts, compile-time scalar values,
 and supported pure unary calls. An output can also be read for an in-place
 elementwise update. Independent scopes and enclosing serial loops retain their
@@ -92,7 +92,8 @@ deferred to the future TTL consumer.
 Nested Tiles scopes, multiple stores, masks, predicates, dynamic shapes,
 transpose, offsets, gather/scatter, coordinate values in the RHS, unsupported
 buffer views or aliases, global stores, and side effects inside the elementwise
-scope fail explicitly. Copy, GEMM, reduction, and communication are separate
+scope fail explicitly. Use a separate `T.Tiles` scope for each additional
+assignment. Copy, GEMM, reduction, and communication are separate
 operations; they cannot be hidden inside an elementwise expression.
 
 ## Pass order and output stages

@@ -73,7 +73,7 @@ def test_transpose_fragment_exact_dtype_and_reentry(dtype, source_fragment):
     assert all(str(dfb.element_dtype) == dtype for dfb in mod.attrs["tt.dfb_table"])
 
 
-def multi_store_tiles():
+def separate_tiles_stores():
     @T.prim_func
     def main(
         A: T.Tensor((32, 32), "float32"),
@@ -87,16 +87,17 @@ def multi_store_tiles():
             g = T.alloc_fragment((32, 32), "float32")
             T.copy(A, a)
             T.copy(B, b)
-            for i, j in T.Tiles(g):
+            for i, j in T.Tiles(f):
                 f[i, j] = a[i, j] + b[i, j]
+            for i, j in T.Tiles(g):
                 g[i, j] = f[i, j] * T.float32(2)
             T.copy(g, C)
 
     return main
 
 
-def test_multi_store_tiles_preserves_ordered_fragment_values():
-    mod = lower(multi_store_tiles())
+def test_separate_tiles_stores_preserve_ordered_fragment_values():
+    mod = lower(separate_tiles_stores())
     rng = np.random.default_rng(19)
     a = rng.normal(size=(32, 32)).astype("float32")
     b = rng.normal(size=(32, 32)).astype("float32")

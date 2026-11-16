@@ -125,15 +125,11 @@ struct Access {
   bool read{false};
   bool write{false};
 };
-struct StorePlan {
-  BufferStore store;
-  std::vector<Access> accesses;
-  Span span;
-};
 struct ScopePlan {
   Array<Var> variables;
   Array<PrimExpr> domain;
-  std::vector<StorePlan> stores;
+  BufferStore store;
+  std::vector<Access> accesses;
   Span span;
 };
 
@@ -228,35 +224,21 @@ public:
     for (const PrimExpr &extent : plan.domain)
       Require(Static(extent, "logical domain") > 0,
               "logical domain must be positive");
-    Array<Stmt> statements;
-    if (const auto *sequence = body.as<SeqStmtNode>()) {
-      statements = sequence->seq;
-    } else {
-      statements.push_back(body);
-    }
-    Require(!statements.empty(), "scope body must contain a BufferStore");
-    for (const Stmt &statement : statements) {
-      const auto *store = statement.as<BufferStoreNode>();
-      Require(store != nullptr,
-              "scope body must contain only a flat sequence of BufferStore "
-              "statements; nested scopes, predicates and side effects are "
-              "unsupported");
-      StorePlan operation;
-      operation.store = ffi::GetRef<BufferStore>(store);
-      operation.span = store->span.defined() ? store->span : plan.span;
-      Require(!store->predicate.has_value(), "store predicate is unsupported");
-      Require(store->value.dtype() == store->buffer->dtype,
-              "store expression dtype mismatch");
-      AnalyzeExpression(plan, &operation, store->value);
-      RecordAccess(plan, &operation, store->buffer, store->indices, false,
-                   store->span);
-      // Storage metadata belongs to the actual effects, never to the Buffer
-      // that merely supplied the frontend domain shape.
-      for (const Access &access : operation.accesses)
-        ValidateBuffer(access.buffer, access.axes, plan.domain);
-      plan.stores.push_back(std::move(operation));
-    }
-    ValidateStoreSequence(plan);
+    const auto *store = body.as<BufferStoreNode>();
+    Require(store != nullptr,
+            "T.Tiles body must contain exactly one BufferStore assignment; "
+            "nested scopes, predicates, side effects and multiple assignments "
+            "are unsupported");
+    plan.store = ffi::GetRef<BufferStore>(store);
+    Require(!store->predicate.has_value(), "store predicate is unsupported");
+    Require(store->value.dtype() == store->buffer->dtype,
+            "store expression dtype mismatch");
+    AnalyzeExpression(plan, store->value);
+    RecordAccess(plan, store->buffer, store->indices, false, store->span);
+    // Storage metadata belongs to the actual effects, never to the Buffer
+    // that merely supplied the frontend domain shape.
+    for (const Access &access : plan.accesses)
+      ValidateBuffer(access.buffer, access.axes, plan.domain);
     return plan;
   }
 
@@ -350,32 +332,8 @@ private:
     });
   }
 
-  void ValidateStoreSequence(const ScopePlan &plan) {
-    std::unordered_map<Var, size_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
-        outputs;
-    for (size_t index = 0; index < plan.stores.size(); ++index) {
-      const Buffer &output = plan.stores[index].store->buffer;
-      Require(outputs.emplace(output->data, index).second,
-              "buffer '" + std::string(output->name) +
-                  "' may be written only once in one T.Tiles scope");
-    }
-    for (const StorePlan &operation : plan.stores) {
-      for (const Access &access : operation.accesses) {
-        if (!access.read || !outputs.count(access.buffer->data))
-          continue;
-        for (size_t axis = 0; axis < access.axes.size(); ++axis) {
-          Require(access.axes[axis]->value == static_cast<int64_t>(axis),
-                  "buffer '" + std::string(access.buffer->name) +
-                      "' is written in the same T.Tiles scope and must be "
-                      "read at matching logical coordinates");
-        }
-      }
-    }
-  }
-
-  void RecordAccess(const ScopePlan &plan, StorePlan *operation,
-                    const Buffer &buffer, const Array<PrimExpr> &indices,
-                    bool read, const Span &) {
+  void RecordAccess(ScopePlan &plan, const Buffer &buffer,
+                    const Array<PrimExpr> &indices, bool read, const Span &) {
     Require(indices.size() == plan.domain.size(),
             "buffer access rank must match logical domain");
     Array<Integer> axes;
@@ -389,7 +347,7 @@ private:
         Reject("access indices in buffer '" + std::string(buffer->name) +
                "' must be identity or zero-axis broadcast in Phase 1");
     }
-    for (const Access &access : operation->accesses) {
+    for (const Access &access : plan.accesses) {
       if (!access.buffer->data.same_as(buffer->data) || access.read != read)
         continue;
       Require(access.buffer.same_as(buffer),
@@ -400,15 +358,13 @@ private:
                   "' through different logical regions");
       return;
     }
-    operation->accesses.push_back({buffer, axes, read, !read});
+    plan.accesses.push_back({buffer, axes, read, !read});
   }
 
-  void AnalyzeExpression(const ScopePlan &plan, StorePlan *operation,
-                         const PrimExpr &expr) {
+  void AnalyzeExpression(ScopePlan &plan, const PrimExpr &expr) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
       Require(!load->predicate.has_value(), "load predicate is unsupported");
-      RecordAccess(plan, operation, load->buffer, load->indices, true,
-                   load->span);
+      RecordAccess(plan, load->buffer, load->indices, true, load->span);
       return;
     }
     if (expr.as<IntImmNode>() || expr.as<FloatImmNode>())
@@ -422,13 +378,13 @@ private:
     if (const auto *cast = expr.as<CastNode>()) {
       Require(cast->annotations.empty(),
               "Cast annotations have no supported template schema");
-      AnalyzeExpression(plan, operation, cast->value);
+      AnalyzeExpression(plan, cast->value);
       return;
     }
 #define TT_BINARY(Node)                                                        \
   if (const auto *binary = expr.as<Node>()) {                                  \
-    AnalyzeExpression(plan, operation, binary->a);                             \
-    AnalyzeExpression(plan, operation, binary->b);                             \
+    AnalyzeExpression(plan, binary->a);                                        \
+    AnalyzeExpression(plan, binary->b);                                        \
     return;                                                                    \
   }
     TT_BINARY(AddNode)
@@ -447,16 +403,16 @@ private:
     TT_BINARY(OrNode)
 #undef TT_BINARY
     if (const auto *logical_not = expr.as<NotNode>()) {
-      AnalyzeExpression(plan, operation, logical_not->a);
+      AnalyzeExpression(plan, logical_not->a);
       return;
     }
     if (const auto *select = expr.as<SelectNode>()) {
       Require(select->condition.dtype().is_bool() &&
                   select->true_value.dtype() == select->false_value.dtype(),
               "Select requires a Boolean condition and equal arm dtypes");
-      AnalyzeExpression(plan, operation, select->condition);
-      AnalyzeExpression(plan, operation, select->true_value);
-      AnalyzeExpression(plan, operation, select->false_value);
+      AnalyzeExpression(plan, select->condition);
+      AnalyzeExpression(plan, select->true_value);
+      AnalyzeExpression(plan, select->false_value);
       return;
     }
     if (const auto *call = expr.as<CallNode>()) {
@@ -479,7 +435,7 @@ private:
                   effects[ffi::GetRef<Op>(op)]->value ==
                       static_cast<int>(CallEffectKind::kPure),
               "Call must be pure");
-      AnalyzeExpression(plan, operation, call->args[0]);
+      AnalyzeExpression(plan, call->args[0]);
       return;
     }
     Reject("unsupported Phase 1 expression; loop variables cannot be numeric "
@@ -516,11 +472,10 @@ private:
   }
 };
 
-SBlockRealize ApplyStorePlan(const ScopePlan &plan,
-                             const StorePlan &operation) {
+SBlockRealize ApplyPlan(const ScopePlan &plan) {
   Array<BufferRegion> reads, writes;
   ValueKinds value_kinds;
-  for (const Access &access : operation.accesses) {
+  for (const Access &access : plan.accesses) {
     Array<Range> ranges;
     for (size_t axis = 0; axis < plan.domain.size(); ++axis) {
       PrimExpr extent = access.axes[axis]->value < 0
@@ -553,19 +508,9 @@ SBlockRealize ApplyStorePlan(const ScopePlan &plan,
       {kTTIteratorTypes, iterator_types},
       {kTTValueKinds, value_kinds}};
   TemplateBuilder builder;
-  SBlock block({}, reads, writes, "tl.tt.elementwise", builder(operation.store),
-               std::nullopt, {}, {}, annotations, operation.span);
-  return SBlockRealize({}, const_true(), block, operation.span);
-}
-
-Stmt ApplyPlan(const ScopePlan &plan) {
-  Array<Stmt> operations;
-  for (const StorePlan &operation : plan.stores)
-    operations.push_back(ApplyStorePlan(plan, operation));
-  Require(!operations.empty(), "scope plan must contain a BufferStore");
-  if (operations.size() == 1)
-    return operations[0];
-  return SeqStmt(operations, plan.span);
+  SBlock block({}, reads, writes, "tl.tt.elementwise", builder(plan.store),
+               std::nullopt, {}, {}, annotations, plan.span);
+  return SBlockRealize({}, const_true(), block, plan.span);
 }
 
 Stmt MergeComputeBranch(const IfThenElse &branch,
@@ -827,10 +772,8 @@ public:
                  domain.value()[axis], ForKind::kParallel, body);
     }
     ScopeAnalyzer analyzer(allocation_, scalar_parameters_);
-    ScopePlan plan = analyzer.Analyze(Downcast<For>(body), false);
-    Require(plan.stores.size() == 1,
-            "one structured elementwise block must contain one output store");
-    SBlock expected = ApplyStorePlan(plan, plan.stores[0])->block;
+    SBlock expected =
+        ApplyPlan(analyzer.Analyze(Downcast<For>(body), false))->block;
     Require(ffi::StructuralEqual()(op->reads, expected->reads),
             "structured elementwise read regions disagree with expression");
     Require(ffi::StructuralEqual()(op->writes, expected->writes),

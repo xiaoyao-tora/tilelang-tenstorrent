@@ -177,24 +177,27 @@ def test_compound_expression_and_repeated_loads():
     assert _effects_by_name(block.reads) == {"A": [64, 64], "B": [64, 64]}
 
 
-def test_multiple_stores_form_ordered_single_output_blocks():
+def test_frontend_rejects_multiple_stores_in_one_tiles_scope():
+    @T.prim_func
+    def main(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "float32")):
+        with T.Kernel(1, 1, threads=1):
+            a = T.alloc_shared((32, 32), "float32")
+            c = T.alloc_shared((32, 32), "float32")
+            T.copy(A, a)
+            for i, j in T.Tiles(c):
+                c[i, j] = a[i, j] + T.float32(1)
+                a[i, j] = c[i, j] * T.float32(2)
+            T.copy(c, C)
+
+    mod = tirx.transform.BindTarget(tvm.target.Target(TARGET))(tvm.IRModule({"main": main}))
+    _reject_frontend(mod, "exactly one BufferStore assignment; found 2")
+
+
+def test_canonicalizer_defensively_rejects_multiple_stores_atomically():
     def body(a, b, c, ij, store):
         return tirx.SeqStmt([store, tirx.BufferStore(a, c[tuple(ij)] * b[0, ij[1]], ij)])
 
-    mod = _canonicalize(_module(body=body))
-    root_body = mod["main"].body.block.body
-    assert isinstance(root_body, tirx.SeqStmt)
-    assert len(root_body.seq) == 2
-    blocks = [statement.block for statement in root_body.seq]
-    assert all(isinstance(statement, tirx.SBlockRealize) for statement in root_body.seq)
-    assert [block.writes[0].buffer.name for block in blocks] == ["C", "A"]
-    assert [_effects_by_name(block.reads) for block in blocks] == [
-        {"A": [64, 64], "B": [64, 64]},
-        {"C": [64, 64], "B": [1, 64]},
-    ]
-    assert all(len(block.writes) == 1 for block in blocks)
-    assert not _nodes(mod["main"], tirx.For)
-    transform.VerifyTTComputeBlocks()(mod)
+    _reject(_module(body=body), "exactly one BufferStore assignment")
 
 
 @pytest.mark.parametrize("kind", ["constant", "cast", "exp", "inplace"])
@@ -396,20 +399,6 @@ def test_reject_unsupported_scope_body(kind):
         return tirx.SeqStmt([tirx.Evaluate(value), store])
 
     _reject(_module(body=body), "[Ss]tore|body|[Nn]ested|scope|unsupported|Phase 1")
-
-
-@pytest.mark.parametrize("kind", ["repeated_output", "broadcast_dependency"])
-def test_reject_unsafe_multiple_store_dependencies_atomically(kind):
-    def body(a, b, c, ij, store):
-        if kind == "repeated_output":
-            second = tirx.BufferStore(c, c[tuple(ij)] * a[tuple(ij)], ij)
-        else:
-            first = tirx.BufferStore(c, a[0, ij[1]] + b[tuple(ij)], ij)
-            second = tirx.BufferStore(a, b[tuple(ij)], ij)
-            return tirx.SeqStmt([first, second])
-        return tirx.SeqStmt([store, second])
-
-    _reject(_module(body=body), "written only once|matching logical coordinates")
 
 
 @pytest.mark.parametrize("kind", ["load", "store"])
