@@ -127,8 +127,10 @@ that distinction by supplying defaults too early.
 
 `LegalizeTenstorrentTileOps` consumes verified structured operations into explicit
 computation calls with scalar expression DAGs, access maps, shapes and dtypes.
-It preserves the classic Add operation for compatible v1 programs and uses the
-[Phase 4 Device contract](tenstorrent_phase4_lower.md) for general computation.
+All supported elementwise expressions use the generic `tl.tt.tile_compute`
+contract described by the
+[Phase 4 Device contract](tenstorrent_phase4_lower.md); the active pipeline has
+no Add-specific operation or formation path.
 
 Every complete pipeline invocation continues through:
 
@@ -139,12 +141,22 @@ InferTenstorrentComputeRequirements
 VerifyTenstorrentDeviceIR
 ```
 
+Pass 11 requires `tt.topology_normalized=1`, including single-Core and empty
+programs; direct callers must run `NormalizeTenstorrentTopology` first. There
+is no legacy Add/no-op formation fallback. Supported operations all use the
+stream-oriented shared-grid planner. Before planning, formation defensively
+checks actual operation calls, compute kinds, and nested scalar DAGs, including
+dtype and unary-call variants. Its scalar node/unary support set is shared with
+the Device verifier in `compute_support.h`; shape, broadcast access maps,
+dependencies and resources remain subject to planner and Device validation.
+
 `tilelang.tenstorrent.lower_tenstorrent_ir(mod, target)` returns verified Device
 IR. A computation without a complete Device consumer raises
 `NotImplementedError` in legalization, layout inference, formation, or compute
 requirement inference. `VerifyTTStructuredDataflow` checks definite
 initialization and region bounds before those capability checks; uninitialized
-reads, malformed metadata and failed semantic proofs raise `ValueError`.
+reads, malformed metadata and failed semantic proofs raise `ValueError`. This
+is a Lower-stage contract, not a promise of TTL codegen or hardware support.
 
 Clients needing capture alone invoke the capture and structured verifier passes
 directly. Complete lowering accepts only the original frontend module;
@@ -161,8 +173,8 @@ describes the new Device schema and narrower TTL emission boundary.
 
 The target tests cover both frontend forms, canonical effects and geometry,
 broadcasts, compound expressions, idempotency, malformed contracts, and
-pipeline stages. Device IR tests retain descriptor and instruction-protocol
-checks for the existing Add consumer.
+pipeline stages. Device IR tests cover descriptor, resource, lifecycle,
+communication and instruction-protocol contracts for generic compute consumers.
 
 Numerical evaluation of structured templates in tests checks logical indexing
 and expression semantics on the CPU. It does not validate BF16 device rounding,

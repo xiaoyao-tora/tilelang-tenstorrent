@@ -9,6 +9,7 @@
  */
 #include "verify_device_ir.h"
 #include "compact_device_program.h"
+#include "compute_support.h"
 #include "device_table_compaction.h"
 #include "infer_compute_requirements.h"
 
@@ -1402,17 +1403,7 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
                   SupportedComputeDType(expr.value().dtype()) ||
                   (boolean_node && expr.value().dtype() == DataType::Bool()),
               "Device expression has unsupported intermediate dtype");
-        Check(bound_variable || object.as<IntImmNode>() ||
-                  object.as<FloatImmNode>() || object.as<CastNode>() ||
-                  object.as<CallNode>() || object.as<AddNode>() ||
-                  object.as<SubNode>() || object.as<MulNode>() ||
-                  object.as<DivNode>() || object.as<MinNode>() ||
-                  object.as<MaxNode>() || object.as<EQNode>() ||
-                  object.as<NENode>() || object.as<LTNode>() ||
-                  object.as<LENode>() || object.as<GTNode>() ||
-                  object.as<GENode>() || object.as<AndNode>() ||
-                  object.as<OrNode>() || object.as<NotNode>() ||
-                  object.as<SelectNode>(),
+        Check(bound_variable || IsSupportedComputeNode(expr.value()),
               "Device expression contains an unsupported expression node");
         if (const auto *select = object.as<SelectNode>())
           Check(select->condition.dtype() == DataType::Bool() &&
@@ -1519,12 +1510,7 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
               node->args.size() == 1 && node->args[0].dtype() == node->dtype,
               "Device unary operation requires one operand of the same dtype");
           const std::string name = operation->name;
-          Check(name == "tirx.exp" || name == "tirx.log" ||
-                    name == "tirx.sqrt" || name == "tirx.tanh" ||
-                    name == "tirx.rsqrt" || name == "tirx.floor" ||
-                    name == "tirx.ceil" || name == "tirx.exp2" ||
-                    name == "tirx.log2" || name == "tirx.sin" ||
-                    name == "tirx.cos" || name == "tirx.fabs",
+          Check(IsSupportedComputeUnary(name),
                 "Device expression contains unsupported scalar operation " +
                     name);
         }

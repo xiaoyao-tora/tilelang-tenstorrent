@@ -12,6 +12,7 @@
 #include "../../op/utils.h"
 #include "../ir/device_ir.h"
 #include "../op/builtin.h"
+#include "compute_support.h"
 #include "device_metadata_interner.h"
 #include "device_statement_compaction.h"
 #include "device_table_compaction.h"
@@ -4921,6 +4922,90 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                input->global_infos)));
 }
 
+class FormationExpressionVerifier : public ExprVisitor {
+public:
+  void VisitExpr(const PrimExpr &expr) final {
+    if (!expr.as<BufferLoadNode>() && !expr.as<VarNode>() &&
+        !IsSupportedComputeNode(expr))
+      ThrowUnsupported("compute expression node " +
+                       std::string(expr->GetTypeKey()));
+    if (!expr.as<IntImmNode>() && !expr.as<VarNode>() &&
+        expr.dtype() != DataType::BFloat(16) &&
+        expr.dtype() != DataType::Float(32) && expr.dtype() != DataType::Bool())
+      ThrowUnsupported(
+          "compute expression requires scalar BF16/FP32 values or predicates");
+    ExprVisitor::VisitExpr(expr);
+  }
+  void VisitExpr_(const BufferLoadNode *op) final {
+    // Coordinates are access metadata, not arithmetic in the scalar DAG.
+  }
+  void VisitExpr_(const CastNode *op) final {
+    if (!op->annotations.empty() || op->value.dtype() == DataType::Bool())
+      ThrowUnsupported("compute Cast annotations or boolean numeric cast");
+    ExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const CallNode *op) final {
+    const auto *name = op->op.as<OpNode>();
+    if (!name || (!op->op.same_as(compute_broadcast()) &&
+                  !IsSupportedComputeUnary(name->name)))
+      ThrowUnsupported("compute scalar operation " +
+                       (name ? std::string(name->name) : "external call"));
+    if (!op->annotations.empty())
+      ThrowUnsupported("compute scalar Call annotations");
+    if (!op->op.same_as(compute_broadcast()) &&
+        (op->args.size() != 1 || op->args[0].dtype() != op->dtype))
+      ThrowUnsupported(
+          "compute unary operation requires one operand of the same dtype");
+    ExprVisitor::VisitExpr_(op);
+  }
+};
+
+void VerifyFormationOperations(const Stmt &body) {
+  PostOrderVisit(body, [](const ffi::ObjectRef &object) {
+    const auto *evaluate = object.as<EvaluateNode>();
+    if (!evaluate || is_zero(evaluate->value))
+      return;
+    const auto *node = evaluate->value.as<CallNode>();
+    if (!node)
+      ThrowUnsupported("non-call Evaluate in compute dataflow");
+    Call call = ffi::GetRef<Call>(node);
+    if (call->op.same_as(tile_compute())) {
+      auto kind_attr = call->annotations.Get("tt.compute_kind");
+      const auto *kind = kind_attr.has_value()
+                             ? kind_attr.value().as<StringImmNode>()
+                             : nullptr;
+      if (!kind)
+        ThrowMalformed("tile_compute has no compute kind");
+      if (kind->value != "elementwise" && kind->value != "fill" &&
+          kind->value != "typecast" && kind->value != "copy" &&
+          kind->value != "transpose" && kind->value != "gemm" &&
+          kind->value != "reduce" && kind->value != "accumulator_init" &&
+          kind->value != "gemm_update" &&
+          kind->value != "accumulator_materialize")
+        ThrowUnsupported("compute kind " + std::string(kind->value));
+      auto expression = call->annotations.Get("tt.expression");
+      if (expression.has_value()) {
+        auto expr = expression.value().as<PrimExpr>();
+        if (!expr.has_value())
+          ThrowMalformed("tile_compute has invalid expression");
+        FormationExpressionVerifier()(expr.value());
+      } else if (kind->value == "elementwise" || kind->value == "fill" ||
+                 kind->value == "typecast") {
+        ThrowMalformed("scalar tile_compute has no expression");
+      }
+    } else if (!call->op.same_as(Copy::Get()) &&
+               !call->op.same_as(transfer()) &&
+               !call->op.same_as(all_gather()) &&
+               !call->op.same_as(all_reduce()) &&
+               !call->op.same_as(pipe_send()) &&
+               !call->op.same_as(pipe_recv())) {
+      const auto *op = call->op.as<OpNode>();
+      ThrowUnsupported("operation " +
+                       (op ? std::string(op->name) : "external call"));
+    }
+  });
+}
+
 IRModule FormProgram(const IRModule &input) {
   ffi::Optional<GlobalVar> frontend_global;
   ffi::Optional<PrimFunc> frontend_func;
@@ -4975,9 +5060,13 @@ IRModule FormProgram(const IRModule &input) {
   }
 
   Stmt kernel_body = StripLogicalCoreLoops(frontend, launch_grid.value());
-  if (!frontend->GetAttr<Integer>("tt.topology_normalized").has_value())
+  auto topology_normalized =
+      frontend->GetAttr<Integer>("tt.topology_normalized");
+  if (!topology_normalized.has_value() ||
+      topology_normalized.value()->value != 1)
     ThrowMalformed(
         "input requires NormalizeTenstorrentTopology before formation");
+  VerifyFormationOperations(kernel_body);
   For xloop = Downcast<For>(frontend->body);
   For yloop = Downcast<For>(xloop->body);
   return FormMulticoreProgram(
