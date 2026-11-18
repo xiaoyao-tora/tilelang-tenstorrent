@@ -16,6 +16,7 @@
 #include "device_metadata_interner.h"
 #include "device_statement_compaction.h"
 #include "device_table_compaction.h"
+#include "dtype_support.h"
 #include "verify_device_ir.h"
 
 #include <tvm/arith/analyzer.h>
@@ -4929,11 +4930,18 @@ public:
         !IsSupportedComputeNode(expr))
       ThrowUnsupported("compute expression node " +
                        std::string(expr->GetTypeKey()));
-    if (!expr.as<IntImmNode>() && !expr.as<VarNode>() &&
-        expr.dtype() != DataType::BFloat(16) &&
-        expr.dtype() != DataType::Float(32) && expr.dtype() != DataType::Bool())
+    const bool leaf_load =
+        expr.as<BufferLoadNode>() && IsSupportedStorageDType(expr.dtype());
+    if (!expr.as<IntImmNode>() && !expr.as<VarNode>() && !leaf_load &&
+        !IsSupportedExpressionDType(expr.dtype()) &&
+        expr.dtype() != DataType::Bool())
       ThrowUnsupported(
-          "compute expression requires scalar BF16/FP32 values or predicates");
+          "compute expression requires scalar BF16/FP32 or INT32/UINT32/UINT16 "
+          "values or predicates: " +
+          DTypeRejectionReason(expr.dtype()));
+    if (!expr.as<IntImmNode>() && !expr.as<VarNode>() && !leaf_load &&
+        IsIntegerDType(expr.dtype()) && !IsSupportedIntegerComputeNode(expr))
+      ThrowUnsupported(UnsupportedIntegerOperatorMessage("compute expression"));
     ExprVisitor::VisitExpr(expr);
   }
   void VisitExpr_(const BufferLoadNode *op) final {

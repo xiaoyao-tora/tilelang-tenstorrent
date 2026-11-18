@@ -11,6 +11,7 @@
 #include "compact_device_program.h"
 #include "compute_support.h"
 #include "device_table_compaction.h"
+#include "dtype_support.h"
 #include "infer_compute_requirements.h"
 
 #include <tvm/arith/analyzer.h>
@@ -1236,8 +1237,19 @@ ffi::Array<PrimExpr> ComputeShape(const Call &call, const char *key) {
   return CheckedShape(value.value(), key);
 }
 
+// Float compute values: comparisons, selects and accumulators stay float-only.
 bool SupportedComputeDType(DataType dtype) {
-  return dtype == DataType::BFloat(16) || dtype == DataType::Float(32);
+  return IsSupportedFloatComputeDType(dtype);
+}
+
+// A structured expression may carry an integer scalar DAG.
+bool SupportedExpressionDType(DataType dtype) {
+  return IsSupportedExpressionDType(dtype);
+}
+
+// Tensor and DFB element dtypes may be integer even when compute is float-only.
+bool SupportedStorageDType(DataType dtype) {
+  return IsSupportedStorageDType(dtype);
 }
 
 void VerifyTileGrid(const ffi::Array<PrimExpr> &shape,
@@ -1400,11 +1412,15 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
             object.as<LENode>() || object.as<GTNode>() || object.as<GENode>() ||
             object.as<AndNode>() || object.as<OrNode>() || object.as<NotNode>();
         Check(bound_variable || object.as<IntImmNode>() ||
-                  SupportedComputeDType(expr.value().dtype()) ||
+                  SupportedExpressionDType(expr.value().dtype()) ||
                   (boolean_node && expr.value().dtype() == DataType::Bool()),
               "Device expression has unsupported intermediate dtype");
         Check(bound_variable || IsSupportedComputeNode(expr.value()),
               "Device expression contains an unsupported expression node");
+        if (IsIntegerDType(expr.value().dtype()))
+          Check(bound_variable || IsSupportedDeviceIntegerComputeNode(expr.value()),
+                "Device integer expression only supports add, sub, mul and "
+                "broadcast");
         if (const auto *select = object.as<SelectNode>())
           Check(select->condition.dtype() == DataType::Bool() &&
                     SupportedComputeDType(select->dtype) &&
@@ -2772,7 +2788,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
   std::unordered_map<int64_t, int> effects;
   std::unordered_map<int64_t, ffi::Array<PrimExpr>> logical_shapes;
   for (const auto &[id, tensor] : tensors) {
-    Check(SupportedComputeDType(tensor->dtype),
+    Check(SupportedStorageDType(tensor->dtype),
           "Phase 4 Tensor dtype unsupported");
     Check(tensor->tile_shape.size() == 2 &&
               RequireStaticInteger(tensor->tile_shape[0], "Tensor tile rows") ==
@@ -2802,7 +2818,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
                    "Tensor " + std::to_string(id));
   }
   for (const auto &[id, dfb] : dfbs) {
-    Check(SupportedComputeDType(dfb->element_dtype),
+    Check(SupportedStorageDType(dfb->element_dtype),
           "Phase 4 DFB dtype unsupported");
     int64_t capacity =
         RequireStaticInteger(dfb->block_count, "DFB block count");
@@ -3520,7 +3536,7 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     CoreKey core = CoreOf(dfb->producer_domain);
     Check(core == CoreOf(dfb->consumer_domain),
           "Phase 6 DFB producer/consumer owner Core mismatch");
-    Check(SupportedComputeDType(dfb->element_dtype),
+    Check(SupportedStorageDType(dfb->element_dtype),
           "Phase 6 DFB dtype unsupported");
     Check(dfb->tile_shape.size() == 2 &&
               RequireStaticInteger(dfb->tile_shape[0], "tile rows") == 32 &&
@@ -3568,7 +3584,7 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
                 "physical allocation overhead is not included");
   }
   for (const auto &[id, tensor] : tensors) {
-    Check(SupportedComputeDType(tensor->dtype),
+    Check(SupportedStorageDType(tensor->dtype),
           "Phase 6 Tensor dtype unsupported");
     Check(tensor->tile_shape.size() == 2 &&
               RequireStaticInteger(tensor->tile_shape[0], "Tensor tile rows") ==

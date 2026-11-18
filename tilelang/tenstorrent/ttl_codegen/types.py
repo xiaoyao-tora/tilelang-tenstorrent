@@ -22,6 +22,9 @@ class TTLTypeConverter:
         data_types = {
             "bfloat16": self.bindings.ttcore.DataType.BFloat16,
             "float32": self.bindings.ttcore.DataType.Float32,
+            "int32": self.bindings.ttcore.DataType.Int32,
+            "uint32": self.bindings.ttcore.DataType.UInt32,
+            "uint16": self.bindings.ttcore.DataType.UInt16,
         }
         dtype_name = str(dtype)
         if dtype_name not in data_types:

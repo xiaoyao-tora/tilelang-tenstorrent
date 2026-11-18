@@ -182,13 +182,32 @@ def test_basic_layout_infers_32x32_bfloat16_metadata_and_round_trips():
 
 def test_layout_rejects_unsupported_dtype():
     @T.prim_func
-    def int_tensor(A: T.Tensor((32, 32), T.int32)):
+    def half_tensor(A: T.Tensor((32, 32), T.float16)):
         with T.Kernel(1, 1, threads=1):
-            tmp = T.alloc_shared((32, 32), T.int32)
+            tmp = T.alloc_shared((32, 32), T.float16)
             T.copy(A, tmp)
 
-    mod = tirx.transform.BindTarget(TARGET)(tvm.IRModule({"int_tensor": int_tensor}))
+    mod = tirx.transform.BindTarget(TARGET)(tvm.IRModule({"half_tensor": half_tensor}))
     mod = _apply("NormalizeTenstorrentLaunch", mod)
     mod = _apply("NormalizeTenstorrentBufferMetadata", mod)
-    with pytest.raises(NotImplementedError, match="supports bfloat16 and float32"):
+    with pytest.raises(NotImplementedError, match="no FLOAT16 tensor type"):
         _apply("InferTenstorrentTensorLayout", mod)
+
+
+def test_layout_accepts_integer_storage_dtypes():
+    for dtype in ("int32", "uint32", "uint16"):
+
+        @T.prim_func
+        def int_tensor(A: T.Tensor((32, 32), dtype), C: T.Tensor((32, 32), dtype)):
+            with T.Kernel(1, 1, threads=1):
+                tmp = T.alloc_shared((32, 32), dtype, annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 2})
+                T.copy(A, tmp)
+                T.copy(tmp, C)
+
+        mod = tvm.IRModule({"int_tensor": int_tensor})
+        mod = tirx.transform.BindTarget(TARGET)(mod)
+        mod = _apply("NormalizeTenstorrentLaunch", mod)
+        mod = _apply("NormalizeTenstorrentBufferMetadata", mod)
+        mod = _apply("InferTenstorrentTensorLayout", mod)
+        layouts = mod["int_tensor"].attrs["tt.buffer_metadata_table"]
+        assert {str(entry.buffer.dtype) for entry in layouts} == {dtype}
