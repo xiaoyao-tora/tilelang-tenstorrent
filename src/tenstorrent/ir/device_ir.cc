@@ -53,7 +53,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   RegisterMetadataPrinter<ComputeValueDescriptor>();
   RegisterMetadataPrinter<ComputeRequirements>();
   RegisterMetadataPrinter<NormalizedTopologyDescriptor>();
-  RegisterMetadataPrinter<CommunicationDescriptor>();
   RegisterMetadataPrinter<DFBStorageGroupDescriptor>();
   RegisterMetadataPrinter<PipeTransferDescriptor>();
   RegisterMetadataPrinter<DeviceIRDescriptorFamily>();
@@ -100,47 +99,6 @@ void NormalizedTopologyDescriptorNode::RegisterReflection() {
       .def_ro("occurrence_extents",
               &NormalizedTopologyDescriptorNode::occurrence_extents)
       .def_ro("source_span", &NormalizedTopologyDescriptorNode::source_span);
-}
-
-CommunicationDescriptor::CommunicationDescriptor(
-    int64_t communication_id, ffi::String kind, ffi::String algorithm,
-    tirx::BufferRegion source_region, tirx::BufferRegion destination_region,
-    ffi::Array<PrimExpr> source_coord, ffi::Array<PrimExpr> group_begin,
-    ffi::Array<PrimExpr> group_end, PrimExpr parameter, ffi::String contract,
-    ffi::Array<PrimExpr> occurrence_extents, Span source_span) {
-  auto node = ffi::make_object<CommunicationDescriptorNode>();
-  node->communication_id = communication_id;
-  node->kind = std::move(kind);
-  node->algorithm = std::move(algorithm);
-  node->source_region = std::move(source_region);
-  node->destination_region = std::move(destination_region);
-  node->source_coord = std::move(source_coord);
-  node->group_begin = std::move(group_begin);
-  node->group_end = std::move(group_end);
-  node->parameter = std::move(parameter);
-  node->contract = std::move(contract);
-  node->occurrence_extents = std::move(occurrence_extents);
-  node->source_span = std::move(source_span);
-  data_ = std::move(node);
-}
-
-void CommunicationDescriptorNode::RegisterReflection() {
-  ffi::reflection::ObjectDef<CommunicationDescriptorNode>()
-      .def_ro("communication_id",
-              &CommunicationDescriptorNode::communication_id)
-      .def_ro("kind", &CommunicationDescriptorNode::kind)
-      .def_ro("algorithm", &CommunicationDescriptorNode::algorithm)
-      .def_ro("source_region", &CommunicationDescriptorNode::source_region)
-      .def_ro("destination_region",
-              &CommunicationDescriptorNode::destination_region)
-      .def_ro("source_coord", &CommunicationDescriptorNode::source_coord)
-      .def_ro("group_begin", &CommunicationDescriptorNode::group_begin)
-      .def_ro("group_end", &CommunicationDescriptorNode::group_end)
-      .def_ro("parameter", &CommunicationDescriptorNode::parameter)
-      .def_ro("contract", &CommunicationDescriptorNode::contract)
-      .def_ro("occurrence_extents",
-              &CommunicationDescriptorNode::occurrence_extents)
-      .def_ro("source_span", &CommunicationDescriptorNode::source_span);
 }
 
 bool IsSupportedAccumulatorDTypeTriple(DataType input, DataType accumulation,
@@ -482,20 +440,28 @@ void DFBStorageGroupDescriptorNode::RegisterReflection() {
       .def_ro("source_span", &DFBStorageGroupDescriptorNode::source_span);
 }
 
-PipeDescriptor::PipeDescriptor(int64_t pipe_net_id, int64_t communication_id,
-                               int64_t record_index, CoreCoord src_coord,
-                               CoreCoord dst_begin, CoreCoord dst_end,
-                               ffi::String contract, int64_t payload_dfb_id,
-                               Span source_span) {
+PipeDescriptor::PipeDescriptor(
+    int64_t pipe_net_id, int64_t record_index, CoreCoord src_coord,
+    CoreCoord dst_begin, CoreCoord dst_end, ffi::String contract,
+    ffi::String kind, ffi::String algorithm, PrimExpr parameter,
+    ffi::Array<PrimExpr> group_begin, ffi::Array<PrimExpr> group_end,
+    ffi::Array<PrimExpr> occurrence_extents, ffi::String payload_source_name,
+    int64_t payload_dfb_id, Span source_span) {
   ffi::ObjectPtr<PipeDescriptorNode> node =
       ffi::make_object<PipeDescriptorNode>();
   node->pipe_net_id = pipe_net_id;
-  node->communication_id = communication_id;
   node->record_index = record_index;
   node->src_coord = std::move(src_coord);
   node->dst_begin = std::move(dst_begin);
   node->dst_end = std::move(dst_end);
   node->contract = std::move(contract);
+  node->kind = std::move(kind);
+  node->algorithm = std::move(algorithm);
+  node->parameter = std::move(parameter);
+  node->group_begin = std::move(group_begin);
+  node->group_end = std::move(group_end);
+  node->occurrence_extents = std::move(occurrence_extents);
+  node->payload_source_name = std::move(payload_source_name);
   node->payload_dfb_id = payload_dfb_id;
   node->source_span = std::move(source_span);
   data_ = std::move(node);
@@ -505,12 +471,18 @@ void PipeDescriptorNode::RegisterReflection() {
   namespace refl = ffi::reflection;
   refl::ObjectDef<PipeDescriptorNode>()
       .def_ro("pipe_net_id", &PipeDescriptorNode::pipe_net_id)
-      .def_ro("communication_id", &PipeDescriptorNode::communication_id)
       .def_ro("record_index", &PipeDescriptorNode::record_index)
       .def_ro("src_coord", &PipeDescriptorNode::src_coord)
       .def_ro("dst_begin", &PipeDescriptorNode::dst_begin)
       .def_ro("dst_end", &PipeDescriptorNode::dst_end)
       .def_ro("contract", &PipeDescriptorNode::contract)
+      .def_ro("kind", &PipeDescriptorNode::kind)
+      .def_ro("algorithm", &PipeDescriptorNode::algorithm)
+      .def_ro("parameter", &PipeDescriptorNode::parameter)
+      .def_ro("group_begin", &PipeDescriptorNode::group_begin)
+      .def_ro("group_end", &PipeDescriptorNode::group_end)
+      .def_ro("occurrence_extents", &PipeDescriptorNode::occurrence_extents)
+      .def_ro("payload_source_name", &PipeDescriptorNode::payload_source_name)
       .def_ro("payload_dfb_id", &PipeDescriptorNode::payload_dfb_id)
       .def_ro("source_span", &PipeDescriptorNode::source_span);
 }
@@ -696,7 +668,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   OperationIdentityNode::RegisterReflection();
   TensorDescriptorNode::RegisterReflection();
   NormalizedTopologyDescriptorNode::RegisterReflection();
-  CommunicationDescriptorNode::RegisterReflection();
   DFBDescriptorNode::RegisterReflection();
   DFBStorageGroupDescriptorNode::RegisterReflection();
   PipeDescriptorNode::RegisterReflection();
@@ -745,22 +716,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(group_begin), std::move(group_end),
                  std::move(parameter), std::move(contract), std::move(guard),
                  std::move(occurrence_extents), std::move(source_span));
-           })
-      .def("tl.tenstorrent.CommunicationDescriptor",
-           [](int64_t communication_id, ffi::String kind, ffi::String algorithm,
-              tirx::BufferRegion source_region,
-              tirx::BufferRegion destination_region,
-              ffi::Array<PrimExpr> source_coord,
-              ffi::Array<PrimExpr> group_begin, ffi::Array<PrimExpr> group_end,
-              PrimExpr parameter, ffi::String contract,
-              ffi::Array<PrimExpr> occurrence_extents, Span source_span) {
-             return CommunicationDescriptor(
-                 communication_id, std::move(kind), std::move(algorithm),
-                 std::move(source_region), std::move(destination_region),
-                 std::move(source_coord), std::move(group_begin),
-                 std::move(group_end), std::move(parameter),
-                 std::move(contract), std::move(occurrence_extents),
-                 std::move(source_span));
            })
       .def("tl.tenstorrent.OperationIdentity",
            [](ffi::String operation_id, Span source_span) {
@@ -839,14 +794,22 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                                         std::move(accumulators));
            })
       .def("tl.tenstorrent.PipeDescriptor",
-           [](int64_t pipe_net_id, int64_t communication_id,
-              int64_t record_index, CoreCoord src_coord, CoreCoord dst_begin,
-              CoreCoord dst_end, ffi::String contract, int64_t payload_dfb_id,
+           [](int64_t pipe_net_id, int64_t record_index, CoreCoord src_coord,
+              CoreCoord dst_begin, CoreCoord dst_end, ffi::String contract,
+              ffi::String kind, ffi::String algorithm, PrimExpr parameter,
+              ffi::Array<PrimExpr> group_begin,
+              ffi::Array<PrimExpr> group_end,
+              ffi::Array<PrimExpr> occurrence_extents,
+              ffi::String payload_source_name, int64_t payload_dfb_id,
               Span source_span) {
-             return PipeDescriptor(pipe_net_id, communication_id, record_index,
-                                   std::move(src_coord), std::move(dst_begin),
-                                   std::move(dst_end), std::move(contract),
-                                   payload_dfb_id, std::move(source_span));
+             return PipeDescriptor(
+                 pipe_net_id, record_index, std::move(src_coord),
+                 std::move(dst_begin), std::move(dst_end),
+                 std::move(contract), std::move(kind), std::move(algorithm),
+                 std::move(parameter), std::move(group_begin),
+                 std::move(group_end), std::move(occurrence_extents),
+                 std::move(payload_source_name), payload_dfb_id,
+                 std::move(source_span));
            })
       .def("tl.tenstorrent.PipeTransferDescriptor",
            [](int64_t transfer_id, int64_t pipe_net_id,

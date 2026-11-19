@@ -14,7 +14,6 @@ class RecordResolutionError(NotImplementedError):
 @dataclass(frozen=True)
 class ResolvedPipeRecord:
     pipe_net_id: int
-    communication_id: int
     record_index: int
     source: tuple[int, int]
     destination_begin: tuple[int, int]
@@ -47,7 +46,6 @@ def resolve_transport_records(mod: IRModule) -> dict[int, tuple[ResolvedPipeReco
     records: dict[int, list[ResolvedPipeRecord]] = {}
     required = (
         "pipe_net_id",
-        "communication_id",
         "record_index",
         "source_x",
         "source_y",
@@ -72,7 +70,6 @@ def resolve_transport_records(mod: IRModule) -> dict[int, tuple[ResolvedPipeReco
             pipe_net = columns["pipe_net_id"][row]
             record = ResolvedPipeRecord(
                 pipe_net_id=pipe_net,
-                communication_id=columns["communication_id"][row],
                 record_index=columns["record_index"][row],
                 source=(columns["source_x"][row], columns["source_y"][row]),
                 destination_begin=(columns["destination_begin_x"][row], columns["destination_begin_y"][row]),
@@ -98,9 +95,6 @@ def resolve_transport_records(mod: IRModule) -> dict[int, tuple[ResolvedPipeReco
         indices = [entry.record_index for entry in ordered]
         if indices != list(range(len(indices))):
             raise RecordResolutionError(f"PipeNet {pipe_net} record indices are not dense")
-        communications = {entry.communication_id for entry in ordered}
-        if len(communications) != 1:
-            raise RecordResolutionError(f"PipeNet {pipe_net} has inconsistent parent communications")
         result[pipe_net] = tuple(ordered)
     return result
 

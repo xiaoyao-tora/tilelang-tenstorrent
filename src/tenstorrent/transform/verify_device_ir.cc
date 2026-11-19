@@ -593,14 +593,12 @@ void VerifyPipeTable(const ffi::Array<PipeDescriptor> &pipes,
   std::unordered_set<std::string> record_ids;
   std::unordered_map<int64_t, int64_t> next_record;
   std::unordered_map<int64_t, ffi::String> contracts;
-  std::unordered_map<int64_t, int64_t> communications;
+  std::unordered_map<int64_t, ffi::String> kinds;
   int64_t expected_pipe_net = 0;
   for (const PipeDescriptor &pipe : pipes) {
     const std::string label = "PipeNet " + std::to_string(pipe->pipe_net_id) +
                               " record " + std::to_string(pipe->record_index);
     Check(pipe->pipe_net_id >= 0, label + " has a negative pipe_net_id");
-    Check(pipe->communication_id >= 0,
-          label + " has a negative communication_id");
     Check(pipe->record_index >= 0, label + " has a negative record_index");
     const std::string record_id = std::to_string(pipe->pipe_net_id) + ":" +
                                   std::to_string(pipe->record_index);
@@ -614,10 +612,9 @@ void VerifyPipeTable(const ffi::Array<PipeDescriptor> &pipes,
           label + " is out of order; expected record_index " +
               std::to_string(expected));
     ++expected;
-    auto [communication, new_pipe_net] =
-        communications.emplace(pipe->pipe_net_id, pipe->communication_id);
-    Check(new_pipe_net || communication->second == pipe->communication_id,
-          label + " has inconsistent parent communication IDs");
+    auto [kind, kind_inserted] = kinds.emplace(pipe->pipe_net_id, pipe->kind);
+    Check(kind_inserted || kind->second == pipe->kind,
+          label + " mixes communication kinds in one PipeNet");
     VerifyCoord(pipe->src_coord, launch_grid, label + " src_coord");
     VerifyDomain(CoreDomain(pipe->dst_begin, pipe->dst_end), launch_grid,
                  label + " destination range");
@@ -3475,8 +3472,6 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     Check(records.count(record_key),
           "Pipe transfer references missing original record");
     const PipeDescriptor &record = records.at(record_key);
-    Check(transfer->communication_id == record->communication_id,
-          "Pipe transfer parent communication disagrees with original record");
     Check(transfer->occurrence >= 0 && (extended || transfer->occurrence == 0),
           "schema v4 supports one occurrence; schema v6 requires a nonnegative "
           "epoch");
@@ -4125,8 +4120,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       RequireModuleAttr<ffi::Array<DFBDescriptor>>(mod, kDFBTableAttr);
   ffi::Array<PipeDescriptor> transports =
       RequireModuleAttr<ffi::Array<PipeDescriptor>>(mod, "tt.transport_table");
-  auto communication = mod->GetAttr<ffi::Array<CommunicationDescriptor>>(
-      "tt.communication_table");
+  Check(!mod->attrs->dict.count("tt.communication_table"),
+        "current Device IR must not carry a communication table");
   ffi::Array<ffi::String> order =
       RequireModuleAttr<ffi::Array<ffi::String>>(mod, kKernelOrderAttr);
   Check(order.size() == 3 && mod->functions.size() == 3,
@@ -4210,7 +4205,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   std::map<std::pair<int64_t, int64_t>, PipeDescriptor> transport_records;
   for (const PipeDescriptor &transport : transports) {
     Check(transport.defined() && transport->pipe_net_id >= 0 &&
-              transport->communication_id >= 0 && transport->record_index >= 0,
+              transport->record_index >= 0,
           "transport descriptor has an invalid identity");
     VerifyCoord(transport->src_coord, launch_grid, "transport source");
     VerifyDomain(CoreDomain(transport->dst_begin, transport->dst_end),
@@ -4219,10 +4214,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
            transport->contract == "collective") &&
               dfb_table.count(transport->payload_dfb_id),
           "transport descriptor has an invalid contract or payload DFB");
-    Check(communication.has_value() &&
-              transport->communication_id <
-                  static_cast<int64_t>(communication.value().size()),
-          "transport descriptor references a missing parent communication");
     Check(transport_records
               .emplace(std::make_pair(transport->pipe_net_id,
                                       transport->record_index),
@@ -4280,7 +4271,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   using RecordEndpointKey = std::tuple<int64_t, int64_t, int64_t, int64_t>;
   std::map<RecordKey, int64_t> record_send_counts;
   std::map<RecordEndpointKey, int64_t> record_receive_counts;
-  std::map<std::pair<int64_t, std::string>, int64_t> local_communication_counts;
   bool raw_resource_operand = false;
   const DeviceResourceAliases *current_resource_aliases = nullptr;
   std::function<void(const Stmt &, std::vector<Call> *, std::vector<int64_t> *,
@@ -4849,12 +4839,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
         Check(work_group_id >= 0,
               "Device stream work group must be a nonnegative integer");
         auto role = block->annotations.Get("tt.communication_role");
-        auto communication_ids = block->annotations.Get("tt.communication_ids");
         auto pipe_net_ids = block->annotations.Get("tt.pipe_net_ids");
-        Check(role.has_value() == communication_ids.has_value() &&
-                  role.has_value() == pipe_net_ids.has_value(),
-              "Device communication role, communication IDs and PipeNet IDs "
-              "must coexist");
+        Check(role.has_value() == pipe_net_ids.has_value(),
+              "Device communication role and PipeNet IDs must coexist");
         if (role.has_value()) {
           auto role_string = role.value().as<ffi::String>();
           Check(role_string.has_value(),
@@ -4875,11 +4862,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             }
             return ids;
           };
-          std::set<int64_t> allowed_communications =
-              read_ids(communication_ids.value(), "Device communication IDs");
           std::set<int64_t> allowed_pipe_nets =
               read_ids(pipe_net_ids.value(), "Device PipeNet IDs");
-          std::set<int64_t> found_communications, found_pipe_nets;
+          std::set<int64_t> found_pipe_nets;
           bool found_pipe = false;
           PostOrderVisit(block->body, [&](const ffi::ObjectRef &nested) {
             const auto *call = nested.as<CallNode>();
@@ -4925,13 +4910,11 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               Check(transport != transport_records.end(),
                     "stream-work operation references a missing PipeNet");
               found_pipe_nets.insert(pipe_net);
-              found_communications.insert(transport->second->communication_id);
             }
           });
           Check(found_pipe,
                 "Device communication role region contains no Pipe operation");
-          Check(found_communications == allowed_communications &&
-                    found_pipe_nets == allowed_pipe_nets,
+          Check(found_pipe_nets == allowed_pipe_nets,
                 "Device communication block summaries disagree with their "
                 "Pipe record operations");
         }
@@ -5209,21 +5192,13 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             Check(site.has_value() && occurrence.has_value() &&
                       kind.has_value() && kind.value().as<StringImm>(),
                   "local communication operation has no semantic identity");
-            int64_t communication_id = Downcast<Integer>(site.value())->value;
-            Check(communication.has_value() && communication_id >= 0 &&
-                      communication_id <
-                          static_cast<int64_t>(communication.value().size()),
-                  "local communication operation references a missing "
-                  "communication");
+            int64_t communication_site = Downcast<Integer>(site.value())->value;
+            Check(communication_site >= 0,
+                  "local communication operation has a negative site");
             ffi::String kind_name = Downcast<StringImm>(kind.value())->value;
             Check((local_reduce && kind_name == "local_reduce") ||
                       (!local_reduce && kind_name == "local_copy"),
                   "local communication operation has the wrong semantic kind");
-            auto key = std::make_pair(communication_id, std::string(kind_name));
-            Check(local_communication_counts[key] <=
-                      std::numeric_limits<int64_t>::max() - dynamic_multiplier,
-                  "local communication multiplicity overflows");
-            local_communication_counts[key] += dynamic_multiplier;
           };
           for (size_t call_index = 0; call_index < calls.size(); ++call_index) {
             const Call &call = calls[call_index];
@@ -5681,127 +5656,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   for (const auto &[resource, dtype] : value_exports)
     compute_values.Export(resource, dtype);
 
-  if (communication.has_value()) {
-    int64_t expected_site = 0;
-    for (const CommunicationDescriptor &entry : communication.value()) {
-      Check(entry.defined() && entry->communication_id == expected_site++,
-            "communication site IDs must be dense and deterministic");
-      Check(entry->kind == "transfer" || entry->kind == "all_gather" ||
-                entry->kind == "all_reduce",
-            "unknown high-level communication kind");
-      Check(entry->source_region.defined() &&
-                entry->destination_region.defined() &&
-                entry->group_begin.size() == 2 && entry->group_end.size() == 2,
-            "communication descriptor is incomplete");
-      Check(!entry->algorithm.empty(),
-            "communication descriptor has no selected algorithm");
-      Check((entry->kind == "transfer" &&
-             (entry->algorithm == "direct_p2p" ||
-              entry->algorithm == "direct_multicast")) ||
-                (entry->kind == "all_gather" &&
-                 entry->algorithm == "direct_all_to_all") ||
-                (entry->kind == "all_reduce" &&
-                 entry->algorithm == "root0_left_fold_broadcast"),
-            "communication kind and selected algorithm disagree");
-    }
-  }
-  if (communication.has_value()) {
-    using TransferPair = std::tuple<int64_t, int64_t, int64_t, int64_t>;
-    for (const CommunicationDescriptor &entry : communication.value()) {
-      bool collective =
-          entry->kind == "all_gather" || entry->kind == "all_reduce";
-      int64_t bx = 0, by = 0, ex = launch_grid->x, ey = launch_grid->y;
-      if (collective) {
-        bx = RequireStaticInteger(entry->group_begin[0],
-                                  "communication group begin x");
-        by = RequireStaticInteger(entry->group_begin[1],
-                                  "communication group begin y");
-        ex = RequireStaticInteger(entry->group_end[0],
-                                  "communication group end x");
-        ey = RequireStaticInteger(entry->group_end[1],
-                                  "communication group end y");
-        Check(bx >= 0 && by >= 0 && bx < ex && by < ey &&
-                  ex <= launch_grid->x && ey <= launch_grid->y,
-              "communication group is outside the launch grid");
-      }
-      int64_t group_size =
-          CheckedProduct(ex - bx, ey - by, "communication group size");
-      int64_t occurrence_count = 1;
-      for (const PrimExpr &extent : entry->occurrence_extents)
-        occurrence_count = CheckedProduct(
-            occurrence_count,
-            RequireStaticInteger(extent, "communication occurrence extent"),
-            "communication occurrence count");
-      Check(occurrence_count > 0,
-            "communication occurrence domain must be nonempty");
-      std::set<TransferPair> actual;
-      bool has_transport = false;
-      for (const auto &[key, record] : transport_records) {
-        if (record->communication_id != entry->communication_id)
-          continue;
-        has_transport = true;
-        Check(record_send_counts[key] == occurrence_count,
-              "Pipe record send multiplicity disagrees with communication "
-              "occurrence extent");
-        CoreCoord source = record->src_coord;
-        for (int64_t dx = record->dst_begin->x; dx < record->dst_end->x; ++dx)
-          for (int64_t dy = record->dst_begin->y; dy < record->dst_end->y;
-               ++dy) {
-            bool loopback = dx == source->x && dy == source->y;
-            Check(!loopback || record->contract == "collective",
-                  "point-to-point Pipe record cannot loop back to its source");
-            Check(actual.insert({source->x, source->y, dx, dy}).second,
-                  "communication has a duplicate transport endpoint");
-            Check(record_receive_counts[{key.first, key.second, dx, dy}] ==
-                      occurrence_count,
-                  "Pipe record receive multiplicity disagrees with "
-                  "communication occurrence extent");
-          }
-      }
-      int64_t local_copies =
-          local_communication_counts[{entry->communication_id, "local_copy"}];
-      int64_t local_reductions =
-          local_communication_counts[{entry->communication_id, "local_reduce"}];
-      if (entry->kind == "transfer") {
-        Check(has_transport && local_copies == 0 && local_reductions == 0,
-              "direct transfer has an incomplete or unexpected local plan");
-      } else if (entry->kind == "all_gather") {
-        int64_t axis =
-            RequireStaticInteger(entry->parameter, "all_gather axis");
-        Check(axis == 0 || axis == 1,
-              "all_gather axis must be normalized to zero or one");
-        std::set<TransferPair> expected;
-        for (int64_t sx = bx; sx < ex; ++sx)
-          for (int64_t sy = by; sy < ey; ++sy)
-            for (int64_t dx = bx; dx < ex; ++dx)
-              for (int64_t dy = by; dy < ey; ++dy)
-                if (sx != dx || sy != dy)
-                  expected.insert({sx, sy, dx, dy});
-        Check(actual == expected &&
-                  local_copies == occurrence_count * group_size * group_size &&
-                  local_reductions == 0,
-              "direct all_gather does not cover every source/destination "
-              "contribution");
-      } else if (entry->kind == "all_reduce") {
-        const auto *reduction = entry->parameter.as<StringImmNode>();
-        Check(reduction &&
-                  (reduction->value == "sum" || reduction->value == "max" ||
-                   reduction->value == "min"),
-              "all_reduce has an unsupported reduction operation");
-        std::set<TransferPair> expected;
-        for (int64_t x = bx; x < ex; ++x)
-          for (int64_t y = by; y < ey; ++y)
-            if (x != bx || y != by) {
-              expected.insert({x, y, bx, by});
-              expected.insert({bx, by, x, y});
-            }
-        Check(actual == expected && local_copies == occurrence_count &&
-                  local_reductions == occurrence_count * (group_size - 1),
-              "direct all_reduce has incomplete gather/reduce/broadcast "
-              "coverage");
-      }
-    }
-  }
   return parameterized;
 }
 

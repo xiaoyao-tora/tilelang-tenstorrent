@@ -4641,10 +4641,55 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       }
     }
   }
+  struct PlannedCommunication {
+    ffi::String kind;
+    ffi::String algorithm;
+    PrimExpr parameter;
+    ffi::Array<PrimExpr> group_begin;
+    ffi::Array<PrimExpr> group_end;
+    ffi::Array<PrimExpr> occurrence_extents;
+    ffi::String source_name;
+  };
+  std::map<int64_t, PlannedCommunication> planned_communications;
+  if (auto normalized_topology =
+          frontend->GetAttr<ffi::Array<NormalizedTopologyDescriptor>>(
+              "tt.normalized_topology")) {
+    For logical_x = Downcast<For>(frontend->body);
+    For logical_y = Downcast<For>(logical_x->body);
+    StaticValueSubstituter bind_x(
+        logical_x->loop_var,
+        Call(logical_x->loop_var.dtype(), tenstorrent::core_x(), {}));
+    StaticValueSubstituter bind_y(
+        logical_y->loop_var,
+        Call(logical_y->loop_var.dtype(), tenstorrent::core_y(), {}));
+    for (const NormalizedTopologyDescriptor &entry :
+         normalized_topology.value()) {
+      ffi::String algorithm =
+          entry->kind == "all_gather" ? ffi::String("direct_all_to_all")
+          : entry->kind == "all_reduce"
+              ? ffi::String("root0_left_fold_broadcast")
+          : entry->contract == "collective" ? ffi::String("direct_multicast")
+                                            : ffi::String("direct_p2p");
+      ffi::Array<PrimExpr> group_begin, group_end;
+      for (const PrimExpr &value : entry->group_begin)
+        group_begin.push_back(bind_y(bind_x(value)));
+      for (const PrimExpr &value : entry->group_end)
+        group_end.push_back(bind_y(bind_x(value)));
+      planned_communications.emplace(
+          entry->site_id,
+          PlannedCommunication{entry->kind, algorithm,
+                               bind_y(bind_x(entry->parameter)),
+                               std::move(group_begin), std::move(group_end),
+                               entry->occurrence_extents,
+                               ffi::String(entry->source_region->buffer->name)});
+    }
+  }
+
   std::map<int64_t, int64_t> pipe_net_ids;
   std::map<int64_t, int64_t> next_record_indices;
   std::map<PlannedPipeRecordKey, MaterializedPipeRecordIdentity>
       materialized_record_ids;
+  std::map<int64_t, std::set<std::string>> pipe_name_sources;
   for (const auto &[key, endpoint] : ordered_record_sources) {
     int64_t communication_id = key.first;
     auto [pipe_net, inserted] =
@@ -4653,14 +4698,24 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     int64_t record_index = next_record_indices[pipe_net_id]++;
     materialized_record_ids.emplace(
         key, MaterializedPipeRecordIdentity{pipe_net_id, record_index});
+    auto planned = planned_communications.find(communication_id);
+    if (planned == planned_communications.end())
+      ThrowMalformed("PipeNet has no normalized communication");
+    const PlannedCommunication &communication = planned->second;
+    pipe_name_sources[pipe_net_id].insert(
+        std::string(communication.source_name));
     const auto &r = endpoint.record;
     pipes.push_back(
-        PipeDescriptor(pipe_net_id, communication_id, record_index,
+        PipeDescriptor(pipe_net_id, record_index,
                        CoreCoord(r[3]->value, r[4]->value),
                        CoreCoord(r[5]->value, r[6]->value),
                        CoreCoord(r[7]->value, r[8]->value),
                        r[2]->value ? "collective" : "point_to_point",
-                       endpoint.dfb_id, endpoint.span));
+                       communication.kind, communication.algorithm,
+                       communication.parameter, communication.group_begin,
+                       communication.group_end, communication.occurrence_extents,
+                       communication.source_name, endpoint.dfb_id,
+                       endpoint.span));
   }
   PipeRecordIdentityRemapper remap_record_ids(&materialized_record_ids);
   for (auto &slot_bodies : shared_bodies)
@@ -4688,44 +4743,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
         sender.occurrence, CoreCoord(r[3]->value, r[4]->value),
         CoreCoord(sender.x, sender.y), sender.dfb_id, receiver->second.dfb_id,
         sender.transaction_count, sender.span));
-  }
-  ffi::Array<CommunicationDescriptor> communications;
-  auto normalized_topology =
-      frontend->GetAttr<ffi::Array<NormalizedTopologyDescriptor>>(
-          "tt.normalized_topology");
-  if (normalized_topology.has_value()) {
-    For logical_x = Downcast<For>(frontend->body);
-    For logical_y = Downcast<For>(logical_x->body);
-    StaticValueSubstituter bind_x(
-        logical_x->loop_var,
-        Call(logical_x->loop_var.dtype(), tenstorrent::core_x(), {}));
-    StaticValueSubstituter bind_y(
-        logical_y->loop_var,
-        Call(logical_y->loop_var.dtype(), tenstorrent::core_y(), {}));
-    auto parameterize = [&](const PrimExpr &expr) {
-      return bind_y(bind_x(expr));
-    };
-    auto parameterize_array = [&](const ffi::Array<PrimExpr> &values) {
-      ffi::Array<PrimExpr> result;
-      for (const PrimExpr &value : values)
-        result.push_back(parameterize(value));
-      return result;
-    };
-    for (const NormalizedTopologyDescriptor &entry :
-         normalized_topology.value()) {
-      ffi::String algorithm =
-          entry->kind == "all_gather" ? ffi::String("direct_all_to_all")
-          : entry->kind == "all_reduce"
-              ? ffi::String("root0_left_fold_broadcast")
-          : entry->contract == "collective" ? ffi::String("direct_multicast")
-                                            : ffi::String("direct_p2p");
-      communications.push_back(CommunicationDescriptor(
-          entry->site_id, entry->kind, algorithm, entry->source_region,
-          entry->destination_region, parameterize_array(entry->source_coord),
-          parameterize_array(entry->group_begin),
-          parameterize_array(entry->group_end), parameterize(entry->parameter),
-          entry->contract, entry->occurrence_extents, entry->source_span));
-    }
   }
   ffi::Map<ffi::String, Integer> materialized_streams = storage_groups;
   if (pipeline_extent) {
@@ -4757,8 +4774,10 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   ffi::Array<PipeDescriptor> stream_pipes;
   for (const PipeDescriptor &pipe : pipes)
     stream_pipes.push_back(PipeDescriptor(
-        pipe->pipe_net_id, pipe->communication_id, pipe->record_index,
-        pipe->src_coord, pipe->dst_begin, pipe->dst_end, pipe->contract,
+        pipe->pipe_net_id, pipe->record_index, pipe->src_coord,
+        pipe->dst_begin, pipe->dst_end, pipe->contract, pipe->kind,
+        pipe->algorithm, pipe->parameter, pipe->group_begin, pipe->group_end,
+        pipe->occurrence_extents, pipe->payload_source_name,
         stream_id(pipe->payload_dfb_id), pipe->source_span));
   pipes = std::move(stream_pipes);
 
@@ -4803,16 +4822,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       BuildResourceNames(stream_name_sources, DeviceResourceKind::kDFBStream,
                          "_stream");
 
-  std::map<int64_t, std::set<std::string>> pipe_name_sources;
-  for (const PipeDescriptor &pipe : pipes) {
-    if (pipe->communication_id < 0 ||
-        pipe->communication_id >= static_cast<int64_t>(communications.size()))
-      ThrowMalformed("PipeNet has no parent communication for resource naming");
-    const CommunicationDescriptor &communication =
-        communications[pipe->communication_id];
-    pipe_name_sources[pipe->pipe_net_id].insert(
-        std::string(communication->source_region->buffer->name));
-  }
   resource_names.by_kind[static_cast<size_t>(DeviceResourceKind::kPipeNet)] =
       BuildResourceNames(pipe_name_sources, DeviceResourceKind::kPipeNet,
                          "_pipe");
@@ -4882,7 +4891,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       {kTensorTableAttr, tensors},
       {kDFBTableAttr, dfbs},
       {kDFBStorageGroupsAttr, stream_plan.descriptors},
-      {"tt.communication_table", communications},
       {"tt.transport_table", pipes},
       {kKernelOrderAttr, order}};
   if (!accumulators.empty())

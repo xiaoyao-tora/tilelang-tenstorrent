@@ -76,7 +76,6 @@ COMPUTE_VALUE_FAMILIES_ATTR = "tt.compute_value_families"
 TRANSPORT_FAMILIES_ATTR = "tt.transport_families"
 PIPE_TABLE_ATTR = "tt.pipe_table"
 PIPE_TRANSFER_TABLE_ATTR = "tt.pipe_transfer_table"
-COMMUNICATION_TABLE_ATTR = "tt.communication_table"
 TRANSPORT_TABLE_ATTR = "tt.transport_table"
 KERNEL_ORDER_ATTR = "tt.kernel_order"
 KERNEL_SLOT_ATTR = "tt.kernel_slot"
@@ -319,40 +318,6 @@ class NormalizedTopologyDescriptor(Node):
         )
 
 
-@tvm_ffi.register_object("tl.tenstorrent.CommunicationDescriptor")
-class CommunicationDescriptor(Node):
-    def __init__(
-        self,
-        communication_id,
-        kind,
-        algorithm,
-        source_region,
-        destination_region,
-        source_coord,
-        group_begin,
-        group_end,
-        parameter,
-        contract,
-        occurrence_extents=(),
-        source_span=None,
-    ):
-        self.__init_handle_by_constructor__(
-            _ffi_api.CommunicationDescriptor,
-            int(communication_id),
-            kind,
-            algorithm,
-            source_region,
-            destination_region,
-            list(source_coord),
-            list(group_begin),
-            list(group_end),
-            parameter,
-            contract,
-            list(occurrence_extents),
-            source_span,
-        )
-
-
 @tvm_ffi.register_object("tl.tenstorrent.DFBDescriptor")
 class DFBDescriptor(Node):
     def __init__(
@@ -481,27 +446,41 @@ class ComputeRequirements(Node):
 
 @tvm_ffi.register_object("tl.tenstorrent.PipeDescriptor")
 class PipeDescriptor(Node):
+    """One PipeNet record plus the communication contract it belongs to."""
+
     def __init__(
         self,
         pipe_net_id: int,
-        communication_id: int,
         record_index: int,
         src_coord: CoreCoord,
         dst_begin: CoreCoord,
         dst_end: CoreCoord,
         contract: str,
-        payload_dfb_id: int,
-        source_span: Span,
+        kind: str,
+        algorithm: str,
+        parameter,
+        group_begin=(),
+        group_end=(),
+        occurrence_extents=(),
+        payload_source_name: str = "",
+        payload_dfb_id: int = -1,
+        source_span: Span | None = None,
     ):
         self.__init_handle_by_constructor__(
             _ffi_api.PipeDescriptor,
             int(pipe_net_id),
-            int(communication_id),
             int(record_index),
             src_coord,
             dst_begin,
             dst_end,
             contract,
+            kind,
+            algorithm,
+            parameter,
+            list(group_begin),
+            list(group_end),
+            list(occurrence_extents),
+            payload_source_name,
             int(payload_dfb_id),
             source_span,
         )
@@ -691,8 +670,6 @@ __all__ = (
     "ComputeValueDescriptor",
     "COMPUTE_VALUE_TABLE_ATTR",
     "ComputeRequirements",
-    "CommunicationDescriptor",
-    "COMMUNICATION_TABLE_ATTR",
     "ACCUMULATOR_TABLE_ATTR",
     "COMPUTE_REQUIREMENTS_ATTR",
     "COMPUTE_REGION_REQUIREMENTS_ATTR",

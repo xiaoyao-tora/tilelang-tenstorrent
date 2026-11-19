@@ -508,7 +508,6 @@ CompactCurrentTransports(const ffi::Array<PipeDescriptor> &descriptors) {
     FamilyBuilder &builder = builders[found->second];
     builder.positions.push_back(position);
     builder.fields["pipe_net_id"].push_back(descriptor->pipe_net_id);
-    builder.fields["communication_id"].push_back(descriptor->communication_id);
     builder.fields["record_index"].push_back(descriptor->record_index);
     builder.fields["source_x"].push_back(descriptor->src_coord->x);
     builder.fields["source_y"].push_back(descriptor->src_coord->y);
@@ -858,22 +857,23 @@ RestoreCurrentTransports(const DeviceIRDescriptorFamily &family,
   Check(family->source_parts.empty(),
         "transport family cannot have source string parts");
   DecodedFields fields = ReadFields(
-      family, {"pipe_net_id", "communication_id", "record_index", "source_x",
+      family, {"pipe_net_id", "record_index", "source_x",
                "source_y", "destination_begin_x", "destination_begin_y",
                "destination_end_x", "destination_end_y", "payload_dfb_id"});
   std::vector<PipeDescriptor> result;
   result.reserve(family->positions->count);
   for (int64_t row = 0; row < family->positions->count; ++row)
     result.emplace_back(
-        fields.at("pipe_net_id")[row], fields.at("communication_id")[row],
-        fields.at("record_index")[row],
+        fields.at("pipe_net_id")[row], fields.at("record_index")[row],
         CoreCoord(fields.at("source_x")[row], fields.at("source_y")[row]),
         CoreCoord(fields.at("destination_begin_x")[row],
                   fields.at("destination_begin_y")[row]),
         CoreCoord(fields.at("destination_end_x")[row],
                   fields.at("destination_end_y")[row]),
-        prototype->contract, fields.at("payload_dfb_id")[row],
-        prototype->source_span);
+        prototype->contract, prototype->kind, prototype->algorithm,
+        prototype->parameter, prototype->group_begin, prototype->group_end,
+        prototype->occurrence_extents, prototype->payload_source_name,
+        fields.at("payload_dfb_id")[row], prototype->source_span);
   return result;
 }
 

@@ -270,42 +270,6 @@ public:
                                              NormalizedTopologyDescriptorNode);
 };
 
-/*! \brief Final high-level communication identity retained in Device IR. */
-class CommunicationDescriptorNode : public ffi::Object {
-public:
-  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
-      kTVMFFISEqHashKindTreeNode;
-  int64_t communication_id;
-  ffi::String kind;
-  ffi::String algorithm;
-  tirx::BufferRegion source_region;
-  tirx::BufferRegion destination_region;
-  ffi::Array<PrimExpr> source_coord;
-  ffi::Array<PrimExpr> group_begin;
-  ffi::Array<PrimExpr> group_end;
-  PrimExpr parameter;
-  ffi::String contract;
-  ffi::Array<PrimExpr> occurrence_extents;
-  Span source_span;
-
-  static void RegisterReflection();
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.CommunicationDescriptor",
-                                    CommunicationDescriptorNode, ffi::Object);
-};
-
-class CommunicationDescriptor : public ffi::ObjectRef {
-public:
-  TVM_DLL CommunicationDescriptor(
-      int64_t communication_id, ffi::String kind, ffi::String algorithm,
-      tirx::BufferRegion source_region, tirx::BufferRegion destination_region,
-      ffi::Array<PrimExpr> source_coord, ffi::Array<PrimExpr> group_begin,
-      ffi::Array<PrimExpr> group_end, PrimExpr parameter, ffi::String contract,
-      ffi::Array<PrimExpr> occurrence_extents, Span source_span);
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(CommunicationDescriptor,
-                                             ffi::ObjectRef,
-                                             CommunicationDescriptorNode);
-};
-
 class DFBDescriptorNode : public ffi::Object {
 public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
@@ -542,20 +506,28 @@ public:
 /*! \brief One static, ordered record in a materialized transport PipeNet.
  *
  * PipeNet IDs are globally dense. record_index is dense within one PipeNet and
- * directly indexes the downstream PipeNet record array. communication_id names
- * the high-level communication whose selected algorithm owns this PipeNet.
+ * directly indexes the downstream PipeNet record array. kind selects the
+ * communication form (transfer / broadcast / all_gather / all_reduce),
+ * algorithm names the delivery mechanism, and parameter carries the reduction
+ * operator or concat axis that only the collective forms use.
  */
 class PipeDescriptorNode : public ffi::Object {
 public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
       kTVMFFISEqHashKindTreeNode;
   int64_t pipe_net_id;
-  int64_t communication_id;
   int64_t record_index;
   CoreCoord src_coord;
   CoreCoord dst_begin;
   CoreCoord dst_end;
   ffi::String contract;
+  ffi::String kind;
+  ffi::String algorithm;
+  PrimExpr parameter;
+  ffi::Array<PrimExpr> group_begin;
+  ffi::Array<PrimExpr> group_end;
+  ffi::Array<PrimExpr> occurrence_extents;
+  ffi::String payload_source_name;
   int64_t payload_dfb_id;
   Span source_span;
 
@@ -566,11 +538,13 @@ public:
 
 class PipeDescriptor : public ffi::ObjectRef {
 public:
-  TVM_DLL PipeDescriptor(int64_t pipe_net_id, int64_t communication_id,
-                         int64_t record_index, CoreCoord src_coord,
-                         CoreCoord dst_begin, CoreCoord dst_end,
-                         ffi::String contract, int64_t payload_dfb_id,
-                         Span source_span);
+  TVM_DLL PipeDescriptor(
+      int64_t pipe_net_id, int64_t record_index, CoreCoord src_coord,
+      CoreCoord dst_begin, CoreCoord dst_end, ffi::String contract,
+      ffi::String kind, ffi::String algorithm, PrimExpr parameter,
+      ffi::Array<PrimExpr> group_begin, ffi::Array<PrimExpr> group_end,
+      ffi::Array<PrimExpr> occurrence_extents, ffi::String payload_source_name,
+      int64_t payload_dfb_id, Span source_span);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(PipeDescriptor, ffi::ObjectRef,
                                              PipeDescriptorNode);
 };

@@ -21,7 +21,6 @@ MODULE_ATTRS = {
     "tt.operation_identity",
     "tt.tensor_table",
     "tt.dfb_storage_groups",
-    "tt.communication_table",
     "tt.transport_families",
     "tt.kernel_order",
 }
@@ -80,7 +79,6 @@ def test_backend_context_lowers_minimal_frontend_to_device_ir(monkeypatch):
     assert str(lowered.attrs["tt.operation_identity"].operation_id) == "phase1_noop"
     assert len(lowered.attrs["tt.tensor_table"]) == 1
     assert not lowered.attrs["tt.dfb_storage_groups"]
-    assert not lowered.attrs["tt.communication_table"]
     assert not lowered.attrs["tt.transport_families"]
 
     functions = {str(func.attrs["tt.kernel_slot"]): func for func in lowered.functions.values()}
