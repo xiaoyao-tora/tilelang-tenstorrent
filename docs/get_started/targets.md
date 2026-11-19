@@ -17,7 +17,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `cutedsl` | NVIDIA CUTLASS/CuTe DSL backend. Requires `nvidia-cutlass-dsl`. |
 | `hip` | AMD GPUs via ROCm. Use a config dict for options such as `{"kind": "hip", "mcpu": "gfx90a"}`. |
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
-| `tenstorrent` | Tenstorrent devices. Requires `wormhole_b0` or `blackhole`; supports verified single-Core BF16/FP32 Device Lower for multi-tile compute, broadcast, Fill, Typecast, Transpose, GEMM and Reduction. Restricted source-only TTL mapping is available; execution remains unsupported. |
+| `tenstorrent` | Tenstorrent devices. Requires `wormhole_b0` or `blackhole`; lowers to verified shared-grid Device IR, emits an in-memory initial TTL Module, compiles it with the pinned TT-Lang pipeline, and executes the resulting `CompiledTTNNKernel` through the `ttnn` JIT adapter. Required full-K FP32 matmul and dynamic family-row CB selection remain explicit capability gates. |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
 | `webgpu` | Browser / WebGPU runtimes. |
 | `c` | Emit plain C source for inspection or custom toolchains. |

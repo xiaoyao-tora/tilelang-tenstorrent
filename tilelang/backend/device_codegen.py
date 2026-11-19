@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from tvm import IRModule
 from tvm.target import Target
@@ -11,7 +12,7 @@ from tvm.target import Target
 from tilelang import tvm
 from tilelang.instrumentation import run_codegen_with_instrumentation
 
-DeviceCodegenFunc = Callable[[IRModule, Target], IRModule]
+DeviceCodegenFunc = Callable[[IRModule, Target], Any]
 DeviceCodegenPrepareFunc = Callable[[IRModule, Target], IRModule]
 
 
@@ -38,7 +39,7 @@ class DeviceCodegen:
     build_without_compile: DeviceCodegenFunc | None = None
     prepare: DeviceCodegenPrepareFunc | None = None
 
-    def lower(self, mod: IRModule, target: Target, *, compile_device: bool) -> IRModule:
+    def lower(self, mod: IRModule, target: Target, *, compile_device: bool) -> Any:
         build_func = self.build if compile_device else self.build_without_compile
         if build_func is None:
             mode = "with compilation" if compile_device else "without compilation"

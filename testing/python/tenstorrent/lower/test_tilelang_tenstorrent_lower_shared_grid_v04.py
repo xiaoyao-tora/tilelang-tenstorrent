@@ -1219,19 +1219,19 @@ def test_device_verifier_rejects_raw_resource_id():
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
-def test_current_codegen_preflight_rejects_before_loading_ttlang(monkeypatch):
+def test_current_codegen_enters_emitter_without_standalone_preflight(monkeypatch):
     mod = lower(point_transfer)
     imported = False
 
     def fail_import(*_args, **_kwargs):
         nonlocal imported
         imported = True
-        raise AssertionError("TT-Lang must not load before mapping preflight")
+        raise ImportError("pinned TT-Lang unavailable")
 
     monkeypatch.setattr("importlib.import_module", fail_import)
-    with pytest.raises(NotImplementedError, match="TTL mapping preflight failed"):
+    with pytest.raises(ImportError, match="pinned TT-Lang unavailable"):
         codegen.build_ttl_without_compile(mod, TARGET)
-    assert not imported
+    assert imported
 
 
 @pytest.mark.xfail(

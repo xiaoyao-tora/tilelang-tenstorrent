@@ -85,11 +85,12 @@ TIR contract.
 
 `DeviceCodegen.prepare` lets a backend replace the common
 `LowerIntrin`/`Simplify`/`HoistBroadcastValues` preparation without adding a
-target-kind branch to the shared engine. Tenstorrent's current hook validates
-target kind and architecture and reruns the read-only Device TIR verifier
-without importing `ttl`.
+target-kind branch to the shared engine. Tenstorrent's hook validates the target
+kind, architecture and Device stage. It trusts the Device verifier at the end
+of the fixed Lower pipeline and does not repeat whole-program verification or
+mapping preflight in Codegen.
 
-The source-only device output format is `ttl`; no host codegen is declared.
+The in-memory device output format is `ttl`; no host codegen is declared.
 The only compatible execution backend is `ttnn`, and its current declaration
 requests neither host codegen nor eager device compilation.
 
@@ -98,23 +99,23 @@ Python and Python-AST compilation are reference material only and will not be
 inputs to TileLang codegen. Initial TTL must contain the types/layouts, module
 and slot attributes, logical DFB bindings and acquire operations, TensorSlice
 and copy operations, tensor compute/store, Pipe structure, and source
-locations. TT-Lang may later supply complete waits and CB releases, physical CB
-and DST indices, structured compute scheduling, TTKernel, EmitC, and C++.
+locations. User DFB waits, publications and releases are explicit. TT-Lang
+supplies lifecycle operations only for compiler-created DFBs, along with
+physical CB and DST indices, structured compute scheduling, TTKernel, EmitC,
+and C++.
 
 ## TT-Lang reference and blockers
 
-The active ABI reference was audited from an adjacent production source
-checkout during Phase 0, at commit
-`e49ce12c2bcd2350565632d9b51239e9eafb2546`, package version
-`1.1.9.dev51`. The public binding surface is `ttl.ir`, `ttl.dialects.ttl`,
+The active ABI reference is TT-Lang commit
+`4ca4b89de95242ccb9bca8ade71200ac81a59e38`, packaged locally as
+`1.1.9.dev20260824+light`. The public binding surface is `ttl.ir`, `ttl.dialects.ttl`,
 `ttl.dialects.ttcore`, `ttl.dialects.ttkernel`, `ttl.passmanager`, and
 `ttl.passes`; the expected registered pipeline is
 `ttl-to-ttkernel-pipeline`.
 
-The repository vendors that exact source as the `3rdparty/tt-lang` gitlink, but
-the current environment does not contain a built `ttlang-opt` or importable
-`ttl` package. The reference was therefore source-audited but not TTL parser or
-compile-only validated here. Current shared-grid TTL emission, the TTNN
-execution path, and hardware validation remain separate blockers. Typed Device
-TIR metadata and the hardware-independent Lower/verifier pipeline are
-implemented.
+The repository vendors that exact source as the `3rdparty/tt-lang` gitlink and
+uses the official compiler wheel for the same commit. TileLang's local adapter
+drives the pinned pipeline and packaging helpers without modifying TT-Lang.
+TTL parser and compile-only validation run against those bindings. TTNN
+hardware execution, numerical correctness and performance remain separate
+validation stages.

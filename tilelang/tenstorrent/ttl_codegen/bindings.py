@@ -17,6 +17,8 @@ class Bindings:
     ttkernel: object
     func: object
     arith: object
+    scf: object
+    tensor: object
 
 
 def load_bindings() -> Bindings:
@@ -31,6 +33,8 @@ def load_bindings() -> Bindings:
                 "ttl.dialects.ttkernel",
                 "ttl.dialects.func",
                 "ttl.dialects.arith",
+                "ttl.dialects.scf",
+                "ttl.dialects.tensor",
             )
         ]
     except (ImportError, OSError) as error:

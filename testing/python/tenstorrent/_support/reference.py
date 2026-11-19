@@ -227,7 +227,7 @@ def _round(value, dtype):
     if str(dtype) == "bfloat16":
         value = np.asarray(value, dtype=np.float32)
         bits = value.view(np.uint32)
-        bits = (bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)) & np.uint32(0xFFFF0000)
+        bits = (bits + np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))) & np.uint32(0xFFFF0000)
         return bits.view(np.float32)
     target = np.dtype(str(dtype))
     if target.kind in "iub" or str(dtype) in ("float16", "float32", "float64"):

@@ -48,6 +48,12 @@ class ResolvedDFB:
     storage_group_id: int
 
 
+@dataclass(frozen=True)
+class ResolvedResource:
+    kind: str
+    identifier: int
+
+
 class CurrentDFBResolver:
     """Resolve static Device stream IDs without table expansion."""
 
@@ -87,7 +93,7 @@ class CurrentDFBResolver:
         )
 
 
-def _resource_alias_prologue(function):
+def resource_alias_prologue(function):
     aliases = {}
     identities = set()
     prologue_vars = set()
@@ -130,6 +136,26 @@ def _resource_alias_prologue(function):
     return aliases
 
 
+def resolve_resource_operand(operand, aliases, expected_kind: str) -> ResolvedResource:
+    if isinstance(operand, tirx.Var):
+        if operand not in aliases:
+            raise ResourceResolutionError(f"unbound Device resource ref {operand.name}")
+        kind, identifier = aliases[operand]
+        if kind != expected_kind:
+            raise ResourceResolutionError(f"resource ref {operand.name} has kind {kind}, expected {expected_kind}")
+        return ResolvedResource(kind, identifier)
+    if isinstance(operand, tirx.Call) and str(operand.op.name) == expected_kind:
+        if len(operand.args) != 1:
+            raise ResourceResolutionError(f"{expected_kind} requires one identifier")
+        identifier = arith.Analyzer().simplify(operand.args[0])
+        if isinstance(identifier, tirx.IntImm):
+            return ResolvedResource(expected_kind, int(identifier))
+        raise ResourceResolutionError(
+            f"dynamic {expected_kind} family-row selection requires TT-Lang resource-selection support: {identifier}"
+        )
+    raise ResourceResolutionError(f"Device operand is not a {expected_kind}")
+
+
 def resolve_current_function_groups(mod: IRModule) -> dict[str, tuple[int, ...]]:
     """Return the finite storage-group bindings required by each kernel slot.
 
@@ -142,7 +168,7 @@ def resolve_current_function_groups(mod: IRModule) -> dict[str, tuple[int, ...]]
         slot = str(function.attrs["tt.kernel_slot"])
         groups = set(resolver.groups_for_slot(slot))
         failure: list[ResourceResolutionError] = []
-        aliases = _resource_alias_prologue(function)
+        aliases = resource_alias_prologue(function)
 
         def visit(
             node,
@@ -188,5 +214,8 @@ __all__ = [
     "CurrentDFBResolver",
     "ResolvedDFB",
     "ResourceResolutionError",
+    "ResolvedResource",
+    "resource_alias_prologue",
+    "resolve_resource_operand",
     "resolve_current_function_groups",
 ]

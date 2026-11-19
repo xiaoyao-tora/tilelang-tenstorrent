@@ -105,4 +105,34 @@ def resolve_transport_records(mod: IRModule) -> dict[int, tuple[ResolvedPipeReco
     return result
 
 
-__all__ = ["RecordResolutionError", "ResolvedPipeRecord", "resolve_transport_records"]
+def build_pipenet_attributes(bindings, context, mod: IRModule):
+    result = {}
+    for pipe_net_id, records in resolve_transport_records(mod).items():
+        pipe_records = [
+            bindings.ttl.PipeRecordAttr.get(
+                context,
+                record.source[0],
+                record.source[1],
+                record.destination_begin[0],
+                record.destination_begin[1],
+                record.destination_end[0] - 1,
+                record.destination_end[1] - 1,
+                record.contract == "collective",
+            )
+            for record in records
+        ]
+        result[pipe_net_id] = bindings.ttl.PipeNetRecordsAttr.get(
+            context,
+            pipe_net_id,
+            pipe_net_name=f"tilelang_pipe_net_{pipe_net_id}",
+            pipes=pipe_records,
+        )
+    return result
+
+
+__all__ = [
+    "RecordResolutionError",
+    "ResolvedPipeRecord",
+    "build_pipenet_attributes",
+    "resolve_transport_records",
+]

@@ -99,12 +99,12 @@ def _prepare_device_codegen_mod(device_mod: tvm.IRModule, context: BackendContex
     return device_mod
 
 
-def device_codegen(device_mod: tvm.IRModule, context: BackendContext) -> tvm.IRModule:
+def device_codegen(device_mod: tvm.IRModule, context: BackendContext):
     device_mod = _prepare_device_codegen_mod(device_mod, context)
     return context.codegen_device(device_mod, compile_device=True)
 
 
-def device_codegen_without_compile(device_mod: tvm.IRModule, context: BackendContext) -> tvm.IRModule:
+def device_codegen_without_compile(device_mod: tvm.IRModule, context: BackendContext):
     device_mod = _prepare_device_codegen_mod(device_mod, context)
     return context.codegen_device(device_mod, compile_device=False)
 
@@ -191,7 +191,9 @@ def _lower_with_context_impl(
     )
 
     codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
-    kernel_source = codegen_mod.inspect_source()
+    kernel_source = None
+    if getattr(codegen_mod, "eager_source_inspection", True):
+        kernel_source = codegen_mod.inspect_source()
 
     if enable_host_codegen:
         host_mod = host_codegen(host_mod, context)
@@ -204,6 +206,7 @@ def _lower_with_context_impl(
             rt_mod=host_mod,
             target=target,
             target_host=target_host,
+            device_artifact=codegen_mod,
         )
 
     return CompiledArtifact(
@@ -213,6 +216,7 @@ def _lower_with_context_impl(
         kernel_source,
         target=target,
         target_host=target_host,
+        device_artifact=codegen_mod,
     )
 
 

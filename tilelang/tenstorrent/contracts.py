@@ -164,6 +164,8 @@ INITIAL_TTL_REQUIRED = (
     "ttl.bind_cb",
     "ttl.cb_reserve",
     "ttl.cb_wait",
+    "ttl.cb_push",
+    "ttl.cb_pop",
     "ttl.attach_cb",
     "ttl.tensor_slice",
     "ttl.copy",
@@ -174,8 +176,7 @@ INITIAL_TTL_REQUIRED = (
 )
 
 INITIAL_TTL_DEFERRED = (
-    "all_ttl.wait",
-    "all_ttl.cb_push_and_ttl.cb_pop",
+    "compiler_created_dfb_wait_push_pop",
     "physical_cb_index",
     "dst_index",
     "ttl.compute_tile_ops_and_subblock_schedule",
@@ -186,14 +187,18 @@ INITIAL_TTL_DEFERRED = (
 
 DEFERRED_FRONTEND_CAPABILITIES = ("tt.tensor_backed",)
 
-TTLANG_REFERENCE_COMMIT = "e49ce12c2bcd2350565632d9b51239e9eafb2546"
-TTLANG_REFERENCE_VERSION = "1.1.9.dev51"
-TTLANG_LEGACY_REFERENCE_COMMIT = "e49ce12c2bcd2350565632d9b51239e9eafb2546"
+TTLANG_REFERENCE_COMMIT = "4ca4b89de95242ccb9bca8ade71200ac81a59e38"
+TTLANG_REFERENCE_VERSION = "1.1.9.dev20260824+light"
+TTLANG_LEGACY_REFERENCE_COMMIT = "4ca4b89de95242ccb9bca8ade71200ac81a59e38"
 TTLANG_PUBLIC_BINDING_MODULES = (
     "ttl.ir",
     "ttl.dialects.ttl",
     "ttl.dialects.ttcore",
     "ttl.dialects.ttkernel",
+    "ttl.dialects.func",
+    "ttl.dialects.arith",
+    "ttl.dialects.scf",
+    "ttl.dialects.tensor",
     "ttl.passmanager",
     "ttl.passes",
 )

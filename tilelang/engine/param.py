@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 import torch
 from tilelang import tvm as tvm
 from tvm.tirx import Buffer, IntImm, Var, PrimExpr
@@ -160,7 +161,8 @@ class CompiledArtifact:
     host_mod: tvm.IRModule  # Host-side TVM IR module for managing kernel execution
     device_mod: tvm.IRModule  # Device-side TVM IR module containing the actual kernel code
     params: list[KernelParam]  # List of parameters (tensors/scalars) used by the kernel
-    kernel_source: str  # Raw source code of the generated kernel
+    kernel_source: str | None  # Debug source view when the target exposes one eagerly
     rt_mod: tvm.runtime.Module | None = None  # Runtime module for execution, may be lazily initialized
     target: tvm.target.Target | None = None  # Normalized device target used for lowering
     target_host: tvm.target.Target | None = None  # Normalized host target used for host codegen/export
+    device_artifact: Any | None = None  # Opaque target-owned artifact retained for JIT adapters

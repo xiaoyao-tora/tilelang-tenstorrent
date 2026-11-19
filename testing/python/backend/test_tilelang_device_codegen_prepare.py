@@ -71,6 +71,46 @@ def test_device_codegen_without_hook_keeps_shared_prepare(monkeypatch):
     assert calls == ["LowerIntrin", "Simplify", "HoistBroadcastValues"]
 
 
+def test_lower_retains_lazy_device_artifact_without_source_inspection(monkeypatch):
+    class LazyArtifact:
+        eager_source_inspection = False
+
+        def inspect_source(self):
+            raise AssertionError("lazy device artifact must not be inspected during lowering")
+
+    host_mod = tvm.IRModule()
+    device_mod = tvm.IRModule()
+    lazy_artifact = LazyArtifact()
+    target = tvm.target.Target("llvm")
+    target_host = tvm.target.Target("c")
+    context = _context_with_device_codegen(DeviceCodegen("unit"))
+    monkeypatch.setattr(
+        lower_engine,
+        "lower_to_host_device_ir",
+        lambda *_args, **_kwargs: (
+            host_mod,
+            device_mod,
+            [],
+            target,
+            target_host,
+        ),
+    )
+    monkeypatch.setattr(
+        lower_engine,
+        "device_codegen_without_compile",
+        lambda *_args, **_kwargs: lazy_artifact,
+    )
+    result = lower_engine._lower_with_context_impl(
+        tvm.IRModule(),
+        context,
+        runtime_only=False,
+        enable_host_codegen=False,
+        enable_device_compile=False,
+    )
+    assert result.kernel_source is None
+    assert result.device_artifact is lazy_artifact
+
+
 def test_tenstorrent_prepare_is_identity_and_validates_target():
     from tilelang.tenstorrent import language as T
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
@@ -89,5 +129,5 @@ def test_tenstorrent_prepare_is_identity_and_validates_target():
     with pytest.raises(ValueError, match="requires target kind 'tenstorrent'"):
         prepare_ttl_codegen(mod, tvm.target.Target("llvm"))
 
-    with pytest.raises(ValueError, match="tt.device_ir_version"):
+    with pytest.raises(ValueError, match="tt.ir_stage='device'"):
         prepare_ttl_codegen(tvm.IRModule(), target)

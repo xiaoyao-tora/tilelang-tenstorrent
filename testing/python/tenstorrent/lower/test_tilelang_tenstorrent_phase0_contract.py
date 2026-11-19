@@ -251,13 +251,17 @@ def test_structured_compute_precedes_device_lowering_in_pass_order():
 
 
 def test_frozen_ttl_reference_and_initial_module_contract():
-    assert contracts.TTLANG_REFERENCE_COMMIT == "e49ce12c2bcd2350565632d9b51239e9eafb2546"
-    assert contracts.TTLANG_REFERENCE_VERSION == "1.1.9.dev51"
+    assert contracts.TTLANG_REFERENCE_COMMIT == "4ca4b89de95242ccb9bca8ade71200ac81a59e38"
+    assert contracts.TTLANG_REFERENCE_VERSION == "1.1.9.dev20260824+light"
     assert contracts.TTLANG_PUBLIC_BINDING_MODULES == (
         "ttl.ir",
         "ttl.dialects.ttl",
         "ttl.dialects.ttcore",
         "ttl.dialects.ttkernel",
+        "ttl.dialects.func",
+        "ttl.dialects.arith",
+        "ttl.dialects.scf",
+        "ttl.dialects.tensor",
         "ttl.passmanager",
         "ttl.passes",
     )
@@ -271,6 +275,8 @@ def test_frozen_ttl_reference_and_initial_module_contract():
         "ttl.bind_cb",
         "ttl.cb_reserve",
         "ttl.cb_wait",
+        "ttl.cb_push",
+        "ttl.cb_pop",
         "ttl.attach_cb",
         "ttl.tensor_slice",
         "ttl.copy",
@@ -280,8 +286,7 @@ def test_frozen_ttl_reference_and_initial_module_contract():
         "source_location",
     )
     assert contracts.INITIAL_TTL_DEFERRED == (
-        "all_ttl.wait",
-        "all_ttl.cb_push_and_ttl.cb_pop",
+        "compiler_created_dfb_wait_push_pop",
         "physical_cb_index",
         "dst_index",
         "ttl.compute_tile_ops_and_subblock_schedule",

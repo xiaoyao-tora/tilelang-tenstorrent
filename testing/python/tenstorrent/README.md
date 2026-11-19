@@ -12,6 +12,8 @@ Tenstorrent-specific tests are grouped by compiler and execution boundary:
   execution tests.
 - `backend/`: target registration, capabilities, and lazy backend imports.
 - `codegen/`: TTL emission and optional TT-Lang boundary tests.
+- `hardware/`: gated end-to-end tests that execute compiled kernels through
+  TTNN on a Tenstorrent device; see its README for environment requirements.
 - `legacy/`: explicitly skipped tests for superseded Device IR and PipeNet
   contracts. A skipped legacy test is migration debt, not active coverage.
 - `_support/`: reusable non-test modules. It currently contains the shared

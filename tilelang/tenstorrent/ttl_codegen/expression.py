@@ -58,10 +58,17 @@ class ExpressionEmitter:
         self.call = call
         self.shape = list(result_type.shape)
         self.result_type = result_type
-        self.dtype = str(call.annotations["tt.compute_dtype"].value) if dtype is None else str(dtype)
+        self.dtype = str(dtype)
+        tile_type = self.b.ttcore.ir.TileType.maybe_downcast(result_type.element_type)
+        if tile_type is None:
+            raise ValueError(f"TTL expression result must use a tile element type, got {result_type}")
+        self.tile_shape = tuple(map(int, tile_type.shape))
 
     def tensor_type(self, dtype):
-        return self.b.ir.RankedTensorType.get(self.shape, self.e.tile_type(dtype, (32, 32)))
+        return self.b.ir.RankedTensorType.get(
+            self.shape,
+            self.e.type_converter.tile_type(dtype, self.tile_shape),
+        )
 
     def fill(self, value, dtype):
         attr = self.b.ir.FloatAttr.get(self.b.ir.F32Type.get(self.e.ctx), float(value))
@@ -81,12 +88,19 @@ class ExpressionEmitter:
         if isinstance(expr, tirx.Call) and expr.op.name in _LOADS:
             index = int(expr.args[0])
             if expr.op.name == "tl.tt.dfb_operand":
-                return self.e.values[int(self.call.args[index + 1])]
+                return self.e.value_for_dfb_operand(self.call.args[index + 1])
             if expr.op.name == "tl.tt.compute_value_operand":
                 inputs = self.call.annotations.get("tt.value_inputs", [])
-                return self.e.compute_values[int(inputs[index])]
-            return self.e.values[index] if expr.op.name == "tl.tt.dfb_load" else self.e.compute_values[index]
+                return self.e.value_for_compute_operand(inputs[index])
+            if expr.op.name == "tl.tt.dfb_load":
+                return self.e.value_for_dfb_operand(expr.args[0])
+            return self.e.value_for_compute_operand(expr.args[0])
         if isinstance(expr, tirx.Call) and expr.op.name == "tl.tt.compute_broadcast":
+            requirements = self.e.function.attrs.get("tt.compute_requirements")
+            if str(expr.dtype) == "bfloat16" and requirements is not None and str(requirements.destination_width) == "bits32_required":
+                raise NotImplementedError(
+                    "pinned TT-Lang cannot lower BF16 broadcast in a kernel that requires 32-bit destination registers"
+                )
             dims_attr = self.b.ir.DenseI64ArrayAttr.get([int(axis) for axis in expr.args[1:]])
             shape_attr = self.b.ir.DenseI64ArrayAttr.get(self.shape)
             return ttl.block_broadcast(self.tensor_type(expr.dtype), self.emit(expr.args[0]), dims_attr, shape_attr)

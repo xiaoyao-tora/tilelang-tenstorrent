@@ -5,7 +5,9 @@ import importlib.util
 import pytest
 
 
-pytestmark = pytest.mark.skip(reason="TTL Codegen still targets legacy versioned Device IR; this change is intentionally Lower-only")
+pytestmark = pytest.mark.skip(
+    reason="legacy versioned TTL emitter coverage; current-stage Codegen is covered by test_tilelang_tenstorrent_codegen_v07.py"
+)
 
 from tilelang import tvm
 from tvm.target import Target

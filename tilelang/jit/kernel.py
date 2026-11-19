@@ -395,6 +395,18 @@ class JITKernel(Generic[_P, _T]):
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
             )
+        elif execution_backend == "ttnn":
+            from tilelang.jit.adapter.ttnn import TTNNKernelAdapter
+
+            adapter = create_adapter(
+                TTNNKernelAdapter,
+                params=artifact.params,
+                result_idx=out_idx,
+                func_or_mod=tilelang_func,
+                device_artifact=artifact.device_artifact,
+                verbose=self.verbose,
+                compile_flags=compile_flags,
+            )
         else:
             # Handle invalid backend.
             raise ValueError(f"Invalid execution backend: {execution_backend}")
@@ -516,7 +528,7 @@ class JITKernel(Generic[_P, _T]):
         str
             The source code of the compiled kernel function.
         """
-        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl"}:
+        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl", "ttnn"}:
             return self.adapter.get_kernel_source(kernel_only=kernel_only)
         return self.artifact.kernel_source
 
@@ -687,7 +699,7 @@ class JITKernel(Generic[_P, _T]):
 
     @property
     def kernel_source(self) -> str:
-        if self.artifact:
+        if self.artifact and self.artifact.kernel_source is not None:
             return self.artifact.kernel_source
         source = getattr(self.adapter, "kernel_global_source", None)
         if source is not None:

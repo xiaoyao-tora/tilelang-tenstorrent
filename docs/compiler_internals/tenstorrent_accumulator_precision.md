@@ -97,20 +97,20 @@ Versions 5 and 6 require this attribute. Older Device modules remain readable;
 GEMM source generation requires explicit verified requirements and asks callers
 to run the current Lower pipeline when they are missing.
 
-## Source-only TTL generation
+## Initial TTL generation
 
-`build_ttl_without_compile` first verifies Device IR, architecture and consumer
-capability, then lazily imports the pinned TT-Lang production bindings. It
-constructs typed MLIR operations, verifies both the module and its serialized
-form, and returns a TVM source module with `inspect_source()` and format `ttl`.
-It neither loads TTNN nor launches kernels.
+`build_ttl_without_compile` receives Device IR that has already passed the final
+Lower verifier, checks the target/stage handoff, then lazily imports the pinned
+TT-Lang production bindings. It constructs and verifies typed MLIR operations
+and returns an in-memory `TenstorrentTTLModuleNode` that owns the MLIR context
+and Module. `inspect_source()` is a debug view; normal compilation does not
+serialize and parse the Module.
 
-The current consumer is deliberately narrower than Device Lower: direct Add,
-copy and restricted BF16 GEMM on one Core. A v5 GEMM must have one complete-K
-update and a supported transpose configuration. Multiple-update persistent-DST
-scheduling and FP32 GEMM emission remain gated until the pinned compiler can
-prove their precision contract. No fallback silently materializes an FP32
-accumulator into BF16 between updates.
+The current emitter maps shared-grid Tensor/DFB operations, SCF control flow,
+compute values, PipeNet records and BF16 GEMM. A required full-K FP32 GEMM
+remains gated until the pinned compiler exposes a hard-require policy and a
+resolved-schedule query. No fallback silently materializes an FP32 accumulator
+into BF16 between updates.
 
 Verified destination width maps to compute function `fp32_dest_acc_en`:
 32-bit sets `true`, 16-bit sets `false`, unconstrained omits the attribute.
