@@ -3271,7 +3271,6 @@ PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
                           const ffi::String &thread_kind,
                           ffi::Optional<Integer> noc_index,
                           const ffi::Array<Integer> &tensor_arg_indices,
-                          const ffi::String &logical_kind,
                           const ffi::String &logical_role, Stmt body) {
   ffi::Array<Var> params;
   ffi::Map<Var, Buffer> buffer_map;
@@ -3290,7 +3289,7 @@ PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
   }
 
   const ffi::String symbol = operation + "_" + slot;
-  LogicalKernel logical_kernel("kernel." + slot, logical_kind, logical_role,
+  LogicalKernel logical_kernel("kernel." + slot, logical_role,
                                frontend->span);
   ffi::Map<ffi::String, ffi::Any> attrs = {
       {tvm::attr::kGlobalSymbol, symbol},
@@ -4876,7 +4875,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
         compute ? "compute" : "datamovement",
         compute ? ffi::Optional<Integer>(std::nullopt)
                 : ffi::Optional<Integer>(Integer(slot == "ncrisc" ? 0 : 1)),
-        tensor_indices, compute ? "compute" : "datamovement",
+        tensor_indices,
         compute            ? "general"
         : slot == "ncrisc" ? "tensor_io"
                            : "transport",

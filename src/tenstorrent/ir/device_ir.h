@@ -656,7 +656,6 @@ public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
       kTVMFFISEqHashKindTreeNode;
   ffi::String kernel_id;
-  ffi::String kind;
   ffi::String role;
   Span source_span;
 
@@ -667,8 +666,8 @@ public:
 
 class LogicalKernel : public ffi::ObjectRef {
 public:
-  TVM_DLL LogicalKernel(ffi::String kernel_id, ffi::String kind,
-                        ffi::String role, Span source_span);
+  TVM_DLL LogicalKernel(ffi::String kernel_id, ffi::String role,
+                        Span source_span);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(LogicalKernel, ffi::ObjectRef,
                                              LogicalKernelNode);
 };

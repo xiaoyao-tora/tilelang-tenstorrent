@@ -569,8 +569,8 @@ class PipeTransferDescriptor(Node):
 
 @tvm_ffi.register_object("tl.tenstorrent.LogicalKernel")
 class LogicalKernel(Node):
-    def __init__(self, kernel_id: str, kind: str, role: str, source_span: Span):
-        self.__init_handle_by_constructor__(_ffi_api.LogicalKernel, kernel_id, kind, role, source_span)
+    def __init__(self, kernel_id: str, role: str, source_span: Span):
+        self.__init_handle_by_constructor__(_ffi_api.LogicalKernel, kernel_id, role, source_span)
 
 
 @tvm_ffi.register_object("tl.tenstorrent.TTBufferMetadata")

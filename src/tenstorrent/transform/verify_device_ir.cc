@@ -923,9 +923,8 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
   const int64_t input_b_id = plan.input_b->dfb_id;
   const int64_t output_id = plan.output->dfb_id;
   if (slot == "trisc") {
-    Check(
-        logical_kernel->kind == "compute" && logical_kernel->role == "add",
-        "Phase 2 trisc LogicalKernel must have kind `compute` and role `add`");
+    Check(logical_kernel->role == "add",
+          "Phase 2 trisc LogicalKernel must have role `add`");
     VerifyMarkerSequence(
         ParseMarkers(func->body, symbol),
         {{MarkerKind::kDFBReserve, {output_id}},
@@ -937,10 +936,8 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
     return;
   }
   if (slot == "ncrisc") {
-    Check(logical_kernel->kind == "datamovement" &&
-              logical_kernel->role == "tensor_io",
-          "Phase 2 ncrisc LogicalKernel must have kind `datamovement` and role "
-          "`tensor_io`");
+    Check(logical_kernel->role == "tensor_io",
+          "Phase 2 ncrisc LogicalKernel must have role `tensor_io`");
     VerifyMarkerSequence(ParseMarkers(func->body, symbol),
                          {{MarkerKind::kDFBReserve, {input_a_id}},
                           {MarkerKind::kTensorToDFB,
@@ -954,7 +951,7 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
                          symbol);
     return;
   }
-  Check(logical_kernel->kind == "idle" && logical_kernel->role == "idle",
+  Check(logical_kernel->role == "idle",
         "Phase 2 brisc LogicalKernel must be canonical idle");
   Check(IsCanonicalNoOp(func->body),
         "Phase 2 brisc body must be the canonical Evaluate(0) no-op");
@@ -1093,8 +1090,6 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
     Check(kernel_ids.insert(logical_kernel->kernel_id).second,
           "duplicate logical kernel ID `" +
               std::string(logical_kernel->kernel_id) + "`");
-    Check(!logical_kernel->kind.empty(),
-          "PrimFunc `" + symbol + "` has no logical kernel kind");
     Check(!logical_kernel->role.empty(),
           "PrimFunc `" + symbol + "` has no logical kernel role");
     Check(!require_span || logical_kernel->source_span.defined(),

@@ -34,7 +34,7 @@ def _make_slot(slot: str, *, role: str = "idle", noc_index=None):
         slot,
         thread,
         noc_index,
-        LogicalKernel(f"kernel.{slot}", role, role, _span(2)),
+        LogicalKernel(f"kernel.{slot}", role, _span(2)),
         [],
         CoreDomain((0, 0), (1, 1)),
     )

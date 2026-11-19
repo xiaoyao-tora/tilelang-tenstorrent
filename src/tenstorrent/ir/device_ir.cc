@@ -554,12 +554,11 @@ void PipeTransferDescriptorNode::RegisterReflection() {
       .def_ro("source_span", &PipeTransferDescriptorNode::source_span);
 }
 
-LogicalKernel::LogicalKernel(ffi::String kernel_id, ffi::String kind,
-                             ffi::String role, Span source_span) {
+LogicalKernel::LogicalKernel(ffi::String kernel_id, ffi::String role,
+                             Span source_span) {
   ffi::ObjectPtr<LogicalKernelNode> node =
       ffi::make_object<LogicalKernelNode>();
   node->kernel_id = std::move(kernel_id);
-  node->kind = std::move(kind);
   node->role = std::move(role);
   node->source_span = std::move(source_span);
   data_ = std::move(node);
@@ -569,7 +568,6 @@ void LogicalKernelNode::RegisterReflection() {
   namespace refl = ffi::reflection;
   refl::ObjectDef<LogicalKernelNode>()
       .def_ro("kernel_id", &LogicalKernelNode::kernel_id)
-      .def_ro("kind", &LogicalKernelNode::kind)
       .def_ro("role", &LogicalKernelNode::role)
       .def_ro("source_span", &LogicalKernelNode::source_span);
 }
@@ -864,10 +862,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(source_span));
            })
       .def("tl.tenstorrent.LogicalKernel",
-           [](ffi::String kernel_id, ffi::String kind, ffi::String role,
-              Span source_span) {
-             return LogicalKernel(std::move(kernel_id), std::move(kind),
-                                  std::move(role), std::move(source_span));
+           [](ffi::String kernel_id, ffi::String role, Span source_span) {
+             return LogicalKernel(std::move(kernel_id), std::move(role),
+                                  std::move(source_span));
            })
       .def("tl.tenstorrent.TTBufferMetadata",
            [](ffi::String buffer_id, tirx::Buffer buffer, ffi::String kind,
