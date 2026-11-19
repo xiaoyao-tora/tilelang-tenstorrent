@@ -152,153 +152,6 @@ struct FamilyBuilder {
   }
 };
 
-struct CurrentStorageGroups {
-  ffi::Array<DFBStorageGroupDescriptor> descriptors;
-  ffi::Array<DFBStorageGroupRelation> relations;
-};
-
-bool SameStorageGroupContract(const DFBStorageGroupDescriptor &group,
-                              const DFBDescriptor &dfb) {
-  return group->element_dtype == dfb->element_dtype &&
-         ffi::StructuralEqual()(group->tile_shape, dfb->tile_shape) &&
-         ffi::StructuralEqual()(group->block_shape_in_tiles,
-                                dfb->block_shape_in_tiles) &&
-         ffi::StructuralEqual()(group->block_count, dfb->block_count) &&
-         group->producer_slot == dfb->producer_slot &&
-         ffi::StructuralEqual()(group->producer_domain, dfb->producer_domain) &&
-         group->consumer_slot == dfb->consumer_slot &&
-         ffi::StructuralEqual()(group->consumer_domain, dfb->consumer_domain);
-}
-
-CurrentStorageGroups BuildCurrentStorageGroups(
-    const ffi::Array<DFBDescriptor> &dfbs,
-    const ffi::Array<DeviceIRDescriptorFamily> &families,
-    const ffi::Optional<ffi::Map<ffi::String, Integer>> &raw_groups,
-    const ffi::Optional<ffi::Map<ffi::String, ffi::Array<Integer>>>
-        &raw_relations,
-    int64_t pipeline_depth) {
-  std::map<int64_t, DFBDescriptor> by_id;
-  for (const DFBDescriptor &dfb : dfbs)
-    Check(dfb.defined() && by_id.emplace(dfb->dfb_id, dfb).second,
-          "DFB IDs must be dense and unique before storage grouping");
-  if (raw_groups.has_value())
-    Check(raw_groups.value().size() == dfbs.size(),
-          "internal storage groups must cover every DFB generation");
-  if (raw_relations.has_value())
-    Check(raw_relations.value().size() == dfbs.size(),
-          "internal transaction relations must cover every DFB generation");
-  Check(pipeline_depth == 0 || raw_groups.has_value(),
-        "pipelined DFB families require an explicit storage-group plan");
-  std::set<std::string> canonical_keys;
-  for (const auto &[id, dfb] : by_id)
-    canonical_keys.insert(std::to_string(id));
-  if (raw_groups.has_value())
-    for (const auto &[key, group] : raw_groups.value())
-      Check(canonical_keys.count(std::string(key)),
-            "storage metadata requires a canonical decimal DFB key");
-  if (raw_relations.has_value()) {
-    for (const auto &[key, relation] : raw_relations.value()) {
-      Check(canonical_keys.count(std::string(key)),
-            "storage metadata requires a canonical decimal DFB key");
-      Check(relation.size() == 2,
-            "internal transaction relation must be [ordinal, stage]");
-      int64_t iteration = relation[0]->value;
-      int64_t stage = relation[1]->value;
-      Check(pipeline_depth > 0 &&
-                ((iteration == -1 && stage == 0) ||
-                 (iteration >= 0 && stage == iteration % pipeline_depth)),
-            "pipeline relation has invalid iteration/stage");
-    }
-  }
-
-  CurrentStorageGroups result;
-  std::map<int64_t, int64_t> canonical_groups;
-  std::map<int64_t, std::set<int64_t>> ordinals;
-  std::map<int64_t, int64_t> next_raw_ordinal;
-  int64_t next_distinct_group = 0;
-  for (size_t family_id = 0; family_id < families.size(); ++family_id) {
-    const DeviceIRDescriptorFamily &family = families[family_id];
-    Check(family.defined() && family->fields.count("dfb_id"),
-          "DFB family is missing its dfb_id relation");
-    std::vector<int64_t> ids = ExpandDeviceIntColumn(
-        family->fields.at("dfb_id"), family->positions->count);
-    std::vector<int64_t> group_column;
-    std::vector<int64_t> ordinal_column;
-    std::vector<int64_t> pipeline_iteration_column;
-    group_column.reserve(ids.size());
-    ordinal_column.reserve(ids.size());
-    pipeline_iteration_column.reserve(ids.size());
-    auto prototype = family->prototype.as<DFBDescriptor>();
-    Check(prototype.has_value(), "DFB family has the wrong prototype type");
-    const auto *capacity_value =
-        prototype.value()->block_count.as<IntImmNode>();
-    Check(capacity_value && capacity_value->value > 0,
-          "DFB family capacity must be a positive static integer");
-    // A missing internal plan carries no FIFO/lifetime proof. Keep generations
-    // independent instead of inferring logical reuse from capacity alone.
-    int64_t group_period = static_cast<int64_t>(ids.size());
-    int64_t family_group_base = next_distinct_group;
-    next_distinct_group += group_period;
-    for (size_t row = 0; row < ids.size(); ++row) {
-      int64_t id = ids[row];
-      Check(by_id.count(id), "DFB family references a missing generation");
-      int64_t raw_group =
-          family_group_base + static_cast<int64_t>(row) % group_period;
-      int64_t ordinal = static_cast<int64_t>(row) / group_period;
-      int64_t pipeline_iteration = -1;
-      if (raw_relations.has_value()) {
-        ffi::String key = std::to_string(id);
-        Check(raw_relations.value().count(key),
-              "internal transaction relations have a missing DFB generation");
-        ffi::Array<Integer> relation = raw_relations.value().at(key);
-        Check(relation.size() == 2,
-              "internal transaction relation must be [ordinal, stage]");
-        pipeline_iteration = relation[0]->value;
-      }
-      if (raw_groups.has_value()) {
-        ffi::String key = std::to_string(id);
-        Check(raw_groups.value().count(key),
-              "internal storage groups have a missing DFB generation");
-        raw_group = raw_groups.value().at(key)->value;
-        ordinal = raw_relations.has_value()
-                      ? (pipeline_iteration < 0 ? 0 : pipeline_iteration)
-                      : next_raw_ordinal[raw_group]++;
-      }
-      Check(raw_group >= 0 && ordinal >= 0,
-            "storage group IDs and transaction ordinals must be non-negative");
-      auto [found, inserted] =
-          canonical_groups.emplace(raw_group, canonical_groups.size());
-      int64_t group_id = found->second;
-      const DFBDescriptor &dfb = by_id.at(id);
-      if (inserted) {
-        result.descriptors.push_back(DFBStorageGroupDescriptor(
-            group_id, dfb->element_dtype, dfb->tile_shape,
-            dfb->block_shape_in_tiles, dfb->block_count, dfb->producer_slot,
-            dfb->producer_domain, dfb->consumer_slot, dfb->consumer_domain,
-            dfb->transaction_count_or_loop_relation, std::nullopt,
-            dfb->source_span));
-      } else {
-        Check(
-            SameStorageGroupContract(result.descriptors[group_id], dfb),
-            "storage-group generations disagree on capacity, layout, or slots");
-      }
-      Check(ordinals[group_id].insert(ordinal).second,
-            "one logical storage group has a duplicate generation ordinal");
-      group_column.push_back(group_id);
-      ordinal_column.push_back(ordinal);
-      pipeline_iteration_column.push_back(pipeline_iteration);
-    }
-    result.relations.push_back(DFBStorageGroupRelation(
-        family_id, MakeDeviceIntColumn(group_column),
-        MakeDeviceIntColumn(ordinal_column),
-        MakeDeviceIntColumn(pipeline_iteration_column)));
-  }
-  Check(result.descriptors.size() == canonical_groups.size() &&
-            result.relations.size() == families.size(),
-        "incomplete current storage-group construction");
-  return result;
-}
-
 DFBDescriptor RebuildDFB(const DFBDescriptor &prototype, int64_t identifier,
                          const ffi::String &source) {
   return DFBDescriptor(identifier, source, prototype->element_dtype,
@@ -474,47 +327,6 @@ ExpandTable(const ffi::Array<DeviceIRDescriptorFamily> &families, int64_t total,
   }
   for (const Descriptor &descriptor : table)
     Check(descriptor.defined(), "missing descriptor table position");
-  return ffi::Array<Descriptor>(table.begin(), table.end());
-}
-
-ffi::Array<DeviceIRDescriptorFamily>
-LocalizeFamilyPositions(const ffi::Array<DeviceIRDescriptorFamily> &families) {
-  ffi::Array<DeviceIRDescriptorFamily> result;
-  for (const DeviceIRDescriptorFamily &family : families) {
-    std::vector<int64_t> positions(family->positions->count);
-    std::iota(positions.begin(), positions.end(), 0);
-    result.push_back(DeviceIRDescriptorFamily(
-        family->prototype, MakeDeviceIntColumn(positions), family->fields,
-        family->source_parts));
-  }
-  return result;
-}
-
-template <typename Descriptor, typename Restore, typename Identifier>
-ffi::Array<Descriptor>
-ExpandCurrentTable(const ffi::Array<DeviceIRDescriptorFamily> &families,
-                   int64_t total, Restore restore, Identifier identifier) {
-  std::vector<Descriptor> table;
-  table.reserve(total);
-  for (const DeviceIRDescriptorFamily &family : families) {
-    auto prototype = family->prototype.as<Descriptor>();
-    Check(prototype.has_value(), "wrong current family prototype type");
-    std::vector<int64_t> positions = ExpandDeviceIntColumn(family->positions);
-    for (size_t index = 0; index < positions.size(); ++index)
-      Check(positions[index] == static_cast<int64_t>(index),
-            "current family positions must be dense local ordinals");
-    std::vector<Descriptor> entries = restore(family, prototype.value());
-    table.insert(table.end(), entries.begin(), entries.end());
-  }
-  Check(table.size() == static_cast<size_t>(total),
-        "current family expansion size mismatch");
-  std::sort(table.begin(), table.end(),
-            [&](const Descriptor &a, const Descriptor &b) {
-              return identifier(a) < identifier(b);
-            });
-  for (size_t index = 0; index < table.size(); ++index)
-    Check(identifier(table[index]) == static_cast<int64_t>(index),
-          "current family identifiers must be dense and unique");
   return ffi::Array<Descriptor>(table.begin(), table.end());
 }
 
@@ -1226,9 +1038,6 @@ IRModule ParameterizeCurrentDeviceTables(IRModule mod) {
       mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(kComputeValueTableAttr);
   auto transports =
       mod->GetAttr<ffi::Array<PipeDescriptor>>("tt.transport_table");
-  bool stream_operands =
-      mod->GetAttr<Integer>("tt.stream_operands").value_or(Integer(0))->value ==
-      1;
   Check(dfbs.has_value(), "current Device IR is missing tt.dfb_table");
   Check(transports.has_value(),
         "current Device IR is missing tt.transport_table");
@@ -1318,51 +1127,13 @@ IRModule ParameterizeCurrentDeviceTables(IRModule mod) {
                     .second,
             "duplicate Core-local accumulator descriptor ID");
   }
-  ffi::Array<DeviceIRDescriptorFamily> dfb_families =
-      LocalizeFamilyPositions(CompactDFBs(dfbs.value()));
-  bool diagnostic_expansion =
-      mod->attrs->dict.count("tt.current_device_table_expansion");
-  auto stages = mod->GetAttr<Integer>(kPipelineStagesAttr);
-  auto extent = mod->GetAttr<Integer>(kPipelineExtentAttr);
-  if (stages.has_value() != extent.has_value())
-    Check(false, stages.has_value()
-                     ? "missing required Module attr tt.pipeline_extent"
-                     : "missing required Module attr tt.pipeline_stages");
-  int64_t pipeline_depth = stages.has_value() ? std::min(stages.value()->value,
-                                                         extent.value()->value)
-                                              : 0;
-  ffi::Optional<ffi::Map<ffi::String, Integer>> raw_groups;
-  ffi::Optional<ffi::Map<ffi::String, ffi::Array<Integer>>> raw_relations;
-  if (!stream_operands) {
-    raw_groups = diagnostic_expansion && pipeline_depth > 0
-                     ? mod->GetAttr<ffi::Map<ffi::String, Integer>>(
-                           kDFBStorageGroupsAttr)
-                     : mod->GetAttr<ffi::Map<ffi::String, Integer>>(
-                           kInternalDFBStorageGroupsAttr);
-    raw_relations =
-        diagnostic_expansion && pipeline_depth > 0
-            ? mod->GetAttr<ffi::Map<ffi::String, ffi::Array<Integer>>>(
-                  kPipelineRelationsAttr)
-            : mod->GetAttr<ffi::Map<ffi::String, ffi::Array<Integer>>>(
-                  kInternalDFBTransactionRelationsAttr);
-  }
   auto planned_streams = mod->GetAttr<ffi::Array<DFBStorageGroupDescriptor>>(
       kDFBStorageGroupsAttr);
-  CurrentStorageGroups storage;
-  if (stream_operands) {
-    Check(planned_streams.has_value(),
-          "stream-centric Device IR requires materialized logical streams");
-    storage.descriptors = planned_streams.value();
-    mod = WithoutAttr(mod, kDFBFamiliesAttr);
-    mod = WithoutAttr(mod, kDFBStorageGroupRelationsAttr);
-  } else {
-    storage = BuildCurrentStorageGroups(dfbs.value(), dfb_families, raw_groups,
-                                        raw_relations, pipeline_depth);
-    mod = WithAttr(mod, kDFBFamiliesAttr, dfb_families);
-    mod = WithAttr(mod, kDFBStorageGroupRelationsAttr, storage.relations);
-  }
+  Check(planned_streams.has_value(),
+        "stream-centric Device IR requires materialized logical streams");
+  mod = WithoutAttr(mod, kDFBFamiliesAttr);
   mod = WithoutAttr(mod, kDFBTableAttr);
-  mod = WithAttr(mod, kDFBStorageGroupsAttr, storage.descriptors);
+  mod = WithAttr(mod, kDFBStorageGroupsAttr, planned_streams.value());
   if (mod->attrs->dict.count("tt.expanded_storage_group_descriptors"))
     mod = WithoutAttr(mod, "tt.expanded_storage_group_descriptors");
   if (mod->attrs->dict.count("tt.current_device_table_expansion"))
@@ -1373,12 +1144,6 @@ IRModule ParameterizeCurrentDeviceTables(IRModule mod) {
     mod = WithoutAttr(mod, kExpandedAccumulatorLocalIDs);
   if (mod->attrs->dict.count(kExpandedComputeValueLocalIDs))
     mod = WithoutAttr(mod, kExpandedComputeValueLocalIDs);
-  if (mod->attrs->dict.count(kInternalDFBStorageGroupsAttr))
-    mod = WithoutAttr(mod, kInternalDFBStorageGroupsAttr);
-  if (mod->attrs->dict.count(kInternalDFBTransactionRelationsAttr))
-    mod = WithoutAttr(mod, kInternalDFBTransactionRelationsAttr);
-  if (mod->attrs->dict.count(kPipelineRelationsAttr))
-    mod = WithoutAttr(mod, kPipelineRelationsAttr);
   mod = WithAttr(mod, kTransportFamiliesAttr,
                  CompactCurrentTransports(transports.value()));
   mod = WithoutAttr(mod, "tt.transport_table");
@@ -1398,11 +1163,6 @@ IRModule ParameterizeCurrentDeviceTables(IRModule mod) {
 IRModule ExpandCurrentDeviceTables(IRModule mod) {
   if (!HasCurrentDeviceFamilies(mod))
     return mod;
-  bool stream_operands =
-      mod->GetAttr<Integer>("tt.stream_operands").value_or(Integer(0))->value ==
-      1;
-  auto dfbs =
-      mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(kDFBFamiliesAttr);
   auto accumulators = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
       kAccumulatorFamiliesAttr);
   auto values = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
@@ -1411,21 +1171,12 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
       kTransportFamiliesAttr);
   auto storage_groups = mod->GetAttr<ffi::Array<DFBStorageGroupDescriptor>>(
       kDFBStorageGroupsAttr);
-  auto storage_relations = mod->GetAttr<ffi::Array<DFBStorageGroupRelation>>(
-      kDFBStorageGroupRelationsAttr);
   Check(transports.has_value(),
         "current Device family representation requires transport families");
   Check(storage_groups.has_value(),
         "current Device representation requires typed logical streams");
-  if (stream_operands) {
-    Check(!dfbs.has_value() && !storage_relations.has_value(),
-          "stream-centric Device IR cannot persist DFB generation families");
-  } else {
-    Check(dfbs.has_value() && storage_relations.has_value() &&
-              storage_relations.value().size() == dfbs.value().size(),
-          "current Device family representation requires DFB families and "
-          "storage relations");
-  }
+  Check(!mod->attrs->dict.count(kDFBFamiliesAttr),
+        "stream-centric Device IR cannot persist DFB generation families");
   Check(!mod->attrs->dict.count(kDFBTableAttr) &&
             !mod->attrs->dict.count("tt.transport_table") &&
             (!accumulators.has_value() ||
@@ -1433,7 +1184,6 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
             (!values.has_value() ||
              !mod->attrs->dict.count(kComputeValueTableAttr)),
         "current Device IR cannot mix a table with its family representation");
-  int64_t dfb_count = dfbs.has_value() ? TableSize(dfbs.value()) : 0;
   int64_t accumulator_count =
       accumulators.has_value() ? TableSize(accumulators.value()) : 0;
   int64_t value_count = values.has_value() ? TableSize(values.value()) : 0;
@@ -1443,82 +1193,22 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
   Check(compute.accumulators.size() == static_cast<size_t>(accumulator_count) &&
             compute.values.size() == static_cast<size_t>(value_count),
         "current compute family expansion size mismatch");
-  Check(dfb_count <= kExpansionBudget - accumulator_count &&
-            dfb_count + accumulator_count <= kExpansionBudget - value_count &&
-            dfb_count + accumulator_count + value_count <=
+  Check(accumulator_count <= kExpansionBudget &&
+            accumulator_count + value_count <=
                 kExpansionBudget - transport_count,
         "current Device family expansion exceeds the bounded proof budget");
-  ffi::Map<ffi::String, Integer> expanded_groups;
-  ffi::Map<ffi::String, ffi::Array<Integer>> expanded_relations;
-  int64_t pipeline_depth = 1;
-  auto pipeline_stages = mod->GetAttr<Integer>(kPipelineStagesAttr);
-  auto pipeline_extent = mod->GetAttr<Integer>(kPipelineExtentAttr);
-  if (pipeline_stages.has_value() && pipeline_extent.has_value())
-    pipeline_depth = std::min(pipeline_stages.value()->value,
-                              pipeline_extent.value()->value);
-  if (!stream_operands) {
-    for (size_t family_id = 0; family_id < dfbs.value().size(); ++family_id) {
-      const DeviceIRDescriptorFamily &family = dfbs.value()[family_id];
-      const DFBStorageGroupRelation &relation =
-          storage_relations.value()[family_id];
-      Check(relation.defined() &&
-                relation->dfb_family_id == static_cast<int64_t>(family_id) &&
-                family->fields.count("dfb_id"),
-            "storage-group relation does not match its DFB family");
-      std::vector<int64_t> ids = ExpandDeviceIntColumn(
-          family->fields.at("dfb_id"), family->positions->count);
-      std::vector<int64_t> groups = ExpandDeviceIntColumn(
-          relation->storage_group_ids, family->positions->count);
-      std::vector<int64_t> ordinals = ExpandDeviceIntColumn(
-          relation->transaction_ordinals, family->positions->count);
-      std::vector<int64_t> pipeline_iterations = ExpandDeviceIntColumn(
-          relation->pipeline_iterations, family->positions->count);
-      for (size_t row = 0; row < ids.size(); ++row) {
-        ffi::String key = std::to_string(ids[row]);
-        int64_t iteration = pipeline_iterations[row];
-        expanded_groups.Set(key, Integer(groups[row]));
-        expanded_relations.Set(
-            key,
-            {Integer(iteration), Integer(iteration < 0 || pipeline_depth <= 0
-                                             ? 0
-                                             : iteration % pipeline_depth)});
-      }
-    }
-    mod = WithAttr(mod, "tt.expanded_storage_group_descriptors",
-                   storage_groups.value());
-    mod = WithAttr(mod, kDFBStorageGroupsAttr, expanded_groups);
-    mod = WithAttr(mod, kInternalDFBStorageGroupsAttr, expanded_groups);
-    mod = WithoutAttr(mod, kDFBStorageGroupRelationsAttr);
-    mod = WithAttr(mod, "tt.expanded_dfb_transaction_relations",
-                   expanded_relations);
-    if (pipeline_stages.has_value() && pipeline_extent.has_value())
-      mod = WithAttr(mod, kInternalDFBTransactionRelationsAttr,
-                     expanded_relations);
-    if (pipeline_stages.has_value() && pipeline_extent.has_value())
-      mod = WithAttr(mod, kPipelineRelationsAttr, expanded_relations);
-  }
   mod = WithAttr(mod, "tt.current_device_table_expansion", Integer(1));
-  if (stream_operands) {
-    ffi::Array<DFBDescriptor> stream_table;
-    for (const DFBStorageGroupDescriptor &stream : storage_groups.value())
-      stream_table.push_back(DFBDescriptor(
-          stream->storage_group_id,
-          "stream." + std::to_string(stream->storage_group_id),
-          stream->element_dtype, stream->tile_shape,
-          stream->block_shape_in_tiles, stream->block_count, std::nullopt,
-          stream->producer_slot, stream->producer_domain, stream->consumer_slot,
-          stream->consumer_domain, stream->transaction_count_or_loop_relation,
-          stream->source_span));
-    mod = WithAttr(mod, kDFBTableAttr, stream_table);
-  } else {
-    mod = WithAttr(
-        mod, kDFBTableAttr,
-        ExpandCurrentTable<DFBDescriptor>(dfbs.value(), dfb_count, RestoreDFBs,
-                                          [](const DFBDescriptor &descriptor) {
-                                            return descriptor->dfb_id;
-                                          }));
-    mod = WithoutAttr(mod, kDFBFamiliesAttr);
-  }
+  ffi::Array<DFBDescriptor> stream_table;
+  for (const DFBStorageGroupDescriptor &stream : storage_groups.value())
+    stream_table.push_back(DFBDescriptor(
+        stream->storage_group_id,
+        "stream." + std::to_string(stream->storage_group_id),
+        stream->element_dtype, stream->tile_shape,
+        stream->block_shape_in_tiles, stream->block_count, std::nullopt,
+        stream->producer_slot, stream->producer_domain, stream->consumer_slot,
+        stream->consumer_domain, stream->transaction_count_or_loop_relation,
+        stream->source_span));
+  mod = WithAttr(mod, kDFBTableAttr, stream_table);
   mod =
       WithAttr(mod, "tt.transport_table",
                ExpandTable<PipeDescriptor>(transports.value(), transport_count,
@@ -1548,8 +1238,6 @@ IRModule DiscardCurrentDeviceExpansionMetadata(IRModule mod) {
         kExpandedComputeValueLocalIDs})
     if (mod->attrs.defined() && mod->attrs->dict.count(key))
       mod = WithoutAttr(mod, key);
-  if (mod->attrs.defined() && mod->attrs->dict.count(kPipelineRelationsAttr))
-    mod = WithoutAttr(mod, kPipelineRelationsAttr);
   return mod;
 }
 

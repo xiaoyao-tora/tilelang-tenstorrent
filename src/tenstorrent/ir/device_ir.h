@@ -41,12 +41,6 @@ constexpr const char *kComputeRequirementsAttr = "tt.compute_requirements";
 constexpr const char *kDFBTableAttr = "tt.dfb_table";
 constexpr const char *kDFBFamiliesAttr = "tt.dfb_families";
 constexpr const char *kDFBStorageGroupsAttr = "tt.dfb_storage_groups";
-constexpr const char *kDFBStorageGroupRelationsAttr =
-    "tt.dfb_storage_group_relations";
-constexpr const char *kInternalDFBStorageGroupsAttr =
-    "tt.internal_dfb_storage_groups";
-constexpr const char *kInternalDFBTransactionRelationsAttr =
-    "tt.internal_dfb_transaction_relations";
 constexpr const char *kAccumulatorFamiliesAttr = "tt.accumulator_families";
 constexpr const char *kComputeValueFamiliesAttr = "tt.compute_value_families";
 constexpr const char *kTransportFamiliesAttr = "tt.transport_families";
@@ -513,32 +507,6 @@ public:
                             ffi::Array<int64_t> values, int64_t period = 0);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DeviceIRIntColumn, ffi::ObjectRef,
                                              DeviceIRIntColumnNode);
-};
-
-/*! \brief Family-aligned mapping from DFB instances to a logical CB stream. */
-class DFBStorageGroupRelationNode : public ffi::Object {
-public:
-  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
-      kTVMFFISEqHashKindTreeNode;
-  int64_t dfb_family_id;
-  DeviceIRIntColumn storage_group_ids;
-  DeviceIRIntColumn transaction_ordinals;
-  DeviceIRIntColumn pipeline_iterations;
-
-  static void RegisterReflection();
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.DFBStorageGroupRelation",
-                                    DFBStorageGroupRelationNode, ffi::Object);
-};
-
-class DFBStorageGroupRelation : public ffi::ObjectRef {
-public:
-  TVM_DLL DFBStorageGroupRelation(int64_t dfb_family_id,
-                                  DeviceIRIntColumn storage_group_ids,
-                                  DeviceIRIntColumn transaction_ordinals,
-                                  DeviceIRIntColumn pipeline_iterations);
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DFBStorageGroupRelation,
-                                             ffi::ObjectRef,
-                                             DFBStorageGroupRelationNode);
 };
 
 /*! \brief Typed relation family for descriptors sharing immutable fields.

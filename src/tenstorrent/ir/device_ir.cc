@@ -55,7 +55,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   RegisterMetadataPrinter<NormalizedTopologyDescriptor>();
   RegisterMetadataPrinter<CommunicationDescriptor>();
   RegisterMetadataPrinter<DFBStorageGroupDescriptor>();
-  RegisterMetadataPrinter<DFBStorageGroupRelation>();
   RegisterMetadataPrinter<PipeTransferDescriptor>();
   RegisterMetadataPrinter<DeviceIRDescriptorFamily>();
   RegisterMetadataPrinter<DeviceIRIntColumn>();

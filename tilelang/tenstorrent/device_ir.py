@@ -71,7 +71,6 @@ COMPUTE_REGION_REQUIREMENTS_ATTR = "tt.compute_region_requirements"
 DFB_TABLE_ATTR = "tt.dfb_table"
 DFB_FAMILIES_ATTR = "tt.dfb_families"
 DFB_STORAGE_GROUPS_ATTR = "tt.dfb_storage_groups"
-DFB_STORAGE_GROUP_RELATIONS_ATTR = "tt.dfb_storage_group_relations"
 ACCUMULATOR_FAMILIES_ATTR = "tt.accumulator_families"
 COMPUTE_VALUE_FAMILIES_ATTR = "tt.compute_value_families"
 TRANSPORT_FAMILIES_ATTR = "tt.transport_families"
@@ -87,9 +86,6 @@ LOGICAL_KERNEL_ATTR = "tt.logical_kernel"
 TENSOR_ARG_INDICES_ATTR = "tt.tensor_arg_indices"
 CORE_DOMAIN_ATTR = "tt.core_domain"
 BUFFER_METADATA_TABLE_ATTR = "tt.buffer_metadata_table"
-PIPELINE_RELATIONS_ATTR = "tt.pipeline_relations"
-PIPELINE_STAGES_ATTR = "tt.pipeline_stages"
-PIPELINE_EXTENT_ATTR = "tt.pipeline_extent"
 L1_CAPACITY_BYTES_ATTR = "tt.l1_capacity_bytes"
 COMPACT_ORIGINAL_VERSION_ATTR = "tt.compact_original_version"
 COMPACT_DFB_FAMILIES_ATTR = "tt.compact_dfb_families"
@@ -110,28 +106,6 @@ class DeviceIRDescriptorFamily(Node):
 
     def __init__(self, prototype, positions: DeviceIRIntColumn, fields, source_parts=()):
         self.__init_handle_by_constructor__(_ffi_api.DeviceIRDescriptorFamily, prototype, positions, fields, list(source_parts))
-
-
-@tvm_ffi.register_object("tl.tenstorrent.DFBStorageGroupRelation")
-class DFBStorageGroupRelation(Node):
-    """Family-aligned storage-group ID and transaction-ordinal columns."""
-
-    def __init__(
-        self,
-        dfb_family_id: int,
-        storage_group_ids: DeviceIRIntColumn,
-        transaction_ordinals: DeviceIRIntColumn,
-        pipeline_iterations: DeviceIRIntColumn | None = None,
-    ):
-        if pipeline_iterations is None:
-            pipeline_iterations = DeviceIRIntColumn(-1, 0, int(storage_group_ids.count))
-        self.__init_handle_by_constructor__(
-            _ffi_api.DFBStorageGroupRelation,
-            int(dfb_family_id),
-            storage_group_ids,
-            transaction_ordinals,
-            pipeline_iterations,
-        )
 
 
 def compact_device_ir(mod: IRModule, *, force: bool = False) -> IRModule:
@@ -727,9 +701,7 @@ __all__ = (
     "CoreDomain",
     "DFBDescriptor",
     "DFBStorageGroupDescriptor",
-    "DFBStorageGroupRelation",
     "DFB_STORAGE_GROUPS_ATTR",
-    "DFB_STORAGE_GROUP_RELATIONS_ATTR",
     "DeviceIRDescriptorFamily",
     "DeviceIRIntColumn",
     "DeviceFunctionMetadata",

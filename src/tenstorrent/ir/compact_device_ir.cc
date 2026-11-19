@@ -50,33 +50,9 @@ void DeviceIRDescriptorFamilyNode::RegisterReflection() {
       .def_ro("source_parts", &DeviceIRDescriptorFamilyNode::source_parts);
 }
 
-DFBStorageGroupRelation::DFBStorageGroupRelation(
-    int64_t dfb_family_id, DeviceIRIntColumn storage_group_ids,
-    DeviceIRIntColumn transaction_ordinals,
-    DeviceIRIntColumn pipeline_iterations) {
-  auto node = ffi::make_object<DFBStorageGroupRelationNode>();
-  node->dfb_family_id = dfb_family_id;
-  node->storage_group_ids = std::move(storage_group_ids);
-  node->transaction_ordinals = std::move(transaction_ordinals);
-  node->pipeline_iterations = std::move(pipeline_iterations);
-  data_ = std::move(node);
-}
-
-void DFBStorageGroupRelationNode::RegisterReflection() {
-  ffi::reflection::ObjectDef<DFBStorageGroupRelationNode>()
-      .def_ro("dfb_family_id", &DFBStorageGroupRelationNode::dfb_family_id)
-      .def_ro("storage_group_ids",
-              &DFBStorageGroupRelationNode::storage_group_ids)
-      .def_ro("transaction_ordinals",
-              &DFBStorageGroupRelationNode::transaction_ordinals)
-      .def_ro("pipeline_iterations",
-              &DFBStorageGroupRelationNode::pipeline_iterations);
-}
-
 TVM_FFI_STATIC_INIT_BLOCK() {
   DeviceIRIntColumnNode::RegisterReflection();
   DeviceIRDescriptorFamilyNode::RegisterReflection();
-  DFBStorageGroupRelationNode::RegisterReflection();
   ffi::reflection::GlobalDef()
       .def("tl.tenstorrent.DeviceIRIntColumn",
            [](int64_t start, int64_t step, int64_t count,
@@ -91,15 +67,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
              return DeviceIRDescriptorFamily(
                  std::move(prototype), std::move(positions), std::move(fields),
                  std::move(source_parts));
-           })
-      .def("tl.tenstorrent.DFBStorageGroupRelation",
-           [](int64_t dfb_family_id, DeviceIRIntColumn storage_group_ids,
-              DeviceIRIntColumn transaction_ordinals,
-              DeviceIRIntColumn pipeline_iterations) {
-             return DFBStorageGroupRelation(
-                 dfb_family_id, std::move(storage_group_ids),
-                 std::move(transaction_ordinals),
-                 std::move(pipeline_iterations));
            });
 }
 

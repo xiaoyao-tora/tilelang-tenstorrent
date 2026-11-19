@@ -3229,47 +3229,22 @@ using CoreKey = std::pair<int64_t, int64_t>;
 
 struct CurrentStoragePlan {
   std::map<int64_t, DFBStorageGroupDescriptor> groups;
-  std::map<int64_t, int64_t> resource_groups;
-  std::map<int64_t, int64_t> resource_ordinals;
-  std::map<int64_t, int64_t> resource_pipeline_iterations;
-  std::map<int64_t, std::map<int64_t, int64_t>> ordered_resources;
 };
 
 CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
                                             const TensorTable &tensors,
                                             const CoreCoord &launch_grid) {
-  Check(!mod->attrs->dict.count(kInternalDFBStorageGroupsAttr) &&
-            !mod->attrs->dict.count(kInternalDFBTransactionRelationsAttr) &&
-            !mod->attrs->dict.count(kPipelineRelationsAttr),
+  Check(!mod->attrs->dict.count("tt.internal_dfb_storage_groups") &&
+            !mod->attrs->dict.count("tt.internal_dfb_transaction_relations") &&
+            !mod->attrs->dict.count("tt.pipeline_relations"),
         "current Device IR cannot persist concrete storage-group maps");
-  bool stream_operands =
-      mod->GetAttr<Integer>("tt.stream_operands").value_or(Integer(0))->value ==
-      1;
-  auto families =
-      mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(kDFBFamiliesAttr);
+  Check(!mod->attrs->dict.count(kDFBFamiliesAttr) &&
+            !mod->attrs->dict.count("tt.dfb_storage_group_relations"),
+        "stream-centric Device IR cannot persist DFB generation relations");
   auto groups = RequireModuleAttr<ffi::Array<DFBStorageGroupDescriptor>>(
       mod, kDFBStorageGroupsAttr);
-  auto relations = mod->GetAttr<ffi::Array<DFBStorageGroupRelation>>(
-      kDFBStorageGroupRelationsAttr);
-  if (stream_operands) {
-    Check(!families.has_value() && !relations.has_value(),
-          "stream-centric Device IR cannot persist DFB generation relations");
-  } else {
-    Check(families.has_value() && relations.has_value() &&
-              relations.value().size() == families.value().size() &&
-              groups.empty() == families.value().empty(),
-          "current Device IR requires one storage relation per DFB family");
-  }
 
   CurrentStoragePlan result;
-  auto pipeline_stages = mod->GetAttr<Integer>(kPipelineStagesAttr);
-  auto pipeline_extent = mod->GetAttr<Integer>(kPipelineExtentAttr);
-  Check(pipeline_stages.has_value() == pipeline_extent.has_value(),
-        "pipeline stages and extent must be provided together");
-  int64_t pipeline_depth = pipeline_stages.has_value()
-                               ? std::min(pipeline_stages.value()->value,
-                                          pipeline_extent.value()->value)
-                               : 0;
   for (size_t index = 0; index < groups.size(); ++index) {
     const DFBStorageGroupDescriptor &group = groups[index];
     Check(group.defined() &&
@@ -3323,91 +3298,6 @@ CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
     result.groups.emplace(group->storage_group_id, group);
   }
 
-  if (stream_operands)
-    return result;
-
-  for (size_t family_id = 0; family_id < families.value().size(); ++family_id) {
-    const DeviceIRDescriptorFamily &family = families.value()[family_id];
-    const DFBStorageGroupRelation &relation = relations.value()[family_id];
-    Check(relation.defined() &&
-              relation->dfb_family_id == static_cast<int64_t>(family_id) &&
-              family.defined() && family->positions.defined() &&
-              family->fields.count("dfb_id"),
-          "storage relation does not match its DFB family");
-    int64_t count = family->positions->count;
-    std::vector<int64_t> ids =
-        ExpandDeviceIntColumn(family->fields.at("dfb_id"), count);
-    std::vector<int64_t> group_ids =
-        ExpandDeviceIntColumn(relation->storage_group_ids, count);
-    std::vector<int64_t> ordinals =
-        ExpandDeviceIntColumn(relation->transaction_ordinals, count);
-    std::vector<int64_t> pipeline_iterations =
-        ExpandDeviceIntColumn(relation->pipeline_iterations, count);
-    auto prototype = family->prototype.as<DFBDescriptor>();
-    Check(prototype.has_value(), "DFB family has the wrong prototype type");
-    for (int64_t row = 0; row < count; ++row) {
-      int64_t id = ids[row], group_id = group_ids[row], ordinal = ordinals[row];
-      int64_t pipeline_iteration = pipeline_iterations[row];
-      Check(id >= 0 && result.groups.count(group_id) && ordinal >= 0,
-            "storage relation contains an invalid ID or ordinal");
-      Check(result.resource_groups.emplace(id, group_id).second &&
-                result.resource_ordinals.emplace(id, ordinal).second &&
-                result.resource_pipeline_iterations
-                    .emplace(id, pipeline_iteration)
-                    .second &&
-                result.ordered_resources[group_id].emplace(ordinal, id).second,
-            "storage relation has duplicate DFB identities or ordinals");
-      Check((pipeline_depth == 0 && pipeline_iteration == -1) ||
-                (pipeline_depth > 0 &&
-                 (pipeline_iteration == -1 ||
-                  (pipeline_iteration >= 0 &&
-                   pipeline_iteration < pipeline_extent.value()->value &&
-                   pipeline_iteration == ordinal))),
-            "storage relation has an invalid pipeline iteration");
-      const DFBStorageGroupDescriptor &group = result.groups.at(group_id);
-      const DFBDescriptor &dfb = prototype.value();
-      Check(group->element_dtype == dfb->element_dtype &&
-                ffi::StructuralEqual()(group->tile_shape, dfb->tile_shape) &&
-                ffi::StructuralEqual()(group->block_shape_in_tiles,
-                                       dfb->block_shape_in_tiles) &&
-                ffi::StructuralEqual()(group->block_count, dfb->block_count) &&
-                group->producer_slot == dfb->producer_slot &&
-                ffi::StructuralEqual()(group->producer_domain,
-                                       dfb->producer_domain) &&
-                group->consumer_slot == dfb->consumer_slot &&
-                ffi::StructuralEqual()(group->consumer_domain,
-                                       dfb->consumer_domain),
-            "DFB family and storage group contracts disagree");
-    }
-  }
-  Check(result.resource_groups.empty() == families.value().empty(),
-        "current Device IR has incomplete storage-group resource relations");
-  for (const auto &[group_id, resources] : result.ordered_resources) {
-    Check(!resources.empty() && resources.begin()->first == 0,
-          "storage-group transaction ordinals must start at zero");
-    int64_t expected = 0;
-    for (const auto &[ordinal, resource] : resources)
-      Check(ordinal == expected++,
-            "storage-group transaction ordinals must be dense");
-    if (pipeline_depth > 0) {
-      std::set<int64_t> iterations;
-      for (const auto &[ordinal, resource] : resources)
-        iterations.insert(result.resource_pipeline_iterations.at(resource));
-      bool singleton = iterations.count(-1);
-      Check((singleton && resources.size() == 1 && iterations.size() == 1) ||
-                (!singleton &&
-                 resources.size() ==
-                     static_cast<size_t>(pipeline_extent.value()->value) &&
-                 *iterations.begin() == 0 &&
-                 *iterations.rbegin() == pipeline_extent.value()->value - 1),
-            "DFB transaction count disagrees with pipeline group coverage");
-      if (!singleton)
-        Check(RequireStaticInteger(result.groups.at(group_id)->block_count,
-                                   "pipeline storage-group capacity") >=
-                  pipeline_depth,
-              "pipeline storage-group capacity insufficient");
-    }
-  }
   return result;
 }
 
@@ -3415,45 +3305,17 @@ void VerifyCurrentL1Budget(
     const IRModule &mod, const DFBTable &dfbs,
     const std::map<int64_t, std::set<CoreKey>> &resource_cores,
     const CurrentStoragePlan &storage) {
-  if (mod->attrs->dict.count(kPipelineStagesAttr) ||
-      mod->attrs->dict.count(kPipelineExtentAttr) ||
-      mod->attrs->dict.count("tt.pipeline_wait_policy")) {
-    int64_t stages =
-        RequireModuleAttr<Integer>(mod, kPipelineStagesAttr)->value;
-    int64_t extent =
-        RequireModuleAttr<Integer>(mod, kPipelineExtentAttr)->value;
-    Check(stages > 0 && stages <= 32 && extent > 0 && extent <= 1024,
-          "current Device pipeline stages/extent are outside supported bounds");
-    auto wait_policy =
-        RequireModuleAttr<ffi::String>(mod, "tt.pipeline_wait_policy");
-    Check(wait_policy == "conservative" || wait_policy == "delayed",
-          "current Device pipeline wait policy is invalid");
-  }
-
   std::map<CoreKey, int64_t> payload;
   int64_t total_payload = 0;
   for (const auto &[group_id, group] : storage.groups) {
     std::set<CoreKey> cores;
-    bool stream_operands = mod->GetAttr<Integer>("tt.stream_operands")
-                               .value_or(Integer(0))
-                               ->value == 1;
-    if (stream_operands) {
-      Check(dfbs.count(group_id),
-            "logical stream descriptor references a missing DFB");
-      auto uses = resource_cores.find(group_id);
-      Check(uses != resource_cores.end() && !uses->second.empty(),
-            "current Device stream has no body use: " +
-                std::to_string(group_id));
-      cores.insert(uses->second.begin(), uses->second.end());
-    } else {
-      for (const auto &[ordinal, id] : storage.ordered_resources.at(group_id)) {
-        Check(dfbs.count(id), "storage relation references a missing DFB");
-        auto uses = resource_cores.find(id);
-        Check(uses != resource_cores.end() && !uses->second.empty(),
-              "current Device DFB has no body use: " + std::to_string(id));
-        cores.insert(uses->second.begin(), uses->second.end());
-      }
-    }
+    Check(dfbs.count(group_id),
+          "logical stream descriptor references a missing DFB");
+    auto uses = resource_cores.find(group_id);
+    Check(uses != resource_cores.end() && !uses->second.empty(),
+          "current Device stream has no body use: " +
+              std::to_string(group_id));
+    cores.insert(uses->second.begin(), uses->second.end());
     const std::string label =
         "current Device storage group " + std::to_string(group_id);
     int64_t bytes =
@@ -4198,12 +4060,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   auto diagnostic_expansion =
       mod->GetAttr<Integer>("tt.current_device_table_expansion");
   if (diagnostic_expansion.has_value()) {
-    bool stream_operands = mod->GetAttr<Integer>("tt.stream_operands")
-                               .value_or(Integer(0))
-                               ->value == 1;
-    Check(diagnostic_expansion.value()->value == 1 &&
-              (stream_operands ||
-               mod->attrs->dict.count("tt.expanded_storage_group_descriptors")),
+    Check(diagnostic_expansion.value()->value == 1,
           "invalid current Device diagnostic expansion marker");
     IRModule parameterized = ParameterizeCurrentDeviceTables(mod);
     VerifyCurrentDeviceModule(std::move(parameterized));
@@ -4263,9 +4120,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       VerifyTensorTable(tensors, launch_grid, true, false);
   CurrentStoragePlan storage =
       VerifyCurrentStoragePlan(parameterized, tensor_table, launch_grid);
-  bool stream_operands = parameterized->GetAttr<Integer>("tt.stream_operands")
-                             .value_or(Integer(0))
-                             ->value == 1;
   mod = ExpandCurrentDeviceTables(mod);
   ffi::Array<DFBDescriptor> dfbs =
       RequireModuleAttr<ffi::Array<DFBDescriptor>>(mod, kDFBTableAttr);
@@ -4776,10 +4630,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               "Tensor transfer references missing DFB");
         const TensorDescriptor &tensor = tensor_table.at(tensor_id);
         const DFBDescriptor &dfb = dfb_table.at(dfb_id);
-        if (!stream_operands)
-          Check(dfb->tensor_backing.has_value() &&
-                    dfb->tensor_backing.value()->global_arg_index == tensor_id,
-                "Tensor transfer disagrees with DFB Tensor backing");
         Check(call->args.size() == 2,
               "current Tensor transfer requires Tensor/DFB operands only");
         auto starts_attr = call->annotations.Get("tt.starts");
@@ -5561,9 +5411,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 const DFBDescriptor &descriptor = dfb_table.at(resource);
                 bool forwarding =
                     owner == descriptor->producer_slot &&
-                    (stream_operands
-                         ? active_producer_transaction.count(resource)
-                         : descriptor->tensor_backing.has_value());
+                    active_producer_transaction.count(resource);
                 if (forwarding) {
                   auto &entry = state(producer_key(resource));
                   Check(
@@ -5605,9 +5453,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 const DFBDescriptor &descriptor = dfb_table.at(resource);
                 bool forwarding =
                     owner == descriptor->producer_slot &&
-                    (stream_operands
-                         ? active_producer_transaction.count(resource)
-                         : descriptor->tensor_backing.has_value());
+                    active_producer_transaction.count(resource);
                 if (forwarding) {
                   auto &entry = state(producer_key(resource));
                   Check(entry.produced,
@@ -5681,8 +5527,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                                              tensor_table.at(tensor)->dtype);
                 }
               } else if (call->op.same_as(dfb_compute())) {
-                VerifyGeneralCompute(call, dfb_table, &bound_loop_vars,
-                                     stream_operands);
+                VerifyGeneralCompute(call, dfb_table, &bound_loop_vars, true);
               }
             } catch (const ffi::Error &error) {
               Fail(OperationContext(func, Evaluate(call)) + error.what());
@@ -5741,16 +5586,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
     int64_t transaction = std::get<3>(key);
     int64_t group = resource;
     int64_t ordinal = transaction;
-    if (stream_operands) {
-      Check(storage.groups.count(resource),
-            "reserved DFB references a missing logical stream");
-    } else {
-      Check(storage.resource_groups.count(resource) &&
-                storage.resource_ordinals.count(resource),
-            "reserved DFB has no storage-group relation");
-      group = storage.resource_groups.at(resource);
-      ordinal = storage.resource_ordinals.at(resource);
-    }
+    Check(storage.groups.count(resource),
+          "reserved DFB references a missing logical stream");
     group_reserves[{x, y, group}].push_back(
         {ordinal, resource, transaction, event});
   }

@@ -190,9 +190,6 @@ def test_pipeline_device_numerics_and_ring_reuse(stages, extent, start, seed, wa
         np.testing.assert_array_equal(value, a + b + np.float32(iteration))
     np.testing.assert_array_equal(actual[-1], a + b + np.float32(start + extent - 1))
     assert max(trace["pool_high_water"].values()) <= min(stages, extent)
-    # Lower preserves the policy on the structured loop; this Device reference
-    # executes lexical order. TTL/TT-Lang owns delayed window scheduling.
-    assert str(mod.attrs["tt.pipeline_wait_policy"]) == wait_policy
     assert trace["copy_high_water"] == 1
 
 

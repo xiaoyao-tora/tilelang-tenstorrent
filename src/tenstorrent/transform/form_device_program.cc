@@ -4475,7 +4475,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   int64_t pipeline_stages = 0, pipeline_extent = 0;
   ffi::String pipeline_wait_policy;
   ffi::Map<ffi::String, Integer> storage_groups;
-  ffi::Map<ffi::String, ffi::Array<Integer>> pipeline_relations;
   bool producer_forwarding = false;
   bool precision_regions = false;
   CoreDomain shared_domain(CoreCoord(0, 0), CoreCoord(gx, gy));
@@ -4561,21 +4560,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                 "Core-local storage groups disagree for one logical DFB");
         } else {
           storage_groups.Set(global_key, group);
-        }
-      }
-      for (const auto &[key, relation] : planner.PipelineRelations()) {
-        int64_t local = std::stoll(std::string(key));
-        if (local < 0 || local >= static_cast<int64_t>(resource_ids.size()) ||
-            resource_ids[local] < 0)
-          ThrowMalformed("pipeline relation references dead DFB");
-        ffi::String global_key = std::to_string(resource_ids[local]);
-        if (pipeline_relations.count(global_key)) {
-          if (!ffi::StructuralEqual()(pipeline_relations.at(global_key),
-                                      relation))
-            ThrowUnsupported(
-                "Core-local pipeline relations disagree for one logical DFB");
-        } else {
-          pipeline_relations.Set(global_key, relation);
         }
       }
     }
@@ -4898,7 +4882,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       {kTensorTableAttr, tensors},
       {kDFBTableAttr, dfbs},
       {kDFBStorageGroupsAttr, stream_plan.descriptors},
-      {"tt.stream_operands", Integer(1)},
       {"tt.communication_table", communications},
       {"tt.transport_table", pipes},
       {kKernelOrderAttr, order}};
@@ -4906,14 +4889,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     attrs.Set(kAccumulatorTableAttr, accumulators);
   if (!compute_values.empty())
     attrs.Set(kComputeValueTableAttr, compute_values);
-  if (!storage_groups.empty())
-    attrs.Set(kInternalDFBStorageGroupsAttr, storage_groups);
-  if (pipeline_extent) {
-    attrs.Set(kInternalDFBTransactionRelationsAttr, pipeline_relations);
-    attrs.Set("tt.pipeline_stages", Integer(pipeline_stages));
-    attrs.Set("tt.pipeline_extent", Integer(pipeline_extent));
-    attrs.Set("tt.pipeline_wait_policy", pipeline_wait_policy);
-  }
   auto capacity = input->GetAttr<Integer>("tt.l1_capacity_bytes");
   if (capacity.has_value())
     attrs.Set("tt.l1_capacity_bytes", capacity.value());

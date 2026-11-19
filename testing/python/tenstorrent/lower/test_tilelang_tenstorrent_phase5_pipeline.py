@@ -78,8 +78,6 @@ def test_pipeline_preserves_structured_transaction_epochs(stages, extent, start,
     mod = lower_pipeline(func, arch)
     assert str(mod.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in mod.attrs
-    assert int(mod.attrs["tt.pipeline_stages"]) == stages
-    assert int(mod.attrs["tt.pipeline_extent"]) == extent
     depth = min(stages, extent)
     groups = list(mod.attrs["tt.dfb_storage_groups"])
     dfbs = mod.attrs["tt.dfb_table"]
@@ -135,11 +133,8 @@ def test_loop_plan_keeps_input_immutable_and_reusable(stages, arch):
     second = lower_pipeline(func, arch)
     assert ir.save_json(func) == original, "input must stay immutable across repeated lowering"
     assert ir.save_json(first) == ir.save_json(second)
-    if stages:
-        assert int(first.attrs["tt.pipeline_stages"]) == stages
-        assert int(first.attrs["tt.pipeline_extent"]) == 3
-    else:
-        assert "tt.pipeline_stages" not in first.attrs
+    expected_depth = min(stages, 3) if stages else 1
+    assert {int(desc.block_count) for desc in first.attrs["tt.dfb_table"]} == {expected_depth}
 
 
 def test_pipeline_explicit_capacity_preserved_and_insufficient_diagnosed():
@@ -214,7 +209,7 @@ def test_pipeline_zero_stages_preserves_serial_phase4_lower():
     mod = lower_pipeline(make_pipeline(stages=0, extent=3))
     assert str(mod.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in mod.attrs
-    assert "tt.pipeline_stages" not in mod.attrs
+    assert {int(desc.block_count) for desc in mod.attrs["tt.dfb_table"]} == {1}
 
 
 @T.prim_func
@@ -235,7 +230,6 @@ def test_pipeline_rejects_nested_pipeline():
 @pytest.mark.parametrize("policy", ["conservative", "delayed"])
 def test_pipeline_copy_completion_policy_is_preserved_for_codegen(policy):
     mod = lower_pipeline(make_pipeline(stages=3, extent=5, wait_policy=policy))
-    assert str(mod.attrs["tt.pipeline_wait_policy"]) == policy
     calls = lexical_slot_calls(mod, "ncrisc")
     first_wait = next(i for i, call in enumerate(calls) if call.op.name == "tl.tt.dfb_copy_wait")
     issues = sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in calls[:first_wait])

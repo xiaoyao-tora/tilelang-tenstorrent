@@ -21,7 +21,6 @@ MODULE_ATTRS = {
     "tt.operation_identity",
     "tt.tensor_table",
     "tt.dfb_storage_groups",
-    "tt.stream_operands",
     "tt.communication_table",
     "tt.transport_families",
     "tt.kernel_order",
