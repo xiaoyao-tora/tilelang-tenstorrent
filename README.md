@@ -120,7 +120,7 @@ TileLang requires Python 3.10 or newer. The default `auto` target detects CUDA, 
 | LLVM CPU | `llvm` | Host CPUs | Experimental | Build from source with `USE_LLVM=ON`; LLVM 15 or newer is required. |
 | NVIDIA CuTe DSL | `cutedsl` | NVIDIA GPUs | Experimental | Requires `nvidia-cutlass-dsl`. |
 | WebGPU | `webgpu` | WebGPU runtimes | Experimental | Code generation and runtime integration are still evolving. |
-| Tenstorrent | `tenstorrent` | Wormhole B0 and Blackhole | Registration only | Target routing is registered; TTL codegen and TTNN execution are not implemented yet. |
+| Tenstorrent | `tenstorrent` | Wormhole B0 and Blackhole | Experimental | Verified Device IR, in-memory TTL codegen, pinned TT-Lang compilation, and TTNN JIT integration. The current automatic path is ready for hardware testing but has not yet been validated on silicon. |
 | Huawei Ascend | Ascend C / NPU IR | Ascend A2 and A3 | Ecosystem | Developed in [tilelang-ascend](https://github.com/tile-ai/tilelang-ascend) and the MLIR-based [tilelang-mlir-ascend](https://github.com/tile-ai/tilelang-mlir-ascend). |
 | MetaX MACA | MACA adapter | MetaX C500 | Ecosystem | Developed in [tilelang-metax](https://github.com/tile-ai/tilelang-metax); requires the MACA software stack. |
 | Moore Threads MUSA | `musa` | S5000, S4000, and M1000 | Ecosystem | Developed in [tilelang-musa](https://github.com/tile-ai/tilelang-musa) and released independently. |
@@ -148,6 +148,169 @@ pip install tilelang --find-links https://tile-ai.github.io/whl/nightly
 ```
 
 Nightly builds may be less stable than official releases. For source builds, editable installs, Docker, ROCm setup, pip-provided CUDA toolchains, or a custom TVM checkout, follow the complete [installation guide](https://tilelang.com/get_started/Installation.html).
+
+### Tenstorrent development installation
+
+The Tenstorrent backend is currently a source-checkout feature. It requires an
+explicit `wormhole_b0` or `blackhole` target and the pinned compiler/runtime
+pair below:
+
+| Component | Required version |
+| --- | --- |
+| Python | CPython 3.12 |
+| TT-Lang | commit `4ca4b89de95242ccb9bca8ade71200ac81a59e38`, package `1.1.9.dev20260824+light` |
+| TTNN | `0.75.0` |
+
+On Linux x86-64, install Git, a C/C++ compiler, CMake 3.26 or newer, Ninja,
+Python 3.12 development files, zlib, and libedit. Then initialize the checkout
+and create an isolated environment:
+
+```bash
+git submodule update --init --recursive
+
+python3.12 -m venv .venv-tt
+source .venv-tt/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m pip install "ttnn==0.75.0" pytest-timeout
+```
+
+Install the exact cp312 manylinux 2.34 TT-Lang wheel for the pinned commit. In
+this development workspace it is stored at:
+
+```bash
+export TILELANG_TT_WHEEL=../code/build/ttlang/dist/tt_lang-1.1.9.dev20260824+light-cp312-cp312-manylinux_2_34_x86_64.whl
+test -f "$TILELANG_TT_WHEEL"
+sha256sum "$TILELANG_TT_WHEEL"
+python -m pip install --no-deps "$TILELANG_TT_WHEEL"
+```
+
+The expected SHA256 is:
+
+```text
+0d562db2d8b80e6a12854b9f8c699d06c179cbd196b1453c70c96c530319d784
+```
+
+Do not substitute a nearby TT-Lang nightly. TileLang checks
+`ttl.build_info()["ttlang"]` because the TTL dialect and Python compiler ABI are
+revision-specific.
+
+Build the source checkout without a CUDA dependency:
+
+```bash
+export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_TENSTORRENT=ON"
+python -m pip install -e . -v --no-build-isolation --no-deps
+
+# Reconfigure and rebuild after native C++ changes.
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_CUDA=OFF \
+  -DUSE_TENSTORRENT=ON
+ninja -C build
+```
+
+Verify the pinned environment and hardware-free compiler path:
+
+```bash
+python - <<'PY'
+from importlib.metadata import version
+import tilelang
+import ttl
+import ttnn
+
+assert ttl.build_info()["ttlang"] == "4ca4b89de95242ccb9bca8ade71200ac81a59e38"
+assert version("ttnn") == "0.75.0"
+assert callable(ttnn.generic_op)
+print("tilelang", tilelang.__version__)
+print("tt-lang", ttl.build_info())
+print("ttnn", version("ttnn"))
+PY
+
+python -m pytest -q \
+  testing/python/tenstorrent/codegen/test_tilelang_tenstorrent_codegen_v07.py
+```
+
+#### Additional hardware requirements
+
+Python packages alone are not sufficient for device execution. A hardware host
+must also provide:
+
+- a compatible Tenstorrent kernel driver and firmware;
+- readable and writable `/dev/tenstorrent/<id>` device nodes;
+- configured hugepages, normally under `/dev/hugepages` and, on some systems,
+  `/dev/hugepages-1G`;
+- `tt-smi` or equivalent Tenstorrent device-health tooling;
+- the SFPI runtime installed after TT-Lang with `tt-lang-setup-sfpi`;
+- `pytest-timeout`, using the thread timeout method for device deadlocks.
+
+Driver, firmware, hugepage, and device-permission setup is machine-specific and
+is not installed by this repository. Keep those components compatible with the
+pinned TTNN/TT-Metal runtime.
+
+Before running TileLang kernels, ensure the target device is idle and verify
+that TTNN can open it:
+
+```bash
+tt-lang-setup-sfpi
+unset TTLANG_COMPILE_ONLY
+export TT_DEVICE_ID=0
+
+ls -l /dev/tenstorrent
+tt-smi
+
+python - <<'PY'
+import os
+import ttnn
+
+print("available devices:", ttnn.GetNumAvailableDevices())
+print("architecture:", ttnn.get_arch_name())
+dispatch = ttnn.DispatchCoreConfig(ttnn.DispatchCoreType.WORKER)
+device = ttnn.open_device(
+    device_id=int(os.environ.get("TT_DEVICE_ID", "0")),
+    dispatch_core_config=dispatch,
+)
+try:
+    print("opened device:", device.id())
+finally:
+    ttnn.close_device(device)
+PY
+```
+
+Run the hardware tests in stages. Start with TTNN DRAM/L1 transfers, then the
+single-core TileLang kernels, and finally the complete default suite:
+
+```bash
+python -m pytest -v \
+  testing/python/tenstorrent/hardware/test_device_smoke.py \
+  --timeout-method=thread
+
+python -m pytest -v \
+  testing/python/tenstorrent/hardware/test_elementwise_add.py \
+  testing/python/tenstorrent/hardware/test_reduction.py \
+  testing/python/tenstorrent/hardware/test_elementwise_chain.py \
+  testing/python/tenstorrent/hardware/test_repeated_launch.py \
+  --timeout-method=thread
+
+python -m pytest -v testing/python/tenstorrent/hardware \
+  --timeout-method=thread
+```
+
+Without a device, all 13 hardware tests are expected to skip; that is not
+hardware validation. The experimental multi-core SUMMA test is disabled by
+default because the pinned TT-Lang EmitC path can currently terminate on a
+native block-argument assertion. It runs in an isolated subprocess when
+explicitly enabled:
+
+```bash
+TILELANG_TT_RUN_EXPERIMENTAL_SUMMA=1 \
+python -m pytest -v \
+  testing/python/tenstorrent/hardware/test_multicore_summa.py \
+  --timeout-method=thread
+```
+
+See the [hardware test guide](testing/python/tenstorrent/hardware/README.md) for
+the current test matrix and support boundaries. Required full-K FP32 matmul and
+dynamic DFB family selection remain explicit capability gates.
 
 ## Quick Start
 

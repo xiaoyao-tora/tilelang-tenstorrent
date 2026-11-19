@@ -66,8 +66,9 @@ The accumulator analysis inside `LegalizeTenstorrentTileOps` validates that
 contract and emits explicit structured accumulator operations. Single-Core
 [Device IR v7](../compiler_internals/tenstorrent_compute_values.md) supports immutable
 fragment values, mixed shared/fragment elementwise computation, old/new versions,
-GEMM epilogues and exact-dtype materialization. Source-only TTL mapping covers a
-restricted subset; FP32/full-K GEMM schedules and hardware execution remain unavailable.
+GEMM epilogues and exact-dtype materialization. TTL mapping covers a restricted
+subset; required full-K FP32 GEMM schedules and hardware execution validation
+remain unavailable.
 
 Tenstorrent's language facade exposes inter-Core communication topology under `T.comm`:
 
