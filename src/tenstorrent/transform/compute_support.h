@@ -6,6 +6,7 @@
 #define TVM_TL_TENSTORRENT_TRANSFORM_COMPUTE_SUPPORT_H_
 
 #include <string>
+#include <tvm/ir/op.h>
 #include <tvm/tirx/expr.h>
 
 namespace tvm::tl::tenstorrent {
@@ -20,6 +21,45 @@ inline bool IsSupportedComputeNode(const PrimExpr &expr) {
          expr.as<NENode>() || expr.as<LTNode>() || expr.as<LENode>() ||
          expr.as<GTNode>() || expr.as<GENode>() || expr.as<AndNode>() ||
          expr.as<OrNode>() || expr.as<NotNode>() || expr.as<SelectNode>();
+}
+
+// Integer tiles only survive TT-Lang lowering through SFPU integer binary ops
+// (add/sub/mul) and the explicit broadcast call; compare, min/max, div, select
+// and every unary intrinsic are rejected downstream
+// (ConvertTTLTileOpsToTTKernel.cpp:427,487).
+inline bool IsSupportedIntegerComputeNode(const PrimExpr &expr) {
+  using namespace tirx;
+  if (expr.as<IntImmNode>() || expr.as<BufferLoadNode>() ||
+      expr.as<CastNode>() || expr.as<AddNode>() || expr.as<SubNode>() ||
+      expr.as<MulNode>())
+    return true;
+  if (const auto *call = expr.as<CallNode>()) {
+    const auto *operation = call->op.as<OpNode>();
+    return operation != nullptr &&
+           operation->name.find("compute_broadcast") != std::string::npos;
+  }
+  return false;
+}
+
+// Device IR expressions have already replaced buffer leaves by typed load
+// calls, so the verifier accepts the same integer subset plus those loads.
+inline bool IsSupportedDeviceIntegerComputeNode(const PrimExpr &expr) {
+  using namespace tirx;
+  if (expr.as<IntImmNode>() || expr.as<VarNode>() || expr.as<CastNode>() ||
+      expr.as<AddNode>() || expr.as<SubNode>() || expr.as<MulNode>())
+    return true;
+  if (const auto *call = expr.as<CallNode>()) {
+    const auto *operation = call->op.as<OpNode>();
+    if (operation == nullptr)
+      return false;
+    const std::string &name = operation->name;
+    return name == "tl.tt.dfb_operand" ||
+           name == "tl.tt.compute_value_operand" ||
+           name == "tl.tt.dfb_load" ||
+           name == "tl.tt.compute_value_load" ||
+           name.find("compute_broadcast") != std::string::npos;
+  }
+  return false;
 }
 
 inline bool IsSupportedComputeUnary(const std::string &name) {

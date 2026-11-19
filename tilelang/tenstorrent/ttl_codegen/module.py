@@ -13,6 +13,18 @@ from .attributes import attach_function_attributes
 from .bindings import load_bindings
 from .expression import ExpressionEmitter, check_expression
 
+# Device IR dtype -> TTCore tile element type. Integer tiles are emitted for
+# storage, transfer and add/sub/mul/broadcast only; TTL rejects every other
+# integer compute primitive (see progress_doc/int_dtype_support_plan.md).
+TTCORE_DTYPE = {
+    "bfloat16": "BFloat16",
+    "float32": "Float32",
+    "int32": "Int32",
+    "uint32": "UInt32",
+    "uint16": "UInt16",
+}
+TILE_DTYPE_NAMES = tuple(TTCORE_DTYPE)
+
 
 def _calls(body):
     if isinstance(body, tirx.SeqStmt):
@@ -68,8 +80,8 @@ def check_capability(mod):
     if len(mod.attrs["tt.dfb_table"]) > 32:
         raise NotImplementedError("TTL emitter cannot seed more than 32 logical DFB bindings; allocation virtualization is required")
     for dfb in mod.attrs["tt.dfb_table"]:
-        if str(dfb.element_dtype) not in ("bfloat16", "float32") or len(dfb.block_shape_in_tiles) != 2:
-            raise NotImplementedError("TTL emitter requires rank-2 BF16/FP32 DFB blocks")
+        if str(dfb.element_dtype) not in TILE_DTYPE_NAMES or len(dfb.block_shape_in_tiles) != 2:
+            raise NotImplementedError("TTL emitter requires rank-2 BF16/FP32 or integer DFB blocks")
     dfbs = {int(d.dfb_id): d for d in mod.attrs["tt.dfb_table"]}
     values = {int(d.value_id): d for d in mod.attrs.get("tt.compute_value_table", [])}
     supported = {
@@ -188,7 +200,10 @@ class _Emitter:
         self.value_descriptors = {int(d.value_id): d for d in mod.attrs.get("tt.compute_value_table", [])}
 
     def tile_type(self, dtype, tile_shape):
-        dtype = {"bfloat16": self.b.ttcore.DataType.BFloat16, "float32": self.b.ttcore.DataType.Float32}[str(dtype)]
+        name = str(dtype)
+        if name not in TILE_DTYPE_NAMES:
+            raise NotImplementedError(f"TTL emitter has no TTCore tile type for {name}")
+        dtype = getattr(self.b.ttcore.DataType, TTCORE_DTYPE[ name ])
         return self.b.ttcore.ir.TileType.get(self.ctx, *map(int, tile_shape), int(dtype))
 
     def block_type(self, dfb):

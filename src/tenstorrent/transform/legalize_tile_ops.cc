@@ -17,6 +17,8 @@
 #include "../../op/utils.h"
 #include "../ir/device_ir.h"
 #include "../op/builtin.h"
+#include "compute_support.h"
+#include "dtype_support.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
@@ -72,17 +74,50 @@ void Require(bool condition, const std::string &message) {
     ThrowUnsupported(message);
 }
 
-std::string DTypeName(DataType dtype) {
-  std::ostringstream stream;
-  stream << dtype;
-  return stream.str();
+void ValidateDType(DataType dtype) {
+  Require(IsSupportedStorageDType(dtype), UnsupportedStorageDTypeMessage(dtype));
 }
 
-void ValidateDType(DataType dtype) {
-  Require(dtype.lanes() == 1 &&
-              (dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32)),
-          "compute supports scalar bfloat16 and float32, got " +
-              DTypeName(dtype));
+// Structured expressions mix a float subset and an integer subset that TT-Lang
+// lowers through different paths. Integer tiles only survive add/sub/mul and
+// the explicit broadcast call, so integer expressions get their own validation
+// instead of widening the float whitelist.
+void ValidateElementwiseExpression(const Buffer &output,
+                                   const PrimExpr &value) {
+  const std::string owner(output->name);
+  bool has_float = false;
+  bool has_integer = false;
+  bool has_integer_operator = false;
+  PostOrderVisit(value, [&](const ffi::ObjectRef &object) {
+    auto expr = object.as<PrimExpr>();
+    if (!expr.has_value() || expr.value().as<IntImmNode>() ||
+        expr.value().as<VarNode>()) {
+      return;
+    }
+    const DataType dtype = expr.value().dtype();
+    if (dtype.is_bool())
+      return;
+    if (IsSupportedIntegerComputeDType(dtype)) {
+      has_integer = true;
+      has_integer_operator |= !IsSupportedIntegerComputeNode(expr.value());
+      return;
+    }
+    if (IsIntegerDType(dtype)) {
+      ThrowUnsupported(UnsupportedIntegerComputeMessage(dtype) + " in '" +
+                       owner + "'");
+    }
+    if (IsSupportedFloatComputeDType(dtype)) {
+      has_float = true;
+      return;
+    }
+    ThrowUnsupported("structured elementwise expression rejects " +
+                     DTypeName(dtype) + " in output buffer '" + owner +
+                     "': " + DTypeRejectionReason(dtype));
+  });
+  Require(!(has_integer && has_float),
+          UnsupportedMixedIntegerFloatMessage(owner));
+  Require(!has_integer_operator, UnsupportedIntegerOperatorMessage(owner));
+  ValidateDType(output->dtype);
 }
 
 void ValidateRegion(const BufferRegion &region, const std::string &owner,
@@ -937,22 +972,7 @@ private:
     const auto *store = block->body.as<BufferStoreNode>();
     ICHECK(store != nullptr);
     const Buffer &output = store->buffer;
-    PostOrderVisit(store->value, [&](const ffi::ObjectRef &object) {
-      if (auto expr = object.as<PrimExpr>()) {
-        if (!expr.value().as<IntImmNode>() && !expr.value().as<VarNode>()) {
-          DataType dtype = expr.value().dtype();
-          if (dtype.lanes() != 1 ||
-              (dtype != DataType::BFloat(16) && dtype != DataType::Float(32) &&
-               !dtype.is_bool()))
-            ThrowUnsupported(
-                "structured elementwise expression supports scalar bfloat16, "
-                "float32 and bool values, got " +
-                DTypeName(dtype) + " in output buffer '" +
-                std::string(output->name) + "'");
-        }
-      }
-    });
-    ValidateDType(output->dtype);
+    ValidateElementwiseExpression(output, store->value);
     Span span = block->span.defined() ? block->span : op->span;
     ComputeDTypeVerifier dtype_verifier;
     dtype_verifier(store->value);
@@ -963,6 +983,8 @@ private:
     const char *kind = inputs.empty()                ? "fill"
                        : store->value.as<CastNode>() ? "typecast"
                                                      : "elementwise";
+    Require(std::string(kind) != "fill" || !IsIntegerDType(output->dtype),
+            UnsupportedIntegerFillMessage(std::string(output->name)));
     Annotations annotations = BaseAnnotations(output, kind);
     auto domain = Downcast<ffi::Array<PrimExpr>>(
         block->annotations.at("tl.tt.logical_domain"));
@@ -983,6 +1005,8 @@ private:
         if (!IsAccumulator(fill->dst)) {
           Require(call->annotations.empty(),
                   "Fill scheduling annotations are unsupported");
+          Require(!IsIntegerDType(fill->dst->dtype),
+                  UnsupportedIntegerFillMessage(fill->dst->name));
           ComputeDTypeVerifier dtype_verifier;
           dtype_verifier(cast(fill->dst->dtype, fill->value));
           Annotations annotations = BaseAnnotations(fill->dst, "fill");
@@ -997,6 +1021,8 @@ private:
       }
       Require(call->annotations.empty(),
               "Fill scheduling annotations are unsupported");
+      Require(!IsIntegerDType(fill->dst->dtype),
+              UnsupportedIntegerFillMessage(fill->dst->name));
       Require(call->args[1].as<IntImmNode>() ||
                   call->args[1].as<FloatImmNode>(),
               "Fill requires a scalar constant");

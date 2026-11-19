@@ -263,13 +263,6 @@ def test_malformed_stream_table_rejected():
     )
 
 
-def test_invalid_wait_policy_rejected():
-    rejected(
-        pipeline().with_attr("tt.pipeline_wait_policy", "unknown"),
-        "wait policy",
-    )
-
-
 def test_pipeline_resource_metadata_determinism():
     program = make_pipeline(3, 5)
     first = lower_pipeline(program)

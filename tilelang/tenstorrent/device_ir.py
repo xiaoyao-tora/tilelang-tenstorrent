@@ -71,13 +71,11 @@ COMPUTE_REGION_REQUIREMENTS_ATTR = "tt.compute_region_requirements"
 DFB_TABLE_ATTR = "tt.dfb_table"
 DFB_FAMILIES_ATTR = "tt.dfb_families"
 DFB_STORAGE_GROUPS_ATTR = "tt.dfb_storage_groups"
-DFB_STORAGE_GROUP_RELATIONS_ATTR = "tt.dfb_storage_group_relations"
 ACCUMULATOR_FAMILIES_ATTR = "tt.accumulator_families"
 COMPUTE_VALUE_FAMILIES_ATTR = "tt.compute_value_families"
 TRANSPORT_FAMILIES_ATTR = "tt.transport_families"
 PIPE_TABLE_ATTR = "tt.pipe_table"
 PIPE_TRANSFER_TABLE_ATTR = "tt.pipe_transfer_table"
-COMMUNICATION_TABLE_ATTR = "tt.communication_table"
 TRANSPORT_TABLE_ATTR = "tt.transport_table"
 KERNEL_ORDER_ATTR = "tt.kernel_order"
 KERNEL_SLOT_ATTR = "tt.kernel_slot"
@@ -87,9 +85,6 @@ LOGICAL_KERNEL_ATTR = "tt.logical_kernel"
 TENSOR_ARG_INDICES_ATTR = "tt.tensor_arg_indices"
 CORE_DOMAIN_ATTR = "tt.core_domain"
 BUFFER_METADATA_TABLE_ATTR = "tt.buffer_metadata_table"
-PIPELINE_RELATIONS_ATTR = "tt.pipeline_relations"
-PIPELINE_STAGES_ATTR = "tt.pipeline_stages"
-PIPELINE_EXTENT_ATTR = "tt.pipeline_extent"
 L1_CAPACITY_BYTES_ATTR = "tt.l1_capacity_bytes"
 COMPACT_ORIGINAL_VERSION_ATTR = "tt.compact_original_version"
 COMPACT_DFB_FAMILIES_ATTR = "tt.compact_dfb_families"
@@ -110,28 +105,6 @@ class DeviceIRDescriptorFamily(Node):
 
     def __init__(self, prototype, positions: DeviceIRIntColumn, fields, source_parts=()):
         self.__init_handle_by_constructor__(_ffi_api.DeviceIRDescriptorFamily, prototype, positions, fields, list(source_parts))
-
-
-@tvm_ffi.register_object("tl.tenstorrent.DFBStorageGroupRelation")
-class DFBStorageGroupRelation(Node):
-    """Family-aligned storage-group ID and transaction-ordinal columns."""
-
-    def __init__(
-        self,
-        dfb_family_id: int,
-        storage_group_ids: DeviceIRIntColumn,
-        transaction_ordinals: DeviceIRIntColumn,
-        pipeline_iterations: DeviceIRIntColumn | None = None,
-    ):
-        if pipeline_iterations is None:
-            pipeline_iterations = DeviceIRIntColumn(-1, 0, int(storage_group_ids.count))
-        self.__init_handle_by_constructor__(
-            _ffi_api.DFBStorageGroupRelation,
-            int(dfb_family_id),
-            storage_group_ids,
-            transaction_ordinals,
-            pipeline_iterations,
-        )
 
 
 def compact_device_ir(mod: IRModule, *, force: bool = False) -> IRModule:
@@ -345,40 +318,6 @@ class NormalizedTopologyDescriptor(Node):
         )
 
 
-@tvm_ffi.register_object("tl.tenstorrent.CommunicationDescriptor")
-class CommunicationDescriptor(Node):
-    def __init__(
-        self,
-        communication_id,
-        kind,
-        algorithm,
-        source_region,
-        destination_region,
-        source_coord,
-        group_begin,
-        group_end,
-        parameter,
-        contract,
-        occurrence_extents=(),
-        source_span=None,
-    ):
-        self.__init_handle_by_constructor__(
-            _ffi_api.CommunicationDescriptor,
-            int(communication_id),
-            kind,
-            algorithm,
-            source_region,
-            destination_region,
-            list(source_coord),
-            list(group_begin),
-            list(group_end),
-            parameter,
-            contract,
-            list(occurrence_extents),
-            source_span,
-        )
-
-
 @tvm_ffi.register_object("tl.tenstorrent.DFBDescriptor")
 class DFBDescriptor(Node):
     def __init__(
@@ -507,27 +446,41 @@ class ComputeRequirements(Node):
 
 @tvm_ffi.register_object("tl.tenstorrent.PipeDescriptor")
 class PipeDescriptor(Node):
+    """One PipeNet record plus the communication contract it belongs to."""
+
     def __init__(
         self,
         pipe_net_id: int,
-        communication_id: int,
         record_index: int,
         src_coord: CoreCoord,
         dst_begin: CoreCoord,
         dst_end: CoreCoord,
         contract: str,
-        payload_dfb_id: int,
-        source_span: Span,
+        kind: str,
+        algorithm: str,
+        parameter,
+        group_begin=(),
+        group_end=(),
+        occurrence_extents=(),
+        payload_source_name: str = "",
+        payload_dfb_id: int = -1,
+        source_span: Span | None = None,
     ):
         self.__init_handle_by_constructor__(
             _ffi_api.PipeDescriptor,
             int(pipe_net_id),
-            int(communication_id),
             int(record_index),
             src_coord,
             dst_begin,
             dst_end,
             contract,
+            kind,
+            algorithm,
+            parameter,
+            list(group_begin),
+            list(group_end),
+            list(occurrence_extents),
+            payload_source_name,
             int(payload_dfb_id),
             source_span,
         )
@@ -569,8 +522,8 @@ class PipeTransferDescriptor(Node):
 
 @tvm_ffi.register_object("tl.tenstorrent.LogicalKernel")
 class LogicalKernel(Node):
-    def __init__(self, kernel_id: str, kind: str, role: str, source_span: Span):
-        self.__init_handle_by_constructor__(_ffi_api.LogicalKernel, kernel_id, kind, role, source_span)
+    def __init__(self, kernel_id: str, role: str, source_span: Span):
+        self.__init_handle_by_constructor__(_ffi_api.LogicalKernel, kernel_id, role, source_span)
 
 
 @tvm_ffi.register_object("tl.tenstorrent.TTBufferMetadata")
@@ -717,8 +670,6 @@ __all__ = (
     "ComputeValueDescriptor",
     "COMPUTE_VALUE_TABLE_ATTR",
     "ComputeRequirements",
-    "CommunicationDescriptor",
-    "COMMUNICATION_TABLE_ATTR",
     "ACCUMULATOR_TABLE_ATTR",
     "COMPUTE_REQUIREMENTS_ATTR",
     "COMPUTE_REGION_REQUIREMENTS_ATTR",
@@ -727,9 +678,7 @@ __all__ = (
     "CoreDomain",
     "DFBDescriptor",
     "DFBStorageGroupDescriptor",
-    "DFBStorageGroupRelation",
     "DFB_STORAGE_GROUPS_ATTR",
-    "DFB_STORAGE_GROUP_RELATIONS_ATTR",
     "DeviceIRDescriptorFamily",
     "DeviceIRIntColumn",
     "DeviceFunctionMetadata",

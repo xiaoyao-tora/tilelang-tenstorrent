@@ -16,6 +16,7 @@
 #include "compact_device_program.h"
 #include "device_metadata_interner.h"
 #include "device_table_compaction.h"
+#include "dtype_support.h"
 
 namespace tvm {
 namespace tl {
@@ -30,6 +31,50 @@ void Check(bool valid, const std::string &message) {
   TVM_FFI_THROW(NotImplementedError)
       << "[TenstorrentComputeRequirements] " << message;
 }
+
+// Destination width converges monotonically. Any 32-bit value (float32, int32,
+// uint32) pins a 32-bit destination; a 16-bit integer pins a 16-bit
+// destination because TT-Lang lowers uint16 arithmetic through
+// InstrModLoadStore::LO16. A kernel that needs both is rejected instead of
+// silently picking one.
+class DestinationWidth {
+public:
+  // Descriptor dtypes describe tile element values, so integers do participate.
+  void Merge(DataType dtype) {
+    ffi::String next;
+    if (RequiresBits32Destination(dtype))
+      next = "bits32_required";
+    else if (RequiresBits16Destination(dtype))
+      next = "bits16_required";
+    else
+      return;
+    Record(next);
+  }
+  // Scalar expression nodes carry int32 index arithmetic and loop counters that
+  // are not tile values, so only the float32 legacy rule applies here. Integer
+  // tile widths are pinned by the expression root dtype instead.
+  void MergeExpression(DataType dtype) {
+    if (IsIntegerDType(dtype))
+      return;
+    Merge(dtype);
+  }
+  bool empty() const { return width_.empty(); }
+  const ffi::String &width() const { return width_; }
+
+private:
+  void Record(const ffi::String &next) {
+    if (width_.empty()) {
+      width_ = next;
+      return;
+    }
+    if (width_ != next)
+      Unsupported("conflicting hard destination width requirements in one "
+                  "compute kernel");
+  }
+
+  ffi::String width_;
+};
+
 int64_t IntegerValue(const PrimExpr &value) {
   const auto *imm = value.as<IntImmNode>();
   Check(imm != nullptr,
@@ -54,9 +99,9 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
   if (current_device) {
     if (func->GetAttr<ffi::String>(kKernelSlotAttr).value_or("") != "trisc")
       return ComputeRequirements("unconstrained", "allowed", {});
-    bool requires_fp32 = false;
     bool has_fp32_dfb_gemm = false;
     bool has_bf16_dfb_gemm = false;
+    DestinationWidth width_requirement;
     auto value_families = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
         kComputeValueFamiliesAttr);
     if (value_families.has_value()) {
@@ -64,19 +109,21 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
         auto value = family->prototype.as<ComputeValueDescriptor>();
         Check(value.has_value(),
               "compute-value family has the wrong prototype type");
-        requires_fp32 |= value.value()->dtype == DataType::Float(32);
+        width_requirement.Merge(value.value()->dtype);
       }
     } else {
       for (const ComputeValueDescriptor &value :
            mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
                   kComputeValueTableAttr)
                .value_or(ffi::Array<ComputeValueDescriptor>()))
-        requires_fp32 |= value->dtype == DataType::Float(32);
+        width_requirement.Merge(value->dtype);
     }
     PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
-      if (const auto *cast = node.as<CastNode>())
-        requires_fp32 |= cast->dtype == DataType::Float(32) &&
-                         cast->value.dtype() != DataType::Float(32);
+      if (const auto *cast = node.as<CastNode>()) {
+        if (cast->dtype == DataType::Float(32) &&
+            cast->value.dtype() != DataType::Float(32))
+          width_requirement.Merge(cast->dtype);
+      }
       const auto *call = node.as<CallNode>();
       if (!call)
         return;
@@ -97,12 +144,16 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
         return;
       auto typed = expression.value().as<PrimExpr>();
       Check(typed.has_value(), "invalid compute precision expression");
+      // The expression root dtype is the tile result dtype: it is the only
+      // dtype that may pin the destination width for integers.
+      width_requirement.Merge(typed.value().dtype());
       PostOrderVisit(typed.value(), [&](const ffi::ObjectRef &item) {
         if (auto value = item.as<PrimExpr>())
-          requires_fp32 |= value.value().dtype() == DataType::Float(32);
+          width_requirement.MergeExpression(value.value().dtype());
       });
     });
-    ffi::String width = requires_fp32 ? "bits32_required" : "unconstrained";
+    ffi::String width =
+        width_requirement.empty() ? "unconstrained" : width_requirement.width();
     ffi::String full = "allowed";
     if (has_fp32_dfb_gemm) {
       width = "bits32_required";
@@ -190,7 +241,7 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
     if (func->GetAttr<ffi::String>(kKernelSlotAttr).value_or("") != "trisc")
       return ComputeRequirements("unconstrained", "allowed", {});
     std::map<int64_t, ComputeValueDescriptor> by_id;
-    bool requires_fp32 = false;
+    DestinationWidth width_requirement;
     for (const auto &value : values.value()) {
       Check(value.defined() && value->buffer.defined() &&
                 by_id.emplace(value->value_id, value).second,
@@ -208,14 +259,15 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
     std::set<int64_t> used;
     if (current_device) {
       for (const auto &[id, value] : by_id) {
-        requires_fp32 |= value->buffer->dtype == DataType::Float(32);
+        width_requirement.Merge(value->buffer->dtype);
         if (value->accumulator_id >= 0)
           used.insert(value->accumulator_id);
       }
       PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
         const auto *cast = node.as<CastNode>();
-        requires_fp32 |= cast && cast->dtype == DataType::Float(32) &&
-                         cast->value.dtype() != DataType::Float(32);
+        if (cast && cast->dtype == DataType::Float(32) &&
+            cast->value.dtype() != DataType::Float(32))
+          width_requirement.Merge(cast->dtype);
       });
     } else {
       PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
@@ -225,7 +277,7 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
           Check(!call->args.empty(), "compute value definition missing ID");
           int64_t id = IntegerValue(call->args[0]);
           Check(by_id.count(id), "compute value references missing descriptor");
-          requires_fp32 |= by_id.at(id)->buffer->dtype == DataType::Float(32);
+          width_requirement.Merge(by_id.at(id)->buffer->dtype);
         }
         if (call && (call->op.same_as(compute_value()) ||
                      call->op.same_as(dfb_compute()))) {
@@ -233,9 +285,10 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
           if (expression.has_value()) {
             auto expr = expression.value().as<PrimExpr>();
             Check(expr.has_value(), "invalid compute precision expression");
+            width_requirement.Merge(expr.value().dtype());
             PostOrderVisit(expr.value(), [&](const ffi::ObjectRef &item) {
               if (auto value = item.as<PrimExpr>())
-                requires_fp32 |= value.value().dtype() == DataType::Float(32);
+                width_requirement.MergeExpression(value.value().dtype());
             });
           }
         }
@@ -251,7 +304,9 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
     }
     ffi::Array<AccumulatorDescriptor> requirements;
     ffi::String full = "allowed",
-                width = requires_fp32 ? "bits32_required" : "unconstrained";
+                width = width_requirement.empty()
+                            ? "unconstrained"
+                            : width_requirement.width();
     for (int64_t id : used) {
       auto acc = accumulators.at(id);
       Check(IsSupportedAccumulatorDTypeTriple(

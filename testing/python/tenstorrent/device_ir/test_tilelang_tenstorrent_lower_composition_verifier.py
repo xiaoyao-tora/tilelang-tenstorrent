@@ -95,13 +95,6 @@ def test_cross_core_value_definition_is_rejected():
     check_rejected(malformed, "duplicated|crosses Core")
 
 
-def test_partial_pipeline_metadata_cannot_bypass_validation():
-    from testing.python.tenstorrent.device_ir.test_tilelang_tenstorrent_compute_value_verifier import device
-
-    mod = device().with_attr("tt.pipeline_stages", 2)
-    check_rejected(mod, "missing required Module attr.*pipeline_extent")
-
-
 def test_boolean_cast_cannot_be_used_as_numeric_compute():
     from testing.python.tenstorrent.device_ir.test_tilelang_tenstorrent_compute_value_verifier import device
 

@@ -6,6 +6,12 @@ from tvm import tirx
 
 
 _BINARY = {tirx.Add: "add", tirx.Sub: "sub", tirx.Mul: "mul", tirx.Div: "div", tirx.Min: "min", tirx.Max: "max"}
+# Integer tiles survive TT-Lang lowering only through SFPU integer binary ops and
+# the explicit broadcast call; every other primitive is rejected downstream
+# (ConvertTTLTileOpsToTTKernel.cpp:427,487).
+_INTEGER_BINARY = {tirx.Add, tirx.Sub, tirx.Mul}
+_INTEGER_DTYPES = ("int32", "uint32", "uint16")
+_FLOAT_DTYPES = ("bfloat16", "float32")
 _UNARY = {
     "tirx.exp": "exp",
     "tirx.exp2": "exp2",
@@ -30,10 +36,16 @@ _LOADS = (
 
 def check_expression(expr):
     """Check the complete expression before loading optional compiler bindings."""
-    if isinstance(expr, (tirx.IntImm, tirx.FloatImm)):
+    if isinstance(expr, (tirx.IntImm, tirx.FloatImm, tirx.Var)):
         return
-    if str(expr.dtype) not in ("bfloat16", "float32"):
+    dtype = str(expr.dtype)
+    if dtype not in _FLOAT_DTYPES and dtype not in _INTEGER_DTYPES:
         raise NotImplementedError(f"TTL block expression dtype {expr.dtype} is not supported")
+    if dtype in _INTEGER_DTYPES and not _is_integer_expression_node(expr):
+        raise NotImplementedError(
+            f"TTL block expression has no integer mapping for {type(expr).__name__}: integer tiles only support "
+            "elementwise add, sub, mul and broadcast (ConvertTTLTileOpsToTTKernel.cpp:427,487)"
+        )
     if isinstance(expr, tirx.Cast):
         check_expression(expr.value)
     elif type(expr) in _BINARY:
@@ -49,6 +61,15 @@ def check_expression(expr):
         check_expression(expr.args[0])
     else:
         raise NotImplementedError(f"TTL block expression has no mapping for {type(expr).__name__}: {expr}")
+
+
+def _is_integer_expression_node(expr):
+    """Integer scalar DAG leaves and the add/sub/mul/broadcast subset."""
+    if isinstance(expr, (tirx.IntImm, tirx.Var, tirx.Cast)) or type(expr) in _INTEGER_BINARY:
+        return True
+    if isinstance(expr, tirx.Call):
+        return expr.op.name in _LOADS or expr.op.name == "tl.tt.compute_broadcast"
+    return False
 
 
 class ExpressionEmitter:

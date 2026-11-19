@@ -21,6 +21,36 @@ class CapabilityStatus(str, Enum):
     UNSUPPORTED = "unsupported"
 
 
+# Tensor / DFB storage dtypes, mirrored from
+# src/tenstorrent/transform/dtype_support.h.
+FLOAT_DTYPES = ("bfloat16", "float32")
+INTEGER_DTYPES = ("int32", "uint32", "uint16")
+STORAGE_DTYPES = FLOAT_DTYPES + INTEGER_DTYPES
+# Integer tiles only survive TT-Lang lowering through add/sub/mul/broadcast, so
+# only storage-level and elementwise queries can be satisfied. Fill, typecast,
+# transpose, GEMM, reduction and communication stay float-only.
+INTEGER_OPERATIONS = ("copy", "elementwise")
+
+
+def is_integer_dtype(dtype):
+    return str(dtype) in INTEGER_DTYPES
+
+
+def _unsupported_dtype_reason(dtype):
+    dtype = str(dtype)
+    if dtype == "float16":
+        return (
+            "Device Lower has no float16 route (BF16/FP32 or INT32/UINT32/UINT16 tiles only): "
+            "tt-metal defines no FLOAT16 tensor type (tensor_types.hpp:26-37)"
+        )
+    if dtype in ("uint8", "int8"):
+        return (
+            "Device Lower has no uint8 route (BF16/FP32 or INT32/UINT32/UINT16 tiles only): "
+            "TT-Lang compute passthrough rejects uint8 (ComputeTarget.cpp:51-56)"
+        )
+    return "Device Lower storage supports scalar BF16/FP32 or INT32/UINT32/UINT16 tiles only"
+
+
 @dataclass(frozen=True)
 class LowerCapability:
     status: CapabilityStatus
@@ -114,8 +144,17 @@ def lower_capability(
         return reject("PipeNet is a legacy compatibility frontend and is not an active Lower input")
     input_dtype = str(input_dtype)
     output_dtype = input_dtype if output_dtype is None else str(output_dtype)
-    if input_dtype not in ("bfloat16", "float32") or output_dtype not in ("bfloat16", "float32"):
-        return reject("Device Lower storage supports scalar BF16/FP32 only")
+    for dtype in (input_dtype, output_dtype):
+        if dtype not in STORAGE_DTYPES:
+            return reject(_unsupported_dtype_reason(dtype))
+    if is_integer_dtype(input_dtype) or is_integer_dtype(output_dtype):
+        if operation not in INTEGER_OPERATIONS:
+            return reject(
+                f"Device Lower has no integer route for {operation!r}: integer tiles only support storage, "
+                "copy and add/sub/mul/broadcast (ConvertTTLTileOpsToTTKernel.cpp:427,487)"
+            )
+        if is_integer_dtype(input_dtype) != is_integer_dtype(output_dtype):
+            return reject("Device Lower integer tiles cannot mix with floating-point dtypes")
     if rank < 1 or tuple(tile_shape) != (32, 32):
         return reject("Device Lower requires positive rank and 32x32 tiles")
     if operation == "elementwise" and rank != 2:

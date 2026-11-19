@@ -43,21 +43,9 @@ COMPUTE_VALUE_DESCRIPTOR_FIELDS = (
     "source_span",
 )
 ACCUMULATOR_MODULE_FIELDS = ("tt.accumulator_table",)
-ACCUMULATOR_DESCRIPTOR_FIELDS = (
-    "accumulator_id",
-    "accumulator_region",
-    "input_dtype",
-    "accumulation_dtype",
-    "output_dtype",
-    "full_k_tiles",
-    "source_span",
-)
-COMPUTE_REQUIREMENTS_FIELDS = ("destination_width", "matmul_full_fp32", "accumulators")
 
-# v4 introduced the typed transfer table. Its current reflected descriptor also
-# retains the parent communication independently from the materialized PipeNet.
+# v4 introduced the typed transfer table.
 # Kernel order lists global function names in (x, y, slot) order.
-MULTICORE_MODULE_FIELDS = ("tt.pipe_transfer_table",)
 PIPE_TRANSFER_DESCRIPTOR_FIELDS = (
     "transfer_id",
     "pipe_net_id",
@@ -126,12 +114,18 @@ DFB_DESCRIPTOR_FIELDS = (
 
 PIPE_DESCRIPTOR_FIELDS = (
     "pipe_net_id",
-    "communication_id",
     "record_index",
     "src_coord",
     "dst_begin",
     "dst_end",
     "contract",
+    "kind",
+    "algorithm",
+    "parameter",
+    "group_begin",
+    "group_end",
+    "occurrence_extents",
+    "payload_source_name",
     "payload_dfb_id",
     "source_span",
 )
@@ -206,14 +200,11 @@ __all__ = (
     "MULTICORE_ACCUMULATOR_DEVICE_IR_VERSION",
     "ACCUMULATOR_DEVICE_IR_VERSION",
     "ACCUMULATOR_MODULE_FIELDS",
-    "ACCUMULATOR_DESCRIPTOR_FIELDS",
-    "COMPUTE_REQUIREMENTS_FIELDS",
     "DEFERRED_FRONTEND_CAPABILITIES",
     "DEVICE_IR_VERSION",
     "GENERAL_DEVICE_IR_VERSION",
     "PIPELINE_DEVICE_IR_VERSION",
     "MULTICORE_DEVICE_IR_VERSION",
-    "MULTICORE_MODULE_FIELDS",
     "PIPE_TRANSFER_DESCRIPTOR_FIELDS",
     "PIPELINE_MODULE_FIELDS",
     "SUPPORTED_DEVICE_IR_VERSIONS",
