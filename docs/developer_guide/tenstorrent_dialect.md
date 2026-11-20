@@ -16,8 +16,10 @@ execute it.
 `T.Tiles` accepts a Buffer, a tuple/list of extents, or two scalar extents. It
 constructs a static rank-2 logical domain using annotated serial loops. The
 Buffer form contributes only its shape; the body supplies the inputs and output.
-Only `parallel=True` is accepted. The annotations preserve the logical domain
-for later compute capture; they do not specify processor placement or scheduling.
+The body must contain exactly one elementwise assignment. Write additional
+assignments as separate `T.Tiles` scopes. Only `parallel=True` is accepted. The
+annotations preserve the logical domain for later compute capture; they do not
+specify processor placement or scheduling.
 
 ```python
 @T.prim_func

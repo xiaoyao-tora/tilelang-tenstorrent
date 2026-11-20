@@ -2,6 +2,7 @@ cancelled
 disjointness
 dout
 hsa
+inout
 inouts
 ist
 LOD

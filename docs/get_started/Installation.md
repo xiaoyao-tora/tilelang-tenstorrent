@@ -123,6 +123,7 @@ python -c "import tilelang; print(tilelang.__version__)"
 Some useful CMake options you can toggle while configuring:
 - `-DUSE_CUDA=ON|OFF` builds against NVIDIA CUDA (default ON when CUDA headers are found).
 - `-DUSE_ROCM=ON` selects ROCm support when building on AMD GPUs.
+- `-DUSE_TENSTORRENT=ON` reserves future TT-Lang/TTNN-dependent native support; target registration is always built.
 - `-DNO_VERSION_LABEL=ON` disables the backend/git suffix in `tilelang.__version__`.
 - `-DUSE_LLVM=ON` enables the LLVM backend for CPU codegen.
 
@@ -307,6 +308,8 @@ pip install tilelang -f https://tile-ai.github.io/whl/nightly
 `USE_METAL`: If to enable Metal support, default: `ON` on Darwin.
 
 `USE_LLVM`: If to enable LLVM support for CPU codegen, default: `OFF`. Set `USE_LLVM=1` for auto-detection, or pass `-DUSE_LLVM=/path/to/llvm-config` through `CMAKE_ARGS` when you need a specific LLVM installation. LLVM 15 or newer is required.
+
+`USE_TENSTORRENT`: Reserved for future native components that depend on TT-Lang or TTNN, default: `OFF`. The hardware-independent Tenstorrent TargetKind and frontend intrinsic registrations are always compiled.
 
 `TVM_ROOT`: TVM source root to use.
 

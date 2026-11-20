@@ -1,0 +1,129 @@
+# Tenstorrent compute values (Device IR v7)
+
+The v7 protocol extends structured `T.Tiles` lowering to ordinary
+fragments and GEMM epilogues. It preserves immutable values independently of
+DFB storage and keeps the existing v1–v6 protocols for their original programs.
+The complete pass sequence remains in `tilelang/tenstorrent/pipeline.py`.
+Device IR v8 extends this contract with explicit precision regions and exact
+DFB snapshots between them; see [Flash Attention Lower](tenstorrent_flash_attention_lower.md).
+
+## Supported frontend contract
+
+- Static rank-2 BF16/FP32 local buffers and 32×32 compute tiles, including
+  keepdims row fragments with a singleton final axis.
+- Shared or fragment inputs and outputs, including mixed inputs, explicit
+  casts and padded row/column/scalar broadcast.
+- Original Buffer identity, old/new versions, multiple consumers and bounded
+  static serial updates. Known conditions specialize before formation.
+- GEMM initialization, complete K-stage updates, in-place scale, epilogues
+  producing new fragments, multiple final consumers and independent lifetimes
+  in an outer serial loop.
+
+Shared allocation metadata continues to describe DFB storage. Fragment geometry
+is inferred without inventing DFB capacity or Tensor backing. Data-dependent
+branches with one pure assignment per arm can become `Select` expressions when
+their local scalar predicate and old output satisfy definite initialization.
+This does not introduce a Device control-flow ABI. Dynamic tails/masks and
+direct cross-slot fragments remain unsupported. Per-Core values, materialized
+PipeNet communication and independent pipelined value chains are described in
+[the Lower composition contract](tenstorrent_lower_composition.md).
+
+## Authoritative IR
+
+Current Device IR stores typed `ComputeValueDescriptor` prototypes and instance
+relations in `tt.compute_value_families`. Each ID in the shared body is local to
+the current Core; diagnostic expansion may synthesize a globally numbered
+`tt.compute_value_table` without changing the persisted contract.
+
+| Field | Meaning |
+| --- | --- |
+| `value_id` | Core-local immutable definition ID |
+| `buffer` | Logical fragment identity, shape and dtype |
+| `version` | Zero-based write version of that logical Buffer |
+| `previous_value_id` | Previous Core-local write to that Buffer, or -1 |
+| `accumulator_id` | Owning Core-local accumulator, or -1 |
+| `source_span` | Original source location |
+
+Multiple contributing accumulator roots are recovered from the body def-use
+graph, not compressed into one scalar descriptor field. Their precision and
+complete-K requirements are checked separately.
+
+The TRISC body owns the definitions and actual dependencies:
+
+| Intrinsic | Contract |
+| --- | --- |
+| `compute_value_ref(id)` | Pure, handle-typed readable reference to one Core-local canonical value ID |
+| `compute_state_ref(id)` | Pure, handle-typed readable reference to one abstract loop-state ID |
+| `compute_value(output, dfb_inputs...)` | Define a typed pure elementwise/fill/typecast value through refs |
+| `compute_value_operand(index)` | Pure expression reference through `tt.value_inputs[index]` |
+| `compute_value_gemm(output, lhs_dfb, rhs_dfb, old)` | Produce a new accumulator version; Boolean `tt.transpose_a/b` are named annotations |
+| `compute_value_store(value, output_dfb)` | Exact-dtype compute store to a reserved DFB |
+
+The output `ComputeValueDescriptor` is authoritative for logical domain, dtype
+and tile geometry. Current Device calls do not repeat those fields or
+`tt.value_input_shapes`. `tt.input_shapes` describes nonempty DFB operand views;
+`tt.value_inputs` is the only serialized compute-value identity list. Effective
+value-input views are derived from each input descriptor plus explicit
+`compute_broadcast` axes. The expression uses zero-based `dfb_operand` and
+`compute_value_operand` leaves, so it never duplicates resource IDs. Tensor
+exports use an explicit compute cast when their storage dtype differs; they
+never silently retag a value.
+
+The canonical integer remains inside each function-entry `compute_value_ref` or
+`compute_state_ref`; body operations use the readable handle alias. Formation
+also emits derived `tt.debug_dfb_operands` and `tt.debug_value_operands` names so
+an expression's local operand indices can be audited without duplicating
+identity in the expression DAG. These names are deterministic diagnostics only:
+the verifier checks their shape and type, while Codegen uses refs and descriptors.
+
+The verifier resolves value and accumulator IDs using the active Core before it
+checks definitions, predecessor chains, exact expression effects, geometry,
+ownership, accumulator provenance, complete K, final output dtype and precision
+requirements independently of the frontend. JSON roundtrips retain the complete
+contract. Runtime objects and frontend side tables are not needed for codegen.
+
+## Materialization and lifetime
+
+Pure fragment chains do not allocate one DFB per value. A consumer requiring
+DFB-attached operands triggers exact-dtype materialization; repeated uses of
+the same version share that materialization. Explicit shared/Tensor outputs
+produce their own DFB transactions.
+
+All values may borrow their source DFBs. Logical release conservatively follows
+the last transitive value consumer, including identity expressions and saved
+old versions. The independent verifier checks this rule. The compiler does not
+promise physical DST residency or elide spills without a validated schedule.
+
+## TTL and validation boundaries
+
+Source emission maps v7 values to typed TTL SSA arithmetic, unary operations,
+cast, broadcast and stores. It uses the pinned compiler builders; the TT-Lang
+pipeline owns physical CB allocation, sync insertion and tile scheduling.
+BF16 broadcasts cannot share a Kernel requiring 32-bit DST on the supported
+architectures and fail before the optional compiler is imported.
+
+BF16 single-update GEMM has a restricted mapping. FP32/full-K and multiple
+update GEMM remain fail-closed at the TTL boundary: the pinned compiler's
+same-tile-type matmul and stateful accumulation lowering do not provide a
+validated lossless schedule for those programs. Logical Device numerical tests
+are separate from real TTL compile-only tests; absent compiler bindings cause
+the latter to skip, not to pass using substitute builders. Hardware execution
+and a production TTNN adapter are outside this implementation.
+
+## CPU numerical test support
+
+Shared Device IR traversal helpers and CPU reference models live together in
+`testing/python/tenstorrent/_support/reference.py`, alongside the hardware-independent
+target tests, not in the production backend or individual integration test files.
+The immutable-value and scheduled-stream
+models retain their separate execution semantics, while sharing dtype conversion.
+Both evaluate constants and explicit `Cast` nodes using the expression dtype.
+`compute_value_store` requires the compute value and destination DFB to have the
+same dtype and copies the already-typed value without an implicit conversion.
+This preserves wide integer/FP64 constants in the conversion helpers while
+keeping the Device IR exact-dtype materialization contract fail-closed.
+
+`testing/python/tenstorrent/semantics/test_tilelang_tenstorrent_compute_values.py`
+tests these contracts directly for both models alongside lowered-IR
+integration cases. These are CPU test oracles, not evidence of TTL or hardware
+dtype support.

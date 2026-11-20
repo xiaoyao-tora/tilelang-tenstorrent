@@ -291,6 +291,7 @@ and the selected execution backend decides whether and when it is invoked.
 | `tilelang/cpu` | `c`, `llvm` | CPU pipeline, codegen, and scalar CPU tile-op implementations. |
 | `tilelang/metal` | `metal` | Metal pipeline, codegen, host hook, and Metal language extensions. |
 | `tilelang/webgpu/backend.py` | `webgpu` | WebGPU compiler component registration. |
+| `tilelang/tenstorrent` | `tenstorrent` | Fixed Tenstorrent Lower produces three shared TRISC/NCRISC/BRISC Device functions. DeviceCodegen emits an in-memory initial TTL Module with typed Tensor/DFB, SCF, compute-value and PipeNet mappings. The `ttnn` JIT adapter invokes the pinned TT-Lang pipeline, retains the resulting `CompiledTTNNKernel`, validates device-resident tiled Tensor arguments and delegates execution to `ttnn.generic_op`. Required full-K FP32 matmul and dynamic family-row CB selection remain explicit capability gates. |
 
 ## Common Backend Infrastructure
 

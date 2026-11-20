@@ -1,0 +1,8 @@
+# from tvm.script import tirx as T
+
+@T.prim_func
+def row_column_gemm_x1_y2_brisc():
+    T.func_attr({"calling_conv": 2, "target": T.target({"arch": "wormhole_b0", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][0], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][0], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+    T.evaluate(0)
+
+# Metadata omitted. Use show_meta=True in script() method to show it.

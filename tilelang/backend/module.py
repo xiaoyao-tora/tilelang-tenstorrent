@@ -120,7 +120,7 @@ class BackendModule:
         target_kind = self._require_target(target)
         return self.device_codegens[target_kind]
 
-    def codegen_device(self, mod: IRModule, target: Target, *, compile_device: bool) -> IRModule:
+    def codegen_device(self, mod: IRModule, target: Target, *, compile_device: bool):
         """Generate device code for the target."""
 
         return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
@@ -213,7 +213,7 @@ class BackendContext:
 
         return self.module.lower(mod, self.target)
 
-    def codegen_device(self, mod: IRModule, *, compile_device: bool | None = None) -> IRModule:
+    def codegen_device(self, mod: IRModule, *, compile_device: bool | None = None):
         """Generate device code using the selected execution policy by default."""
 
         if compile_device is None:

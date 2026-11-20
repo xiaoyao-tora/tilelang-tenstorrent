@@ -1,0 +1,262 @@
+# from tvm.script import ir as I
+# from tvm.script import tirx as T
+
+@I.ir_module
+class Module:
+    I.module_attrs({"tt.device_ir_version": 4, "tt.dfb_table": [metadata["tl.tenstorrent.DFBDescriptor"][0], metadata["tl.tenstorrent.DFBDescriptor"][1], metadata["tl.tenstorrent.DFBDescriptor"][2], metadata["tl.tenstorrent.DFBDescriptor"][3], metadata["tl.tenstorrent.DFBDescriptor"][4], metadata["tl.tenstorrent.DFBDescriptor"][5], metadata["tl.tenstorrent.DFBDescriptor"][6], metadata["tl.tenstorrent.DFBDescriptor"][7], metadata["tl.tenstorrent.DFBDescriptor"][8], metadata["tl.tenstorrent.DFBDescriptor"][9], metadata["tl.tenstorrent.DFBDescriptor"][10], metadata["tl.tenstorrent.DFBDescriptor"][11], metadata["tl.tenstorrent.DFBDescriptor"][12], metadata["tl.tenstorrent.DFBDescriptor"][13], metadata["tl.tenstorrent.DFBDescriptor"][14], metadata["tl.tenstorrent.DFBDescriptor"][15], metadata["tl.tenstorrent.DFBDescriptor"][16], metadata["tl.tenstorrent.DFBDescriptor"][17], metadata["tl.tenstorrent.DFBDescriptor"][18], metadata["tl.tenstorrent.DFBDescriptor"][19], metadata["tl.tenstorrent.DFBDescriptor"][20], metadata["tl.tenstorrent.DFBDescriptor"][21], metadata["tl.tenstorrent.DFBDescriptor"][22], metadata["tl.tenstorrent.DFBDescriptor"][23]], "tt.kernel_order": ["row_column_gemm_x0_y0_trisc", "row_column_gemm_x0_y0_ncrisc", "row_column_gemm_x0_y0_brisc", "row_column_gemm_x0_y1_trisc", "row_column_gemm_x0_y1_ncrisc", "row_column_gemm_x0_y1_brisc", "row_column_gemm_x0_y2_trisc", "row_column_gemm_x0_y2_ncrisc", "row_column_gemm_x0_y2_brisc", "row_column_gemm_x1_y0_trisc", "row_column_gemm_x1_y0_ncrisc", "row_column_gemm_x1_y0_brisc", "row_column_gemm_x1_y1_trisc", "row_column_gemm_x1_y1_ncrisc", "row_column_gemm_x1_y1_brisc", "row_column_gemm_x1_y2_trisc", "row_column_gemm_x1_y2_ncrisc", "row_column_gemm_x1_y2_brisc", "row_column_gemm_x2_y0_trisc", "row_column_gemm_x2_y0_ncrisc", "row_column_gemm_x2_y0_brisc", "row_column_gemm_x2_y1_trisc", "row_column_gemm_x2_y1_ncrisc", "row_column_gemm_x2_y1_brisc", "row_column_gemm_x2_y2_trisc", "row_column_gemm_x2_y2_ncrisc", "row_column_gemm_x2_y2_brisc"], "tt.launch_grid": metadata["tl.tenstorrent.CoreCoord"][0], "tt.operation_identity": metadata["tl.tenstorrent.OperationIdentity"][0], "tt.pipe_table": [metadata["tl.tenstorrent.PipeDescriptor"][0], metadata["tl.tenstorrent.PipeDescriptor"][1], metadata["tl.tenstorrent.PipeDescriptor"][2], metadata["tl.tenstorrent.PipeDescriptor"][3]], "tt.pipe_transfer_table": [metadata["tl.tenstorrent.PipeTransferDescriptor"][0], metadata["tl.tenstorrent.PipeTransferDescriptor"][1], metadata["tl.tenstorrent.PipeTransferDescriptor"][2], metadata["tl.tenstorrent.PipeTransferDescriptor"][3], metadata["tl.tenstorrent.PipeTransferDescriptor"][4], metadata["tl.tenstorrent.PipeTransferDescriptor"][5], metadata["tl.tenstorrent.PipeTransferDescriptor"][6], metadata["tl.tenstorrent.PipeTransferDescriptor"][7]], "tt.target_arch": "blackhole", "tt.tensor_table": [metadata["tl.tenstorrent.TensorDescriptor"][0], metadata["tl.tenstorrent.TensorDescriptor"][1], metadata["tl.tenstorrent.TensorDescriptor"][2]]})
+    @T.prim_func
+    def row_column_gemm_x0_y0_brisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][0], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][0], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+        T.evaluate(0)
+
+    @T.prim_func
+    def row_column_gemm_x0_y0_ncrisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][0], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][1], "tt.noc_index": 0, "tt.tensor_arg_indices": []})
+        T.evaluate(0)
+
+    @T.prim_func
+    def row_column_gemm_x0_y0_trisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][0], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][2], "tt.tensor_arg_indices": []})
+        T.evaluate(0)
+
+    @T.prim_func
+    def row_column_gemm_x0_y1_brisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][1], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][3], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(1, 1)
+        T.tt.dfb_pipe_send(0, 1, 1)
+        T.tt.dfb_pipe_wait(0, 1, 1)
+        T.tt.dfb_pipe_send(1, 1, 1)
+        T.tt.dfb_pipe_wait(1, 1, 1)
+        T.tt.dfb_release(1, 1)
+
+    @T.prim_func
+    def row_column_gemm_x0_y1_ncrisc(A_handle: T.handle):
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][1], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][4], "tt.noc_index": 0, "tt.tensor_arg_indices": [0]})
+        A = T.match_buffer(A_handle, (64, 32), strides=(32, 1))
+        T.tt.dfb_reserve(0, 1)
+        T.tt.tensor_to_dfb_nd(0, 0, 0, 32, 0, 32)
+        T.tt.dfb_copy_wait(0, 1)
+
+    @T.prim_func
+    def row_column_gemm_x0_y1_trisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][1], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][5], "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(0, 1)
+        T.tt.dfb_reserve(1, 1)
+        T.tt.dfb_compute(1, 0, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+        T.tt.dfb_release(0, 1)
+
+    @T.prim_func
+    def row_column_gemm_x0_y2_brisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][2], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][6], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(3, 1)
+        T.tt.dfb_pipe_send(2, 3, 1)
+        T.tt.dfb_pipe_wait(2, 3, 1)
+        T.tt.dfb_pipe_send(3, 3, 1)
+        T.tt.dfb_pipe_wait(3, 3, 1)
+        T.tt.dfb_release(3, 1)
+
+    @T.prim_func
+    def row_column_gemm_x0_y2_ncrisc(A_handle: T.handle):
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][2], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][7], "tt.noc_index": 0, "tt.tensor_arg_indices": [0]})
+        A = T.match_buffer(A_handle, (64, 32), strides=(32, 1))
+        T.tt.dfb_reserve(2, 1)
+        T.tt.tensor_to_dfb_nd(0, 2, 32, 32, 0, 32)
+        T.tt.dfb_copy_wait(2, 1)
+
+    @T.prim_func
+    def row_column_gemm_x0_y2_trisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][2], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][8], "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(2, 1)
+        T.tt.dfb_reserve(3, 1)
+        T.tt.dfb_compute(3, 2, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+        T.tt.dfb_release(2, 1)
+
+    @T.prim_func
+    def row_column_gemm_x1_y0_brisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][3], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][9], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(5, 1)
+        T.tt.dfb_pipe_send(4, 5, 1)
+        T.tt.dfb_pipe_wait(4, 5, 1)
+        T.tt.dfb_pipe_send(5, 5, 1)
+        T.tt.dfb_pipe_wait(5, 5, 1)
+        T.tt.dfb_release(5, 1)
+
+    @T.prim_func
+    def row_column_gemm_x1_y0_ncrisc(B_handle: T.handle):
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][3], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][10], "tt.noc_index": 0, "tt.tensor_arg_indices": [1]})
+        B = T.match_buffer(B_handle, (32, 64), strides=(64, 1))
+        T.tt.dfb_reserve(4, 1)
+        T.tt.tensor_to_dfb_nd(1, 4, 0, 32, 0, 32)
+        T.tt.dfb_copy_wait(4, 1)
+
+    @T.prim_func
+    def row_column_gemm_x1_y0_trisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][3], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][11], "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(4, 1)
+        T.tt.dfb_reserve(5, 1)
+        T.tt.dfb_compute(5, 4, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+        T.tt.dfb_release(4, 1)
+
+    @T.prim_func
+    def row_column_gemm_x1_y1_brisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][4], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][12], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+        T.evaluate(0)
+
+    @T.prim_func
+    def row_column_gemm_x1_y1_ncrisc(C_handle: T.handle):
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][4], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][13], "tt.noc_index": 0, "tt.tensor_arg_indices": [2]})
+        C = T.match_buffer(C_handle, (64, 64), strides=(64, 1))
+        T.tt.dfb_reserve(6, 1)
+        T.tt.dfb_pipe_recv(0, 6, 1)
+        T.tt.dfb_pipe_wait(0, 6, 1)
+        T.tt.dfb_reserve(7, 1)
+        T.tt.dfb_pipe_recv(4, 7, 1)
+        T.tt.dfb_pipe_wait(4, 7, 1)
+        T.tt.dfb_wait(9, 1)
+        T.tt.dfb_to_tensor_nd(9, 2, 0, 32, 0, 32)
+        T.tt.dfb_copy_wait(9, 1)
+        T.tt.dfb_release(9, 1)
+
+    @T.prim_func
+    def row_column_gemm_x1_y1_trisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][4], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][14], "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(6, 1)
+        T.tt.dfb_wait(7, 1)
+        T.tt.dfb_reserve(8, 1)
+        T.tt.dfb_compute(8, 6, 7, tt.compute_kind="gemm", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.transpose_a=0, tt.transpose_b=0, tt.clear=1, tt.accum_dtype="float32", tt.input_shapes=[[32, 32], [32, 32]], tt.access_maps=[[0, 1], [0, 1]])
+        T.tt.dfb_release(6, 1)
+        T.tt.dfb_release(7, 1)
+        T.tt.dfb_wait(8, 1)
+        T.tt.dfb_reserve(9, 1)
+        T.tt.dfb_compute(9, 8, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+        T.tt.dfb_release(8, 1)
+
+    @T.prim_func
+    def row_column_gemm_x1_y2_brisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][5], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][15], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+        T.evaluate(0)
+
+    @T.prim_func
+    def row_column_gemm_x1_y2_ncrisc(C_handle: T.handle):
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][5], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][16], "tt.noc_index": 0, "tt.tensor_arg_indices": [2]})
+        C = T.match_buffer(C_handle, (64, 64), strides=(64, 1))
+        T.tt.dfb_reserve(10, 1)
+        T.tt.dfb_pipe_recv(2, 10, 1)
+        T.tt.dfb_pipe_wait(2, 10, 1)
+        T.tt.dfb_reserve(11, 1)
+        T.tt.dfb_pipe_recv(5, 11, 1)
+        T.tt.dfb_pipe_wait(5, 11, 1)
+        T.tt.dfb_wait(13, 1)
+        T.tt.dfb_to_tensor_nd(13, 2, 32, 32, 0, 32)
+        T.tt.dfb_copy_wait(13, 1)
+        T.tt.dfb_release(13, 1)
+
+    @T.prim_func
+    def row_column_gemm_x1_y2_trisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][5], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][17], "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(10, 1)
+        T.tt.dfb_wait(11, 1)
+        T.tt.dfb_reserve(12, 1)
+        T.tt.dfb_compute(12, 10, 11, tt.compute_kind="gemm", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.transpose_a=0, tt.transpose_b=0, tt.clear=1, tt.accum_dtype="float32", tt.input_shapes=[[32, 32], [32, 32]], tt.access_maps=[[0, 1], [0, 1]])
+        T.tt.dfb_release(10, 1)
+        T.tt.dfb_release(11, 1)
+        T.tt.dfb_wait(12, 1)
+        T.tt.dfb_reserve(13, 1)
+        T.tt.dfb_compute(13, 12, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+        T.tt.dfb_release(12, 1)
+
+    @T.prim_func
+    def row_column_gemm_x2_y0_brisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][6], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][18], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(15, 1)
+        T.tt.dfb_pipe_send(6, 15, 1)
+        T.tt.dfb_pipe_wait(6, 15, 1)
+        T.tt.dfb_pipe_send(7, 15, 1)
+        T.tt.dfb_pipe_wait(7, 15, 1)
+        T.tt.dfb_release(15, 1)
+
+    @T.prim_func
+    def row_column_gemm_x2_y0_ncrisc(B_handle: T.handle):
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][6], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][19], "tt.noc_index": 0, "tt.tensor_arg_indices": [1]})
+        B = T.match_buffer(B_handle, (32, 64), strides=(64, 1))
+        T.tt.dfb_reserve(14, 1)
+        T.tt.tensor_to_dfb_nd(1, 14, 0, 32, 32, 32)
+        T.tt.dfb_copy_wait(14, 1)
+
+    @T.prim_func
+    def row_column_gemm_x2_y0_trisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][6], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][20], "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(14, 1)
+        T.tt.dfb_reserve(15, 1)
+        T.tt.dfb_compute(15, 14, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+        T.tt.dfb_release(14, 1)
+
+    @T.prim_func
+    def row_column_gemm_x2_y1_brisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][7], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][21], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+        T.evaluate(0)
+
+    @T.prim_func
+    def row_column_gemm_x2_y1_ncrisc(C_handle: T.handle):
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][7], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][22], "tt.noc_index": 0, "tt.tensor_arg_indices": [2]})
+        C = T.match_buffer(C_handle, (64, 64), strides=(64, 1))
+        T.tt.dfb_reserve(16, 1)
+        T.tt.dfb_pipe_recv(1, 16, 1)
+        T.tt.dfb_pipe_wait(1, 16, 1)
+        T.tt.dfb_reserve(17, 1)
+        T.tt.dfb_pipe_recv(6, 17, 1)
+        T.tt.dfb_pipe_wait(6, 17, 1)
+        T.tt.dfb_wait(19, 1)
+        T.tt.dfb_to_tensor_nd(19, 2, 0, 32, 32, 32)
+        T.tt.dfb_copy_wait(19, 1)
+        T.tt.dfb_release(19, 1)
+
+    @T.prim_func
+    def row_column_gemm_x2_y1_trisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][7], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][23], "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(16, 1)
+        T.tt.dfb_wait(17, 1)
+        T.tt.dfb_reserve(18, 1)
+        T.tt.dfb_compute(18, 16, 17, tt.compute_kind="gemm", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.transpose_a=0, tt.transpose_b=0, tt.clear=1, tt.accum_dtype="float32", tt.input_shapes=[[32, 32], [32, 32]], tt.access_maps=[[0, 1], [0, 1]])
+        T.tt.dfb_release(16, 1)
+        T.tt.dfb_release(17, 1)
+        T.tt.dfb_wait(18, 1)
+        T.tt.dfb_reserve(19, 1)
+        T.tt.dfb_compute(19, 18, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+        T.tt.dfb_release(18, 1)
+
+    @T.prim_func
+    def row_column_gemm_x2_y2_brisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][8], "tt.kernel_slot": "brisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][24], "tt.noc_index": 1, "tt.tensor_arg_indices": []})
+        T.evaluate(0)
+
+    @T.prim_func
+    def row_column_gemm_x2_y2_ncrisc(C_handle: T.handle):
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][8], "tt.kernel_slot": "ncrisc", "tt.kernel_thread": "datamovement", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][25], "tt.noc_index": 0, "tt.tensor_arg_indices": [2]})
+        C = T.match_buffer(C_handle, (64, 64), strides=(64, 1))
+        T.tt.dfb_reserve(20, 1)
+        T.tt.dfb_pipe_recv(3, 20, 1)
+        T.tt.dfb_pipe_wait(3, 20, 1)
+        T.tt.dfb_reserve(21, 1)
+        T.tt.dfb_pipe_recv(7, 21, 1)
+        T.tt.dfb_pipe_wait(7, 21, 1)
+        T.tt.dfb_wait(23, 1)
+        T.tt.dfb_to_tensor_nd(23, 2, 32, 32, 32, 32)
+        T.tt.dfb_copy_wait(23, 1)
+        T.tt.dfb_release(23, 1)
+
+    @T.prim_func
+    def row_column_gemm_x2_y2_trisc():
+        T.func_attr({"calling_conv": 2, "target": T.target({"arch": "blackhole", "keys": ["tenstorrent"], "kind": "tenstorrent", "tag": ""}), "tt.core_domain": metadata["tl.tenstorrent.CoreDomain"][8], "tt.kernel_slot": "trisc", "tt.kernel_thread": "compute", "tt.logical_kernel": metadata["tl.tenstorrent.LogicalKernel"][26], "tt.tensor_arg_indices": []})
+        T.tt.dfb_wait(20, 1)
+        T.tt.dfb_wait(21, 1)
+        T.tt.dfb_reserve(22, 1)
+        T.tt.dfb_compute(22, 20, 21, tt.compute_kind="gemm", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.transpose_a=0, tt.transpose_b=0, tt.clear=1, tt.accum_dtype="float32", tt.input_shapes=[[32, 32], [32, 32]], tt.access_maps=[[0, 1], [0, 1]])
+        T.tt.dfb_release(20, 1)
+        T.tt.dfb_release(21, 1)
+        T.tt.dfb_wait(22, 1)
+        T.tt.dfb_reserve(23, 1)
+        T.tt.dfb_compute(23, 22, tt.compute_kind="copy", tt.compute_dtype="float32", tt.compute_tile_shape=[32, 32], tt.logical_domain=[32, 32], tt.input_shapes=[[32, 32]], tt.access_maps=[[0, 1]])
+        T.tt.dfb_release(22, 1)
+
+# Metadata omitted. Use show_meta=True in script() method to show it.

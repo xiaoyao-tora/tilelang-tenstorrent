@@ -1,0 +1,112 @@
+"""Typed block expressions for verified Device compute values."""
+
+import math
+
+from tvm import tirx
+
+
+_BINARY = {tirx.Add: "add", tirx.Sub: "sub", tirx.Mul: "mul", tirx.Div: "div", tirx.Min: "min", tirx.Max: "max"}
+_UNARY = {
+    "tirx.exp": "exp",
+    "tirx.exp2": "exp2",
+    "tirx.log": "log",
+    "tirx.log2": "log2",
+    "tirx.sqrt": "sqrt",
+    "tirx.rsqrt": "rsqrt",
+    "tirx.tanh": "tanh",
+    "tirx.sin": "sin",
+    "tirx.cos": "cos",
+    "tirx.fabs": "abs",
+    "tirx.floor": "floor",
+    "tirx.ceil": "ceil",
+}
+_LOADS = (
+    "tl.tt.dfb_operand",
+    "tl.tt.compute_value_operand",
+    "tl.tt.dfb_load",
+    "tl.tt.compute_value_load",
+)
+
+
+def check_expression(expr):
+    """Check the complete expression before loading optional compiler bindings."""
+    if isinstance(expr, (tirx.IntImm, tirx.FloatImm)):
+        return
+    if str(expr.dtype) not in ("bfloat16", "float32"):
+        raise NotImplementedError(f"TTL block expression dtype {expr.dtype} is not supported")
+    if isinstance(expr, tirx.Cast):
+        check_expression(expr.value)
+    elif type(expr) in _BINARY:
+        check_expression(expr.a)
+        check_expression(expr.b)
+    elif isinstance(expr, tirx.Call) and expr.op.name in _LOADS:
+        return
+    elif isinstance(expr, tirx.Call) and expr.op.name == "tl.tt.compute_broadcast":
+        if len(expr.args) < 2:
+            raise ValueError("compute_broadcast requires one value and broadcast axes")
+        check_expression(expr.args[0])
+    elif isinstance(expr, tirx.Call) and expr.op.name in _UNARY:
+        check_expression(expr.args[0])
+    else:
+        raise NotImplementedError(f"TTL block expression has no mapping for {type(expr).__name__}: {expr}")
+
+
+class ExpressionEmitter:
+    def __init__(self, emitter, call, result_type, dtype=None):
+        self.e = emitter
+        self.b = emitter.b
+        self.call = call
+        self.shape = list(result_type.shape)
+        self.result_type = result_type
+        self.dtype = str(dtype)
+        tile_type = self.b.ttcore.ir.TileType.maybe_downcast(result_type.element_type)
+        if tile_type is None:
+            raise ValueError(f"TTL expression result must use a tile element type, got {result_type}")
+        self.tile_shape = tuple(map(int, tile_type.shape))
+
+    def tensor_type(self, dtype):
+        return self.b.ir.RankedTensorType.get(
+            self.shape,
+            self.e.type_converter.tile_type(dtype, self.tile_shape),
+        )
+
+    def fill(self, value, dtype):
+        attr = self.b.ir.FloatAttr.get(self.b.ir.F32Type.get(self.e.ctx), float(value))
+        return self.b.ttl.fill(self.tensor_type(dtype), attr)
+
+    def emit(self, expr, scalar_dtype=None):
+        ttl = self.b.ttl
+        if isinstance(expr, (tirx.IntImm, tirx.FloatImm)):
+            return self.fill(expr.value, scalar_dtype or self.dtype)
+        if isinstance(expr, tirx.Cast):
+            # Constants are materialized directly in the explicitly requested dtype.
+            if isinstance(expr.value, (tirx.IntImm, tirx.FloatImm)):
+                return self.fill(expr.value.value, expr.dtype)
+            return ttl.typecast(self.tensor_type(expr.dtype), self.emit(expr.value))
+        if type(expr) in _BINARY:
+            return getattr(ttl, _BINARY[type(expr)])(self.emit(expr.a, expr.dtype), self.emit(expr.b, expr.dtype))
+        if isinstance(expr, tirx.Call) and expr.op.name in _LOADS:
+            index = int(expr.args[0])
+            if expr.op.name == "tl.tt.dfb_operand":
+                return self.e.value_for_dfb_operand(self.call.args[index + 1])
+            if expr.op.name == "tl.tt.compute_value_operand":
+                inputs = self.call.annotations.get("tt.value_inputs", [])
+                return self.e.value_for_compute_operand(inputs[index])
+            if expr.op.name == "tl.tt.dfb_load":
+                return self.e.value_for_dfb_operand(expr.args[0])
+            return self.e.value_for_compute_operand(expr.args[0])
+        if isinstance(expr, tirx.Call) and expr.op.name == "tl.tt.compute_broadcast":
+            requirements = self.e.function.attrs.get("tt.compute_requirements")
+            if str(expr.dtype) == "bfloat16" and requirements is not None and str(requirements.destination_width) == "bits32_required":
+                raise NotImplementedError(
+                    "pinned TT-Lang cannot lower BF16 broadcast in a kernel that requires 32-bit destination registers"
+                )
+            dims_attr = self.b.ir.DenseI64ArrayAttr.get([int(axis) for axis in expr.args[1:]])
+            shape_attr = self.b.ir.DenseI64ArrayAttr.get(self.shape)
+            return ttl.block_broadcast(self.tensor_type(expr.dtype), self.emit(expr.args[0]), dims_attr, shape_attr)
+        operation = _UNARY[expr.op.name]
+        value = self.emit(expr.args[0])
+        if operation == "log2":
+            scale = self.b.ir.FloatAttr.get(self.b.ir.F32Type.get(self.e.ctx), 1.0 / math.log(2.0))
+            return ttl.mul_unary_const(ttl.log(value), scale)
+        return getattr(ttl, operation)(value)
