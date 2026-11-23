@@ -117,6 +117,9 @@ def test_prebuilt_module_compile_runs_verified_pipeline_and_packages():
     assert manager.verifier is True
     assert manager.ran is module.operation
     assert "ttl-to-ttkernel-pipeline" in pipelines[0][0]
+    assert "lower-to-emitc=false" in pipelines[0][0]
+    assert pipelines[0][0].endswith("},lower-affine,convert-ttkernel-to-emitc,canonicalize)")
+    assert "form-expressions" not in pipelines[0][0]
     assert "matmul-full-fp32=false" in pipelines[0][0]
     assert "unsafe-assume-allocation-groups=false" in pipelines[0][0]
     args, kwargs = calls[0]

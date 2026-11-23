@@ -124,9 +124,13 @@ class TTLStatementEmitterMixin:
 
     def _loop_state_ids(self, body) -> tuple[int, ...]:
         result = set()
+        initialized = set()
 
         def visit(node):
             if not isinstance(node, tirx.Call) or not hasattr(node.op, "name"):
+                return
+            if str(node.op.name) == "tl.tt.compute_value_state_init":
+                initialized.add(self.resource_id(node.args[0], "tl.tt.compute_state_ref"))
                 return
             if str(node.op.name) not in (
                 "tl.tt.compute_value_state_input",
@@ -142,12 +146,17 @@ class TTLStatementEmitterMixin:
             )
 
         tirx.stmt_functor.post_order_visit(body, visit)
-        return tuple(sorted(result))
+        # Nested loops may update an outer state, but a state initialized inside
+        # this body is local to this iteration, not an incoming iter_arg.
+        return tuple(sorted(result - initialized))
 
     def _loop_accumulator_ids(self, body) -> tuple[int, ...]:
         result = set()
+        initialized = set()
 
         def visit(node):
+            if isinstance(node, tirx.Call) and str(node.op.name) == "tl.tt.accumulator_init":
+                initialized.add(self.resource_id(node.args[0], "tl.tt.accumulator_ref"))
             if isinstance(node, tirx.Call) and str(node.op.name) == "tl.tt.gemm_update":
                 result.add(
                     self.resource_id(
@@ -157,7 +166,7 @@ class TTLStatementEmitterMixin:
                 )
 
         tirx.stmt_functor.post_order_visit(body, visit)
-        return tuple(sorted(result))
+        return tuple(sorted(result - initialized))
 
     def emit_for(self, statement) -> None:
         lower = self.scalar.emit(statement.min)

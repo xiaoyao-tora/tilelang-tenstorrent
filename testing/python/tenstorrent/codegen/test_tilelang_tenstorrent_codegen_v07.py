@@ -226,6 +226,27 @@ def test_real_current_summa_pipenet_compile_only():
         artifact.operation.verify()
 
 
+@pytest.mark.parametrize("seq_kv", [32, 64])
+def test_real_flash_attention_nested_loop_state_codegen(seq_kv):
+    _real_bindings()
+    from examples.tenstorrent.flash_attn import make_flash_attention
+
+    frontend = make_flash_attention(
+        batch=2,
+        heads=1,
+        seq_q=128,
+        seq_kv=seq_kv,
+        head_dim=32,
+        core_q=2,
+        core_bh=1,
+        accum_dtype="bfloat16",
+    )
+    device = lower_tenstorrent_ir(tvm.IRModule({"main": frontend}), TARGET)
+    artifact = codegen.build_ttl_without_compile(device, TARGET)
+    assert "iter_args" in artifact.inspect_source()
+    artifact.operation.verify()
+
+
 def test_real_dynamic_dfb_family_selection_is_explicitly_unsupported():
     _real_bindings()
     from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_lower_shared_grid_v04 import (

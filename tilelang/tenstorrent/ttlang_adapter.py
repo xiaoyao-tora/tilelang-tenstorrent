@@ -75,7 +75,7 @@ def _compile_prebuilt_module(
     matmul_full_fp32 = False if "forbidden" in full_fp32_policies else compiler_options.matmul_full_fp32
 
     options = {
-        "lower-to-emitc": True,
+        "lower-to-emitc": False,
         "maximize-dst": compiler_options.maximize_dst,
         "enable-fpu-binary-ops": compiler_options.enable_fpu_binary_ops,
         "use-block-matmul": compiler_options.use_block_matmul,
@@ -97,7 +97,10 @@ def _compile_prebuilt_module(
     }
     option_string = " ".join(f"{name}={str(value).lower() if isinstance(value, bool) else value}" for name, value in options.items())
     manager = ttl_api.PassManager.parse(
-        f"builtin.module(ttl-to-ttkernel-pipeline{{{option_string}}})",
+        # The pinned LLVM form-expressions rewrite indexes duplicate operands
+        # incorrectly. EmitC translation also accepts the unformed operations.
+        f"builtin.module(ttl-to-ttkernel-pipeline{{{option_string}}},"
+        "lower-affine,convert-ttkernel-to-emitc,canonicalize)",
         context=module.context,
     )
     manager.enable_verifier(True)
