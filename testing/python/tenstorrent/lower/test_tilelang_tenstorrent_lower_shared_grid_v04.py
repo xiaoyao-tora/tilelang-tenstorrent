@@ -151,10 +151,9 @@ def test_high_level_communication_forms_complete_device_program(program, kind, a
         "main_ncrisc",
         "main_brisc",
     ]
-    communication = list(mod.attrs["tt.communication_table"])
-    assert len(communication) == 1
-    assert str(communication[0].kind) == kind
-    assert str(communication[0].algorithm) == algorithm
+    transport = mod.attrs["tt.transport_families"][0].prototype
+    assert str(transport.kind) == kind
+    assert str(transport.algorithm) == algorithm
     assert "tt.communication_step_families" not in mod.attrs
     assert resolve_transport_records(mod) or kind in ("all_gather", "all_reduce")
     body_names = {call.op.name for function in mod.functions.values() for call in calls(function.body)}
@@ -546,7 +545,6 @@ def test_collective_transport_families_resolve_to_ordered_pipenet_records():
     assert len(records[0]) == len(records[1]) == 4
     for row, record in enumerate(records[0]):
         assert record.pipe_net_id == 0
-        assert record.communication_id == 0
         assert record.record_index == row
         assert record.source == (0, row)
         assert record.destination_begin == (0, row)
@@ -554,7 +552,6 @@ def test_collective_transport_families_resolve_to_ordered_pipenet_records():
         assert record.contract == "collective"
     for column, record in enumerate(records[1]):
         assert record.pipe_net_id == 1
-        assert record.communication_id == 1
         assert record.record_index == column
         assert record.source == (column, 0)
         assert record.destination_begin == (column, 0)
@@ -655,15 +652,12 @@ def test_summa_device_body_uses_kind_resource_aliases():
     assert "c_local_acc_1" not in trisc.script()
 
 
-def test_pipe_net_namespace_is_independent_from_parent_communication():
+def test_local_collective_leaves_one_pipenet():
     mod = lower(local_collective_then_transfer)
-    communications = list(mod.attrs["tt.communication_table"])
-    assert [int(entry.communication_id) for entry in communications] == [0, 1]
     records = resolve_transport_records(mod)
     assert set(records) == {0}
     (record,) = records[0]
     assert record.pipe_net_id == 0
-    assert record.communication_id == 1
     assert record.record_index == 0
     assert "tt.communication_step_families" not in mod.attrs
 
@@ -691,12 +685,18 @@ def test_codegen_record_resolver_accepts_collective_loopback_only():
     pipe = family.prototype
     prototype = D.PipeDescriptor(
         int(pipe.pipe_net_id),
-        int(pipe.communication_id),
         int(pipe.record_index),
         pipe.src_coord,
         pipe.dst_begin,
         pipe.dst_end,
         "point_to_point",
+        str(pipe.kind),
+        str(pipe.algorithm),
+        pipe.parameter,
+        pipe.group_begin,
+        pipe.group_end,
+        pipe.occurrence_extents,
+        str(pipe.payload_source_name),
         int(pipe.payload_dfb_id),
         pipe.source_span,
     )
@@ -706,16 +706,16 @@ def test_codegen_record_resolver_accepts_collective_loopback_only():
         resolve_transport_records(malformed)
 
 
-def test_device_verifier_rejects_transport_with_wrong_parent_communication():
+def test_codegen_record_resolver_accepts_point_to_point_without_loopback():
     mod = lower(point_transfer)
-    families = list(mod.attrs["tt.transport_families"])
-    family = families[0]
-    fields = dict(family.fields)
-    fields["communication_id"] = D.DeviceIRIntColumn(1, 0, 1, [])
-    families[0] = D.DeviceIRDescriptorFamily(family.prototype, family.positions, fields, family.source_parts)
-    malformed = mod.with_attr("tt.transport_families", families)
-    with pytest.raises(ValueError, match="missing parent communication"):
-        transform.VerifyTenstorrentDeviceIR()(malformed)
+    records = resolve_transport_records(mod)
+    assert set(records) == {0}
+    for record in records[0]:
+        assert record.contract == "point_to_point"
+        assert not (
+            record.destination_begin[0] <= record.source[0] < record.destination_end[0]
+            and record.destination_begin[1] <= record.source[1] < record.destination_end[1]
+        )
 
 
 def _body_counts(function):

@@ -198,8 +198,10 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
     def _tensor_slice(self, tensor_id: int, dfb_id: int, starts):
         descriptor = self.tensors[tensor_id]
         tile_shape = tuple(map(int, descriptor.tile_shape))
-        if len(starts) != len(tile_shape):
-            raise ValueError("Tensor slice rank does not match Tensor tile rank")
+        rank = len(descriptor.shape)
+        if len(starts) != rank:
+            raise ValueError("Tensor slice rank does not match Tensor rank")
+        tile_shape = (1,) * (rank - len(tile_shape)) + tile_shape
         indices = []
         for start, tile in zip(starts, tile_shape):
             if isinstance(start, tirx.IntImm):
@@ -277,6 +279,8 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
                 actual_extents = list(map(int, extents))
             except (TypeError, ValueError) as error:
                 raise NotImplementedError("TTL Tensor copies require static transfer extents") from error
+            if len(actual_extents) > len(expected_extents):
+                expected_extents = [1] * (len(actual_extents) - len(expected_extents)) + expected_extents
             if actual_extents != expected_extents:
                 raise RuntimeError(f"verified Tensor copy extent {actual_extents} does not match DFB block extent {expected_extents}")
             view = self._tensor_slice(tensor_id, dfb_id, starts)
@@ -427,7 +431,7 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
         ).emit(call.annotations["tt.expression"])
 
     def emit_compute_value_gemm(self, call) -> None:
-        if bool(int(call.args[4])):
+        if bool(int(call.annotations["tt.transpose_a"])):
             raise NotImplementedError("TTL matmul does not support transpose_a")
         output = self.compute_value_id(call.args[0])
         descriptor = self.compute_value_descriptors[output]
@@ -435,7 +439,7 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
             self.type_converter.value_type(descriptor),
             self.value_for_dfb_operand(call.args[1]),
             self.value_for_dfb_operand(call.args[2]),
-            transpose_rhs=bool(int(call.args[5])),
+            transpose_rhs=bool(int(call.annotations["tt.transpose_b"])),
         )
         old = self.compute_value_id(call.args[3])
         if old >= 0:

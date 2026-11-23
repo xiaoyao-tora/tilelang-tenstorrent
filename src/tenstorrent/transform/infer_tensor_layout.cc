@@ -4,6 +4,7 @@
  */
 
 #include "../ir/device_ir.h"
+#include "dtype_support.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
@@ -48,8 +49,7 @@ int64_t RequireStaticExtent(const PrimExpr &extent,
 }
 
 bool IsSupportedDType(DataType dtype) {
-  return dtype.lanes() == 1 &&
-         (dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32));
+  return IsSupportedStorageDType(dtype);
 }
 
 TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
@@ -97,7 +97,8 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
   if (!IsSupportedDType(metadata->buffer->dtype)) {
     ThrowUnsupported("buffer '" + buffer_id +
                      "' has an unsupported dtype; Device Lower supports "
-                     "bfloat16 and float32");
+                     "bfloat16, float32, int32, uint32 and uint16: " +
+                     DTypeRejectionReason(metadata->buffer->dtype));
   }
 
   if (kind == "compute_fragment") {

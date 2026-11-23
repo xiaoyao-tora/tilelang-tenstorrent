@@ -11,6 +11,7 @@
 #include "compact_device_program.h"
 #include "compute_support.h"
 #include "device_table_compaction.h"
+#include "dtype_support.h"
 #include "infer_compute_requirements.h"
 
 #include <tvm/arith/analyzer.h>
@@ -592,14 +593,12 @@ void VerifyPipeTable(const ffi::Array<PipeDescriptor> &pipes,
   std::unordered_set<std::string> record_ids;
   std::unordered_map<int64_t, int64_t> next_record;
   std::unordered_map<int64_t, ffi::String> contracts;
-  std::unordered_map<int64_t, int64_t> communications;
+  std::unordered_map<int64_t, ffi::String> kinds;
   int64_t expected_pipe_net = 0;
   for (const PipeDescriptor &pipe : pipes) {
     const std::string label = "PipeNet " + std::to_string(pipe->pipe_net_id) +
                               " record " + std::to_string(pipe->record_index);
     Check(pipe->pipe_net_id >= 0, label + " has a negative pipe_net_id");
-    Check(pipe->communication_id >= 0,
-          label + " has a negative communication_id");
     Check(pipe->record_index >= 0, label + " has a negative record_index");
     const std::string record_id = std::to_string(pipe->pipe_net_id) + ":" +
                                   std::to_string(pipe->record_index);
@@ -613,10 +612,9 @@ void VerifyPipeTable(const ffi::Array<PipeDescriptor> &pipes,
           label + " is out of order; expected record_index " +
               std::to_string(expected));
     ++expected;
-    auto [communication, new_pipe_net] =
-        communications.emplace(pipe->pipe_net_id, pipe->communication_id);
-    Check(new_pipe_net || communication->second == pipe->communication_id,
-          label + " has inconsistent parent communication IDs");
+    auto [kind, kind_inserted] = kinds.emplace(pipe->pipe_net_id, pipe->kind);
+    Check(kind_inserted || kind->second == pipe->kind,
+          label + " mixes communication kinds in one PipeNet");
     VerifyCoord(pipe->src_coord, launch_grid, label + " src_coord");
     VerifyDomain(CoreDomain(pipe->dst_begin, pipe->dst_end), launch_grid,
                  label + " destination range");
@@ -922,9 +920,8 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
   const int64_t input_b_id = plan.input_b->dfb_id;
   const int64_t output_id = plan.output->dfb_id;
   if (slot == "trisc") {
-    Check(
-        logical_kernel->kind == "compute" && logical_kernel->role == "add",
-        "Phase 2 trisc LogicalKernel must have kind `compute` and role `add`");
+    Check(logical_kernel->role == "add",
+          "Phase 2 trisc LogicalKernel must have role `add`");
     VerifyMarkerSequence(
         ParseMarkers(func->body, symbol),
         {{MarkerKind::kDFBReserve, {output_id}},
@@ -936,10 +933,8 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
     return;
   }
   if (slot == "ncrisc") {
-    Check(logical_kernel->kind == "datamovement" &&
-              logical_kernel->role == "tensor_io",
-          "Phase 2 ncrisc LogicalKernel must have kind `datamovement` and role "
-          "`tensor_io`");
+    Check(logical_kernel->role == "tensor_io",
+          "Phase 2 ncrisc LogicalKernel must have role `tensor_io`");
     VerifyMarkerSequence(ParseMarkers(func->body, symbol),
                          {{MarkerKind::kDFBReserve, {input_a_id}},
                           {MarkerKind::kTensorToDFB,
@@ -953,7 +948,7 @@ void VerifyPhase2Body(const tirx::PrimFunc &func, const std::string &symbol,
                          symbol);
     return;
   }
-  Check(logical_kernel->kind == "idle" && logical_kernel->role == "idle",
+  Check(logical_kernel->role == "idle",
         "Phase 2 brisc LogicalKernel must be canonical idle");
   Check(IsCanonicalNoOp(func->body),
         "Phase 2 brisc body must be the canonical Evaluate(0) no-op");
@@ -1092,8 +1087,6 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
     Check(kernel_ids.insert(logical_kernel->kernel_id).second,
           "duplicate logical kernel ID `" +
               std::string(logical_kernel->kernel_id) + "`");
-    Check(!logical_kernel->kind.empty(),
-          "PrimFunc `" + symbol + "` has no logical kernel kind");
     Check(!logical_kernel->role.empty(),
           "PrimFunc `" + symbol + "` has no logical kernel role");
     Check(!require_span || logical_kernel->source_span.defined(),
@@ -1236,8 +1229,19 @@ ffi::Array<PrimExpr> ComputeShape(const Call &call, const char *key) {
   return CheckedShape(value.value(), key);
 }
 
+// Float compute values: comparisons, selects and accumulators stay float-only.
 bool SupportedComputeDType(DataType dtype) {
-  return dtype == DataType::BFloat(16) || dtype == DataType::Float(32);
+  return IsSupportedFloatComputeDType(dtype);
+}
+
+// A structured expression may carry an integer scalar DAG.
+bool SupportedExpressionDType(DataType dtype) {
+  return IsSupportedExpressionDType(dtype);
+}
+
+// Tensor and DFB element dtypes may be integer even when compute is float-only.
+bool SupportedStorageDType(DataType dtype) {
+  return IsSupportedStorageDType(dtype);
 }
 
 void VerifyTileGrid(const ffi::Array<PrimExpr> &shape,
@@ -1400,11 +1404,15 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
             object.as<LENode>() || object.as<GTNode>() || object.as<GENode>() ||
             object.as<AndNode>() || object.as<OrNode>() || object.as<NotNode>();
         Check(bound_variable || object.as<IntImmNode>() ||
-                  SupportedComputeDType(expr.value().dtype()) ||
+                  SupportedExpressionDType(expr.value().dtype()) ||
                   (boolean_node && expr.value().dtype() == DataType::Bool()),
               "Device expression has unsupported intermediate dtype");
         Check(bound_variable || IsSupportedComputeNode(expr.value()),
               "Device expression contains an unsupported expression node");
+        if (IsIntegerDType(expr.value().dtype()))
+          Check(bound_variable || IsSupportedDeviceIntegerComputeNode(expr.value()),
+                "Device integer expression only supports add, sub, mul and "
+                "broadcast");
         if (const auto *select = object.as<SelectNode>())
           Check(select->condition.dtype() == DataType::Bool() &&
                     SupportedComputeDType(select->dtype) &&
@@ -2772,7 +2780,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
   std::unordered_map<int64_t, int> effects;
   std::unordered_map<int64_t, ffi::Array<PrimExpr>> logical_shapes;
   for (const auto &[id, tensor] : tensors) {
-    Check(SupportedComputeDType(tensor->dtype),
+    Check(SupportedStorageDType(tensor->dtype),
           "Phase 4 Tensor dtype unsupported");
     Check(tensor->tile_shape.size() == 2 &&
               RequireStaticInteger(tensor->tile_shape[0], "Tensor tile rows") ==
@@ -2802,7 +2810,7 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
                    "Tensor " + std::to_string(id));
   }
   for (const auto &[id, dfb] : dfbs) {
-    Check(SupportedComputeDType(dfb->element_dtype),
+    Check(SupportedStorageDType(dfb->element_dtype),
           "Phase 4 DFB dtype unsupported");
     int64_t capacity =
         RequireStaticInteger(dfb->block_count, "DFB block count");
@@ -3218,47 +3226,22 @@ using CoreKey = std::pair<int64_t, int64_t>;
 
 struct CurrentStoragePlan {
   std::map<int64_t, DFBStorageGroupDescriptor> groups;
-  std::map<int64_t, int64_t> resource_groups;
-  std::map<int64_t, int64_t> resource_ordinals;
-  std::map<int64_t, int64_t> resource_pipeline_iterations;
-  std::map<int64_t, std::map<int64_t, int64_t>> ordered_resources;
 };
 
 CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
                                             const TensorTable &tensors,
                                             const CoreCoord &launch_grid) {
-  Check(!mod->attrs->dict.count(kInternalDFBStorageGroupsAttr) &&
-            !mod->attrs->dict.count(kInternalDFBTransactionRelationsAttr) &&
-            !mod->attrs->dict.count(kPipelineRelationsAttr),
+  Check(!mod->attrs->dict.count("tt.internal_dfb_storage_groups") &&
+            !mod->attrs->dict.count("tt.internal_dfb_transaction_relations") &&
+            !mod->attrs->dict.count("tt.pipeline_relations"),
         "current Device IR cannot persist concrete storage-group maps");
-  bool stream_operands =
-      mod->GetAttr<Integer>("tt.stream_operands").value_or(Integer(0))->value ==
-      1;
-  auto families =
-      mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(kDFBFamiliesAttr);
+  Check(!mod->attrs->dict.count(kDFBFamiliesAttr) &&
+            !mod->attrs->dict.count("tt.dfb_storage_group_relations"),
+        "stream-centric Device IR cannot persist DFB generation relations");
   auto groups = RequireModuleAttr<ffi::Array<DFBStorageGroupDescriptor>>(
       mod, kDFBStorageGroupsAttr);
-  auto relations = mod->GetAttr<ffi::Array<DFBStorageGroupRelation>>(
-      kDFBStorageGroupRelationsAttr);
-  if (stream_operands) {
-    Check(!families.has_value() && !relations.has_value(),
-          "stream-centric Device IR cannot persist DFB generation relations");
-  } else {
-    Check(families.has_value() && relations.has_value() &&
-              relations.value().size() == families.value().size() &&
-              groups.empty() == families.value().empty(),
-          "current Device IR requires one storage relation per DFB family");
-  }
 
   CurrentStoragePlan result;
-  auto pipeline_stages = mod->GetAttr<Integer>(kPipelineStagesAttr);
-  auto pipeline_extent = mod->GetAttr<Integer>(kPipelineExtentAttr);
-  Check(pipeline_stages.has_value() == pipeline_extent.has_value(),
-        "pipeline stages and extent must be provided together");
-  int64_t pipeline_depth = pipeline_stages.has_value()
-                               ? std::min(pipeline_stages.value()->value,
-                                          pipeline_extent.value()->value)
-                               : 0;
   for (size_t index = 0; index < groups.size(); ++index) {
     const DFBStorageGroupDescriptor &group = groups[index];
     Check(group.defined() &&
@@ -3312,91 +3295,6 @@ CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
     result.groups.emplace(group->storage_group_id, group);
   }
 
-  if (stream_operands)
-    return result;
-
-  for (size_t family_id = 0; family_id < families.value().size(); ++family_id) {
-    const DeviceIRDescriptorFamily &family = families.value()[family_id];
-    const DFBStorageGroupRelation &relation = relations.value()[family_id];
-    Check(relation.defined() &&
-              relation->dfb_family_id == static_cast<int64_t>(family_id) &&
-              family.defined() && family->positions.defined() &&
-              family->fields.count("dfb_id"),
-          "storage relation does not match its DFB family");
-    int64_t count = family->positions->count;
-    std::vector<int64_t> ids =
-        ExpandDeviceIntColumn(family->fields.at("dfb_id"), count);
-    std::vector<int64_t> group_ids =
-        ExpandDeviceIntColumn(relation->storage_group_ids, count);
-    std::vector<int64_t> ordinals =
-        ExpandDeviceIntColumn(relation->transaction_ordinals, count);
-    std::vector<int64_t> pipeline_iterations =
-        ExpandDeviceIntColumn(relation->pipeline_iterations, count);
-    auto prototype = family->prototype.as<DFBDescriptor>();
-    Check(prototype.has_value(), "DFB family has the wrong prototype type");
-    for (int64_t row = 0; row < count; ++row) {
-      int64_t id = ids[row], group_id = group_ids[row], ordinal = ordinals[row];
-      int64_t pipeline_iteration = pipeline_iterations[row];
-      Check(id >= 0 && result.groups.count(group_id) && ordinal >= 0,
-            "storage relation contains an invalid ID or ordinal");
-      Check(result.resource_groups.emplace(id, group_id).second &&
-                result.resource_ordinals.emplace(id, ordinal).second &&
-                result.resource_pipeline_iterations
-                    .emplace(id, pipeline_iteration)
-                    .second &&
-                result.ordered_resources[group_id].emplace(ordinal, id).second,
-            "storage relation has duplicate DFB identities or ordinals");
-      Check((pipeline_depth == 0 && pipeline_iteration == -1) ||
-                (pipeline_depth > 0 &&
-                 (pipeline_iteration == -1 ||
-                  (pipeline_iteration >= 0 &&
-                   pipeline_iteration < pipeline_extent.value()->value &&
-                   pipeline_iteration == ordinal))),
-            "storage relation has an invalid pipeline iteration");
-      const DFBStorageGroupDescriptor &group = result.groups.at(group_id);
-      const DFBDescriptor &dfb = prototype.value();
-      Check(group->element_dtype == dfb->element_dtype &&
-                ffi::StructuralEqual()(group->tile_shape, dfb->tile_shape) &&
-                ffi::StructuralEqual()(group->block_shape_in_tiles,
-                                       dfb->block_shape_in_tiles) &&
-                ffi::StructuralEqual()(group->block_count, dfb->block_count) &&
-                group->producer_slot == dfb->producer_slot &&
-                ffi::StructuralEqual()(group->producer_domain,
-                                       dfb->producer_domain) &&
-                group->consumer_slot == dfb->consumer_slot &&
-                ffi::StructuralEqual()(group->consumer_domain,
-                                       dfb->consumer_domain),
-            "DFB family and storage group contracts disagree");
-    }
-  }
-  Check(result.resource_groups.empty() == families.value().empty(),
-        "current Device IR has incomplete storage-group resource relations");
-  for (const auto &[group_id, resources] : result.ordered_resources) {
-    Check(!resources.empty() && resources.begin()->first == 0,
-          "storage-group transaction ordinals must start at zero");
-    int64_t expected = 0;
-    for (const auto &[ordinal, resource] : resources)
-      Check(ordinal == expected++,
-            "storage-group transaction ordinals must be dense");
-    if (pipeline_depth > 0) {
-      std::set<int64_t> iterations;
-      for (const auto &[ordinal, resource] : resources)
-        iterations.insert(result.resource_pipeline_iterations.at(resource));
-      bool singleton = iterations.count(-1);
-      Check((singleton && resources.size() == 1 && iterations.size() == 1) ||
-                (!singleton &&
-                 resources.size() ==
-                     static_cast<size_t>(pipeline_extent.value()->value) &&
-                 *iterations.begin() == 0 &&
-                 *iterations.rbegin() == pipeline_extent.value()->value - 1),
-            "DFB transaction count disagrees with pipeline group coverage");
-      if (!singleton)
-        Check(RequireStaticInteger(result.groups.at(group_id)->block_count,
-                                   "pipeline storage-group capacity") >=
-                  pipeline_depth,
-              "pipeline storage-group capacity insufficient");
-    }
-  }
   return result;
 }
 
@@ -3404,45 +3302,17 @@ void VerifyCurrentL1Budget(
     const IRModule &mod, const DFBTable &dfbs,
     const std::map<int64_t, std::set<CoreKey>> &resource_cores,
     const CurrentStoragePlan &storage) {
-  if (mod->attrs->dict.count(kPipelineStagesAttr) ||
-      mod->attrs->dict.count(kPipelineExtentAttr) ||
-      mod->attrs->dict.count("tt.pipeline_wait_policy")) {
-    int64_t stages =
-        RequireModuleAttr<Integer>(mod, kPipelineStagesAttr)->value;
-    int64_t extent =
-        RequireModuleAttr<Integer>(mod, kPipelineExtentAttr)->value;
-    Check(stages > 0 && stages <= 32 && extent > 0 && extent <= 1024,
-          "current Device pipeline stages/extent are outside supported bounds");
-    auto wait_policy =
-        RequireModuleAttr<ffi::String>(mod, "tt.pipeline_wait_policy");
-    Check(wait_policy == "conservative" || wait_policy == "delayed",
-          "current Device pipeline wait policy is invalid");
-  }
-
   std::map<CoreKey, int64_t> payload;
   int64_t total_payload = 0;
   for (const auto &[group_id, group] : storage.groups) {
     std::set<CoreKey> cores;
-    bool stream_operands = mod->GetAttr<Integer>("tt.stream_operands")
-                               .value_or(Integer(0))
-                               ->value == 1;
-    if (stream_operands) {
-      Check(dfbs.count(group_id),
-            "logical stream descriptor references a missing DFB");
-      auto uses = resource_cores.find(group_id);
-      Check(uses != resource_cores.end() && !uses->second.empty(),
-            "current Device stream has no body use: " +
-                std::to_string(group_id));
-      cores.insert(uses->second.begin(), uses->second.end());
-    } else {
-      for (const auto &[ordinal, id] : storage.ordered_resources.at(group_id)) {
-        Check(dfbs.count(id), "storage relation references a missing DFB");
-        auto uses = resource_cores.find(id);
-        Check(uses != resource_cores.end() && !uses->second.empty(),
-              "current Device DFB has no body use: " + std::to_string(id));
-        cores.insert(uses->second.begin(), uses->second.end());
-      }
-    }
+    Check(dfbs.count(group_id),
+          "logical stream descriptor references a missing DFB");
+    auto uses = resource_cores.find(group_id);
+    Check(uses != resource_cores.end() && !uses->second.empty(),
+          "current Device stream has no body use: " +
+              std::to_string(group_id));
+    cores.insert(uses->second.begin(), uses->second.end());
     const std::string label =
         "current Device storage group " + std::to_string(group_id);
     int64_t bytes =
@@ -3520,7 +3390,7 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     CoreKey core = CoreOf(dfb->producer_domain);
     Check(core == CoreOf(dfb->consumer_domain),
           "Phase 6 DFB producer/consumer owner Core mismatch");
-    Check(SupportedComputeDType(dfb->element_dtype),
+    Check(SupportedStorageDType(dfb->element_dtype),
           "Phase 6 DFB dtype unsupported");
     Check(dfb->tile_shape.size() == 2 &&
               RequireStaticInteger(dfb->tile_shape[0], "tile rows") == 32 &&
@@ -3568,7 +3438,7 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
                 "physical allocation overhead is not included");
   }
   for (const auto &[id, tensor] : tensors) {
-    Check(SupportedComputeDType(tensor->dtype),
+    Check(SupportedStorageDType(tensor->dtype),
           "Phase 6 Tensor dtype unsupported");
     Check(tensor->tile_shape.size() == 2 &&
               RequireStaticInteger(tensor->tile_shape[0], "Tensor tile rows") ==
@@ -3602,8 +3472,6 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     Check(records.count(record_key),
           "Pipe transfer references missing original record");
     const PipeDescriptor &record = records.at(record_key);
-    Check(transfer->communication_id == record->communication_id,
-          "Pipe transfer parent communication disagrees with original record");
     Check(transfer->occurrence >= 0 && (extended || transfer->occurrence == 0),
           "schema v4 supports one occurrence; schema v6 requires a nonnegative "
           "epoch");
@@ -4187,12 +4055,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   auto diagnostic_expansion =
       mod->GetAttr<Integer>("tt.current_device_table_expansion");
   if (diagnostic_expansion.has_value()) {
-    bool stream_operands = mod->GetAttr<Integer>("tt.stream_operands")
-                               .value_or(Integer(0))
-                               ->value == 1;
-    Check(diagnostic_expansion.value()->value == 1 &&
-              (stream_operands ||
-               mod->attrs->dict.count("tt.expanded_storage_group_descriptors")),
+    Check(diagnostic_expansion.value()->value == 1,
           "invalid current Device diagnostic expansion marker");
     IRModule parameterized = ParameterizeCurrentDeviceTables(mod);
     VerifyCurrentDeviceModule(std::move(parameterized));
@@ -4252,16 +4115,13 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
       VerifyTensorTable(tensors, launch_grid, true, false);
   CurrentStoragePlan storage =
       VerifyCurrentStoragePlan(parameterized, tensor_table, launch_grid);
-  bool stream_operands = parameterized->GetAttr<Integer>("tt.stream_operands")
-                             .value_or(Integer(0))
-                             ->value == 1;
   mod = ExpandCurrentDeviceTables(mod);
   ffi::Array<DFBDescriptor> dfbs =
       RequireModuleAttr<ffi::Array<DFBDescriptor>>(mod, kDFBTableAttr);
   ffi::Array<PipeDescriptor> transports =
       RequireModuleAttr<ffi::Array<PipeDescriptor>>(mod, "tt.transport_table");
-  auto communication = mod->GetAttr<ffi::Array<CommunicationDescriptor>>(
-      "tt.communication_table");
+  Check(!mod->attrs->dict.count("tt.communication_table"),
+        "current Device IR must not carry a communication table");
   ffi::Array<ffi::String> order =
       RequireModuleAttr<ffi::Array<ffi::String>>(mod, kKernelOrderAttr);
   Check(order.size() == 3 && mod->functions.size() == 3,
@@ -4345,7 +4205,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   std::map<std::pair<int64_t, int64_t>, PipeDescriptor> transport_records;
   for (const PipeDescriptor &transport : transports) {
     Check(transport.defined() && transport->pipe_net_id >= 0 &&
-              transport->communication_id >= 0 && transport->record_index >= 0,
+              transport->record_index >= 0,
           "transport descriptor has an invalid identity");
     VerifyCoord(transport->src_coord, launch_grid, "transport source");
     VerifyDomain(CoreDomain(transport->dst_begin, transport->dst_end),
@@ -4354,10 +4214,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
            transport->contract == "collective") &&
               dfb_table.count(transport->payload_dfb_id),
           "transport descriptor has an invalid contract or payload DFB");
-    Check(communication.has_value() &&
-              transport->communication_id <
-                  static_cast<int64_t>(communication.value().size()),
-          "transport descriptor references a missing parent communication");
     Check(transport_records
               .emplace(std::make_pair(transport->pipe_net_id,
                                       transport->record_index),
@@ -4415,7 +4271,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   using RecordEndpointKey = std::tuple<int64_t, int64_t, int64_t, int64_t>;
   std::map<RecordKey, int64_t> record_send_counts;
   std::map<RecordEndpointKey, int64_t> record_receive_counts;
-  std::map<std::pair<int64_t, std::string>, int64_t> local_communication_counts;
   bool raw_resource_operand = false;
   const DeviceResourceAliases *current_resource_aliases = nullptr;
   std::function<void(const Stmt &, std::vector<Call> *, std::vector<int64_t> *,
@@ -4765,10 +4620,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               "Tensor transfer references missing DFB");
         const TensorDescriptor &tensor = tensor_table.at(tensor_id);
         const DFBDescriptor &dfb = dfb_table.at(dfb_id);
-        if (!stream_operands)
-          Check(dfb->tensor_backing.has_value() &&
-                    dfb->tensor_backing.value()->global_arg_index == tensor_id,
-                "Tensor transfer disagrees with DFB Tensor backing");
         Check(call->args.size() == 2,
               "current Tensor transfer requires Tensor/DFB operands only");
         auto starts_attr = call->annotations.Get("tt.starts");
@@ -4988,12 +4839,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
         Check(work_group_id >= 0,
               "Device stream work group must be a nonnegative integer");
         auto role = block->annotations.Get("tt.communication_role");
-        auto communication_ids = block->annotations.Get("tt.communication_ids");
         auto pipe_net_ids = block->annotations.Get("tt.pipe_net_ids");
-        Check(role.has_value() == communication_ids.has_value() &&
-                  role.has_value() == pipe_net_ids.has_value(),
-              "Device communication role, communication IDs and PipeNet IDs "
-              "must coexist");
+        Check(role.has_value() == pipe_net_ids.has_value(),
+              "Device communication role and PipeNet IDs must coexist");
         if (role.has_value()) {
           auto role_string = role.value().as<ffi::String>();
           Check(role_string.has_value(),
@@ -5014,11 +4862,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             }
             return ids;
           };
-          std::set<int64_t> allowed_communications =
-              read_ids(communication_ids.value(), "Device communication IDs");
           std::set<int64_t> allowed_pipe_nets =
               read_ids(pipe_net_ids.value(), "Device PipeNet IDs");
-          std::set<int64_t> found_communications, found_pipe_nets;
+          std::set<int64_t> found_pipe_nets;
           bool found_pipe = false;
           PostOrderVisit(block->body, [&](const ffi::ObjectRef &nested) {
             const auto *call = nested.as<CallNode>();
@@ -5064,13 +4910,11 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               Check(transport != transport_records.end(),
                     "stream-work operation references a missing PipeNet");
               found_pipe_nets.insert(pipe_net);
-              found_communications.insert(transport->second->communication_id);
             }
           });
           Check(found_pipe,
                 "Device communication role region contains no Pipe operation");
-          Check(found_communications == allowed_communications &&
-                    found_pipe_nets == allowed_pipe_nets,
+          Check(found_pipe_nets == allowed_pipe_nets,
                 "Device communication block summaries disagree with their "
                 "Pipe record operations");
         }
@@ -5348,21 +5192,13 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             Check(site.has_value() && occurrence.has_value() &&
                       kind.has_value() && kind.value().as<StringImm>(),
                   "local communication operation has no semantic identity");
-            int64_t communication_id = Downcast<Integer>(site.value())->value;
-            Check(communication.has_value() && communication_id >= 0 &&
-                      communication_id <
-                          static_cast<int64_t>(communication.value().size()),
-                  "local communication operation references a missing "
-                  "communication");
+            int64_t communication_site = Downcast<Integer>(site.value())->value;
+            Check(communication_site >= 0,
+                  "local communication operation has a negative site");
             ffi::String kind_name = Downcast<StringImm>(kind.value())->value;
             Check((local_reduce && kind_name == "local_reduce") ||
                       (!local_reduce && kind_name == "local_copy"),
                   "local communication operation has the wrong semantic kind");
-            auto key = std::make_pair(communication_id, std::string(kind_name));
-            Check(local_communication_counts[key] <=
-                      std::numeric_limits<int64_t>::max() - dynamic_multiplier,
-                  "local communication multiplicity overflows");
-            local_communication_counts[key] += dynamic_multiplier;
           };
           for (size_t call_index = 0; call_index < calls.size(); ++call_index) {
             const Call &call = calls[call_index];
@@ -5550,9 +5386,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 const DFBDescriptor &descriptor = dfb_table.at(resource);
                 bool forwarding =
                     owner == descriptor->producer_slot &&
-                    (stream_operands
-                         ? active_producer_transaction.count(resource)
-                         : descriptor->tensor_backing.has_value());
+                    active_producer_transaction.count(resource);
                 if (forwarding) {
                   auto &entry = state(producer_key(resource));
                   Check(
@@ -5594,9 +5428,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 const DFBDescriptor &descriptor = dfb_table.at(resource);
                 bool forwarding =
                     owner == descriptor->producer_slot &&
-                    (stream_operands
-                         ? active_producer_transaction.count(resource)
-                         : descriptor->tensor_backing.has_value());
+                    active_producer_transaction.count(resource);
                 if (forwarding) {
                   auto &entry = state(producer_key(resource));
                   Check(entry.produced,
@@ -5670,8 +5502,7 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                                              tensor_table.at(tensor)->dtype);
                 }
               } else if (call->op.same_as(dfb_compute())) {
-                VerifyGeneralCompute(call, dfb_table, &bound_loop_vars,
-                                     stream_operands);
+                VerifyGeneralCompute(call, dfb_table, &bound_loop_vars, true);
               }
             } catch (const ffi::Error &error) {
               Fail(OperationContext(func, Evaluate(call)) + error.what());
@@ -5730,16 +5561,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
     int64_t transaction = std::get<3>(key);
     int64_t group = resource;
     int64_t ordinal = transaction;
-    if (stream_operands) {
-      Check(storage.groups.count(resource),
-            "reserved DFB references a missing logical stream");
-    } else {
-      Check(storage.resource_groups.count(resource) &&
-                storage.resource_ordinals.count(resource),
-            "reserved DFB has no storage-group relation");
-      group = storage.resource_groups.at(resource);
-      ordinal = storage.resource_ordinals.at(resource);
-    }
+    Check(storage.groups.count(resource),
+          "reserved DFB references a missing logical stream");
     group_reserves[{x, y, group}].push_back(
         {ordinal, resource, transaction, event});
   }
@@ -5833,127 +5656,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   for (const auto &[resource, dtype] : value_exports)
     compute_values.Export(resource, dtype);
 
-  if (communication.has_value()) {
-    int64_t expected_site = 0;
-    for (const CommunicationDescriptor &entry : communication.value()) {
-      Check(entry.defined() && entry->communication_id == expected_site++,
-            "communication site IDs must be dense and deterministic");
-      Check(entry->kind == "transfer" || entry->kind == "all_gather" ||
-                entry->kind == "all_reduce",
-            "unknown high-level communication kind");
-      Check(entry->source_region.defined() &&
-                entry->destination_region.defined() &&
-                entry->group_begin.size() == 2 && entry->group_end.size() == 2,
-            "communication descriptor is incomplete");
-      Check(!entry->algorithm.empty(),
-            "communication descriptor has no selected algorithm");
-      Check((entry->kind == "transfer" &&
-             (entry->algorithm == "direct_p2p" ||
-              entry->algorithm == "direct_multicast")) ||
-                (entry->kind == "all_gather" &&
-                 entry->algorithm == "direct_all_to_all") ||
-                (entry->kind == "all_reduce" &&
-                 entry->algorithm == "root0_left_fold_broadcast"),
-            "communication kind and selected algorithm disagree");
-    }
-  }
-  if (communication.has_value()) {
-    using TransferPair = std::tuple<int64_t, int64_t, int64_t, int64_t>;
-    for (const CommunicationDescriptor &entry : communication.value()) {
-      bool collective =
-          entry->kind == "all_gather" || entry->kind == "all_reduce";
-      int64_t bx = 0, by = 0, ex = launch_grid->x, ey = launch_grid->y;
-      if (collective) {
-        bx = RequireStaticInteger(entry->group_begin[0],
-                                  "communication group begin x");
-        by = RequireStaticInteger(entry->group_begin[1],
-                                  "communication group begin y");
-        ex = RequireStaticInteger(entry->group_end[0],
-                                  "communication group end x");
-        ey = RequireStaticInteger(entry->group_end[1],
-                                  "communication group end y");
-        Check(bx >= 0 && by >= 0 && bx < ex && by < ey &&
-                  ex <= launch_grid->x && ey <= launch_grid->y,
-              "communication group is outside the launch grid");
-      }
-      int64_t group_size =
-          CheckedProduct(ex - bx, ey - by, "communication group size");
-      int64_t occurrence_count = 1;
-      for (const PrimExpr &extent : entry->occurrence_extents)
-        occurrence_count = CheckedProduct(
-            occurrence_count,
-            RequireStaticInteger(extent, "communication occurrence extent"),
-            "communication occurrence count");
-      Check(occurrence_count > 0,
-            "communication occurrence domain must be nonempty");
-      std::set<TransferPair> actual;
-      bool has_transport = false;
-      for (const auto &[key, record] : transport_records) {
-        if (record->communication_id != entry->communication_id)
-          continue;
-        has_transport = true;
-        Check(record_send_counts[key] == occurrence_count,
-              "Pipe record send multiplicity disagrees with communication "
-              "occurrence extent");
-        CoreCoord source = record->src_coord;
-        for (int64_t dx = record->dst_begin->x; dx < record->dst_end->x; ++dx)
-          for (int64_t dy = record->dst_begin->y; dy < record->dst_end->y;
-               ++dy) {
-            bool loopback = dx == source->x && dy == source->y;
-            Check(!loopback || record->contract == "collective",
-                  "point-to-point Pipe record cannot loop back to its source");
-            Check(actual.insert({source->x, source->y, dx, dy}).second,
-                  "communication has a duplicate transport endpoint");
-            Check(record_receive_counts[{key.first, key.second, dx, dy}] ==
-                      occurrence_count,
-                  "Pipe record receive multiplicity disagrees with "
-                  "communication occurrence extent");
-          }
-      }
-      int64_t local_copies =
-          local_communication_counts[{entry->communication_id, "local_copy"}];
-      int64_t local_reductions =
-          local_communication_counts[{entry->communication_id, "local_reduce"}];
-      if (entry->kind == "transfer") {
-        Check(has_transport && local_copies == 0 && local_reductions == 0,
-              "direct transfer has an incomplete or unexpected local plan");
-      } else if (entry->kind == "all_gather") {
-        int64_t axis =
-            RequireStaticInteger(entry->parameter, "all_gather axis");
-        Check(axis == 0 || axis == 1,
-              "all_gather axis must be normalized to zero or one");
-        std::set<TransferPair> expected;
-        for (int64_t sx = bx; sx < ex; ++sx)
-          for (int64_t sy = by; sy < ey; ++sy)
-            for (int64_t dx = bx; dx < ex; ++dx)
-              for (int64_t dy = by; dy < ey; ++dy)
-                if (sx != dx || sy != dy)
-                  expected.insert({sx, sy, dx, dy});
-        Check(actual == expected &&
-                  local_copies == occurrence_count * group_size * group_size &&
-                  local_reductions == 0,
-              "direct all_gather does not cover every source/destination "
-              "contribution");
-      } else if (entry->kind == "all_reduce") {
-        const auto *reduction = entry->parameter.as<StringImmNode>();
-        Check(reduction &&
-                  (reduction->value == "sum" || reduction->value == "max" ||
-                   reduction->value == "min"),
-              "all_reduce has an unsupported reduction operation");
-        std::set<TransferPair> expected;
-        for (int64_t x = bx; x < ex; ++x)
-          for (int64_t y = by; y < ey; ++y)
-            if (x != bx || y != by) {
-              expected.insert({x, y, bx, by});
-              expected.insert({bx, by, x, y});
-            }
-        Check(actual == expected && local_copies == occurrence_count &&
-                  local_reductions == occurrence_count * (group_size - 1),
-              "direct all_reduce has incomplete gather/reduce/broadcast "
-              "coverage");
-      }
-    }
-  }
   return parameterized;
 }
 
