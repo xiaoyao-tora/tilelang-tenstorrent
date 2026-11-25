@@ -577,7 +577,6 @@ public:
   }
 
   bool HasComputeValues() const { return compute_value_mode_; }
-  bool HasPrecisionRegions() const { return precision_regions_; }
   ffi::Array<ComputeValueDescriptor> ComputeValues() const { return values_; }
   void FinalizeComputeValues() {
     if (!compute_value_mode_ || IsPipeline())
@@ -4479,7 +4478,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   ffi::String pipeline_wait_policy;
   ffi::Map<ffi::String, Integer> storage_groups;
   bool producer_forwarding = false;
-  bool precision_regions = false;
   CoreDomain shared_domain(CoreCoord(0, 0), CoreCoord(gx, gy));
   std::map<std::string, int64_t> logical_resource_ids;
   std::map<int64_t, std::string> resource_storage_keys;
@@ -4519,7 +4517,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       ThrowUnsupported("all active Core bodies must retain their pipeline");
     }
     producer_forwarding |= planner.HasProducerForwarding();
-    precision_regions |= planner.HasPrecisionRegions();
     CoreDomain domain(CoreCoord(x, y), CoreCoord(x + 1, y + 1));
     PrimExpr transaction_relation =
         IndependentIterationCount(independent_loops);
