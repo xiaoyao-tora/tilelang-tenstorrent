@@ -384,7 +384,7 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
         elif kind == "gemm" and len(call.args) >= 3:
             if bool(int(call.annotations.get("tt.transpose_a", 0))):
                 raise NotImplementedError("TTL matmul does not support transpose_a")
-            value = self.bindings.ttl.matmul(
+            value = self._matmul_value(
                 result_type,
                 self.value_for_dfb_operand(call.args[1]),
                 self.value_for_dfb_operand(call.args[2]),
@@ -437,12 +437,34 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
             descriptor.dtype,
         ).emit(call.annotations["tt.expression"])
 
+    def _matmul_value(self, declared_type, lhs, rhs, transpose_rhs: bool):
+        """Emit a matmul whose result tile dtype equals its operand dtype.
+
+        TTL requires the result element type to match the operands, so a
+        differently typed consumer needs an explicit typecast. The destination
+        still accumulates in FP32 when the kernel enables it.
+        """
+        operand_type = lhs.type.element_type
+        matmul_type = self.bindings.ir.RankedTensorType.get(
+            list(map(int, declared_type.shape)),
+            operand_type,
+        )
+        value = self.bindings.ttl.matmul(
+            matmul_type,
+            lhs,
+            rhs,
+            transpose_rhs=transpose_rhs,
+        )
+        if str(operand_type) != str(declared_type.element_type):
+            value = self.bindings.ttl.typecast(declared_type, value)
+        return value
+
     def emit_compute_value_gemm(self, call) -> None:
         if bool(int(call.annotations["tt.transpose_a"])):
             raise NotImplementedError("TTL matmul does not support transpose_a")
         output = self.compute_value_id(call.args[0])
         descriptor = self.compute_value_descriptors[output]
-        result = self.bindings.ttl.matmul(
+        result = self._matmul_value(
             self.type_converter.value_type(descriptor),
             self.value_for_dfb_operand(call.args[1]),
             self.value_for_dfb_operand(call.args[2]),
@@ -456,8 +478,18 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
     def emit_accumulator_init(self, call) -> None:
         identifier = self.resource_id(call.args[0], "tl.tt.accumulator_ref")
         descriptor = self.accumulator_descriptors[identifier]
-        if str(descriptor.accumulation_dtype) != "bfloat16":
-            raise NotImplementedError("matmul_full_fp32=required remains unsupported until TT-Lang exposes a hard full-K schedule API")
+        accumulation = str(descriptor.accumulation_dtype)
+        if accumulation != "bfloat16" and (accumulation != "float32" or str(descriptor.input_dtype) != "bfloat16"):
+            raise NotImplementedError(
+                "TTL persistent accumulators require bfloat16 storage with "
+                "bfloat16 or float32 accumulation; got "
+                f"input={descriptor.input_dtype}, accumulation={accumulation}"
+            )
+        # FP32 accumulation keeps the recurrence in the destination; the
+        # kernel attribute fp32_dest_acc_en comes from the verified compute
+        # requirements. TT-Lang fuses the additive recurrence into DST when
+        # the loop body is the matmul/add pair, and otherwise materializes
+        # the tile, so no extra IR shape is imposed here.
         shape = [int(region.extent) // 32 for region in descriptor.accumulator_region.region]
         result_type = self.bindings.ir.RankedTensorType.get(
             shape,
