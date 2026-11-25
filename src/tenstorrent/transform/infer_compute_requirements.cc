@@ -221,7 +221,7 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
     }
     return ComputeRequirements(width, full, requirements);
   }
-  if (!current_device && legacy_version == 8) {
+  if (legacy_version == 8) {
     auto regions = DeriveRegionComputeRequirements(mod, func);
     ffi::Array<AccumulatorDescriptor> accumulators;
     std::set<int64_t> seen;
@@ -233,8 +233,7 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
                                                : "region_scoped",
                                "allowed", accumulators);
   }
-  if (legacy_version == 7 ||
-      (current_device && mod->attrs->dict.count(kComputeValueTableAttr))) {
+  if (legacy_version == 7) {
     auto values = mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
         kComputeValueTableAttr);
     Check(values.has_value(), "v7 missing compute value table");
@@ -257,51 +256,37 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
               "invalid or duplicate accumulator descriptor");
       }
     std::set<int64_t> used;
-    if (current_device) {
-      for (const auto &[id, value] : by_id) {
-        width_requirement.Merge(value->buffer->dtype);
-        if (value->accumulator_id >= 0)
-          used.insert(value->accumulator_id);
-      }
-      PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
-        const auto *cast = node.as<CastNode>();
-        if (cast && cast->dtype == DataType::Float(32) &&
-            cast->value.dtype() != DataType::Float(32))
-          width_requirement.Merge(cast->dtype);
-      });
-    } else {
-      PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
-        const auto *call = node.as<CallNode>();
-        if (call && (call->op.same_as(compute_value()) ||
-                     call->op.same_as(compute_value_gemm()))) {
-          Check(!call->args.empty(), "compute value definition missing ID");
-          int64_t id = IntegerValue(call->args[0]);
-          Check(by_id.count(id), "compute value references missing descriptor");
-          width_requirement.Merge(by_id.at(id)->buffer->dtype);
-        }
-        if (call && (call->op.same_as(compute_value()) ||
-                     call->op.same_as(dfb_compute()))) {
-          auto expression = call->annotations.Get("tt.expression");
-          if (expression.has_value()) {
-            auto expr = expression.value().as<PrimExpr>();
-            Check(expr.has_value(), "invalid compute precision expression");
-            width_requirement.Merge(expr.value().dtype());
-            PostOrderVisit(expr.value(), [&](const ffi::ObjectRef &item) {
-              if (auto value = item.as<PrimExpr>())
-                width_requirement.MergeExpression(value.value().dtype());
-            });
-          }
-        }
-        if (!call || !call->op.same_as(compute_value_gemm()))
-          return;
-        Check(call->args.size() == 6, "value GEMM arity mismatch");
+    PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
+      const auto *call = node.as<CallNode>();
+      if (call && (call->op.same_as(compute_value()) ||
+                   call->op.same_as(compute_value_gemm()))) {
+        Check(!call->args.empty(), "compute value definition missing ID");
         int64_t id = IntegerValue(call->args[0]);
-        Check(by_id.count(id) &&
-                  accumulators.count(by_id.at(id)->accumulator_id),
-              "value GEMM references missing accumulator");
-        used.insert(by_id.at(id)->accumulator_id);
-      });
-    }
+        Check(by_id.count(id), "compute value references missing descriptor");
+        width_requirement.Merge(by_id.at(id)->buffer->dtype);
+      }
+      if (call && (call->op.same_as(compute_value()) ||
+                   call->op.same_as(dfb_compute()))) {
+        auto expression = call->annotations.Get("tt.expression");
+        if (expression.has_value()) {
+          auto expr = expression.value().as<PrimExpr>();
+          Check(expr.has_value(), "invalid compute precision expression");
+          width_requirement.Merge(expr.value().dtype());
+          PostOrderVisit(expr.value(), [&](const ffi::ObjectRef &item) {
+            if (auto value = item.as<PrimExpr>())
+              width_requirement.MergeExpression(value.value().dtype());
+          });
+        }
+      }
+      if (!call || !call->op.same_as(compute_value_gemm()))
+        return;
+      Check(call->args.size() == 6, "value GEMM arity mismatch");
+      int64_t id = IntegerValue(call->args[0]);
+      Check(by_id.count(id) &&
+                accumulators.count(by_id.at(id)->accumulator_id),
+            "value GEMM references missing accumulator");
+      used.insert(by_id.at(id)->accumulator_id);
+    });
     ffi::Array<AccumulatorDescriptor> requirements;
     ffi::String full = "allowed",
                 width = width_requirement.empty()
@@ -317,9 +302,6 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       ffi::String next_full = fp32 ? "required" : "forbidden";
       bool compatible = (width == "unconstrained" || width == next_width) &&
                         (full == "allowed" || full == next_full);
-      if (current_device && !compatible)
-        Unsupported("conflicting hard destination width requirements in one "
-                    "shared compute kernel");
       Check(compatible, "conflicting hard destination width requirements in "
                         "one compute kernel");
       width = next_width;
@@ -352,29 +334,6 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
               "accumulator operations cross Core or processor ownership");
       });
     }
-  }
-  if (current_device && entries.has_value()) {
-    auto is_core_dispatch = [](const Stmt &statement) {
-      const auto *branch = statement.as<IfThenElseNode>();
-      if (!branch)
-        return false;
-      bool has_core_query = false;
-      PostOrderVisit(branch->condition, [&](const ffi::ObjectRef &node) {
-        const auto *call = node.as<CallNode>();
-        has_core_query |= call && (call->op.same_as(tenstorrent::core_x()) ||
-                                   call->op.same_as(tenstorrent::core_y()));
-      });
-      return has_core_query;
-    };
-    bool canonical = is_core_dispatch(func->body);
-    if (const auto *sequence = func->body.as<SeqStmtNode>()) {
-      canonical = !sequence->seq.empty();
-      for (const Stmt &statement : sequence->seq)
-        canonical &= is_core_dispatch(statement);
-    }
-    Check(
-        canonical,
-        "shared Device accumulator lifetime has unverified outer control flow");
   }
   std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual> storage;
   if (entries.has_value()) {
@@ -697,7 +656,6 @@ tvm::transform::Pass InferTenstorrentComputeRequirements() {
                            ->value == 9;
     bool current_families = HasCurrentDeviceFamilies(mod);
     if (!current_families) {
-      mod = ExpandCurrentDeviceTables(mod);
       mod = ExpandDeviceProgram(mod);
     }
     IRModule result = mod;
