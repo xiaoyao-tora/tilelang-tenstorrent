@@ -37,17 +37,39 @@ class TTLTypeConverter:
             int(data_types[dtype_name]),
         )
 
-    def block_type(self, descriptor):
+    def storage_tile_type(self, descriptor):
+        storage_format = str(descriptor.storage_format)
+        if not storage_format:
+            dtype = descriptor.element_dtype if hasattr(descriptor, "element_dtype") else descriptor.dtype
+            return self.tile_type(dtype, descriptor.tile_shape)
+        formats = {
+            "bfp_bf8": self.bindings.ttcore.DataType.BFP_BFloat8,
+            "bfp_bf4": self.bindings.ttcore.DataType.BFP_BFloat4,
+        }
+        if storage_format not in formats:
+            raise ValueError(f"Unknown Tenstorrent storage_format {storage_format!r}")
+        height, width = self.static_shape(descriptor.tile_shape, "tile shape")
+        if (height, width) != (32, 32):
+            raise ValueError("BFP storage requires 32x32 tiles")
+        return self.bindings.ttcore.ir.TileType.get(self.context, height, width, int(formats[storage_format]))
+
+    def logical_block_type(self, descriptor):
         return self.bindings.ir.RankedTensorType.get(
             self.static_shape(descriptor.block_shape_in_tiles, "DFB block shape"),
             self.tile_type(descriptor.element_dtype, descriptor.tile_shape),
+        )
+
+    def block_type(self, descriptor):
+        return self.bindings.ir.RankedTensorType.get(
+            self.static_shape(descriptor.block_shape_in_tiles, "DFB block shape"),
+            self.storage_tile_type(descriptor),
         )
 
     def circular_buffer_type(self, descriptor):
         return self.bindings.ttl.CircularBufferType.get(
             self.context,
             self.static_shape(descriptor.block_shape_in_tiles, "DFB block shape"),
-            self.tile_type(descriptor.element_dtype, descriptor.tile_shape),
+            self.storage_tile_type(descriptor),
             int(descriptor.block_count),
         )
 
@@ -68,7 +90,7 @@ class TTLTypeConverter:
         }
         if memory_layout not in layouts:
             raise NotImplementedError(f"TTL Tensor memory layout {memory_layout!r} is not supported")
-        tile_type = self.tile_type(descriptor.dtype, descriptor.tile_shape)
+        tile_type = self.storage_tile_type(descriptor)
         logical_shape = self.static_shape(descriptor.shape, "Tensor shape")
         if descriptor.shard_spec is None:
             grid = [1, 1]

@@ -177,7 +177,7 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
       metadata->shard_spec, std::move(block_count), metadata->tensor_backing,
       metadata->alias_of, std::move(tile_shape_origin),
       std::move(block_count_origin), metadata->tensor_backing_origin,
-      std::move(layout_origin), metadata->source_span);
+      std::move(layout_origin), metadata->source_span, metadata->storage_format);
 }
 
 PrimFunc InferLayout(PrimFunc func) {

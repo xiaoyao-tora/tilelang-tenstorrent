@@ -323,10 +323,10 @@ private:
     }
     auto metadata =
         annotation.value()
-            .as<ffi::Map<Var, ffi::Map<ffi::String, ffi::ObjectRef>>>();
+            .as<ffi::Map<Var, ffi::Map<ffi::String, ffi::Any>>>();
     if (!metadata.has_value()) {
       ThrowMalformed(std::string("'") + kAllocBufferAnnotations +
-                     "' must be Map<Var, Map<String, ObjectRef>>");
+                     "' must be Map<Var, Map<String, Any>>");
     }
 
     VarSet allocated_data;
@@ -343,16 +343,25 @@ private:
   }
 
   static void ValidateMetadataEntries(
-      const ffi::Map<ffi::String, ffi::ObjectRef> &entries) {
+      const ffi::Map<ffi::String, ffi::Any> &entries) {
     for (const auto &[key, value] : entries) {
       const std::string key_string = key;
       if (key_string == kTensorBacked) {
         ThrowUnsupported("'tt.tensor_backed' is deferred beyond Phase 1");
       }
       if (StartsWith(key_string, "tt.") && key_string != kDFBBlockCount &&
-          key_string != kTileShape) {
+          key_string != kTileShape && key_string != "tt.storage_format") {
         ThrowUnsupported("allocation annotation '" + key_string +
                          "' is not part of the frozen Phase 1 contract");
+      }
+      if (key_string == "tt.storage_format") {
+        auto format = value.as<ffi::String>();
+        if (!format.has_value())
+          ThrowMalformed("'tt.storage_format' must be a string");
+        if (format.value() != "" && format.value() != "bfp_bf8" &&
+            format.value() != "bfp_bf4")
+          ThrowUnsupported("unknown storage_format '" +
+                           std::string(format.value()) + "'");
       }
       if (key_string == kDFBBlockCount) {
         const auto *count = value.as<IntImmNode>();

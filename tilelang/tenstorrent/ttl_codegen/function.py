@@ -173,9 +173,13 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
     def value_for_dfb_operand(self, operand):
         identifier = self.dfb_id(operand)
         try:
-            return self.values[identifier]
+            value = self.values[identifier]
         except KeyError as error:
             raise RuntimeError(f"DFB stream {identifier} is used without an active wait") from error
+        descriptor = self.groups[identifier]
+        if str(descriptor.storage_format):
+            return self.bindings.ttl.typecast(self.type_converter.logical_block_type(descriptor), value)
+        return value
 
     def value_for_compute_operand(self, operand):
         identifier = self.compute_value_id(operand)
@@ -225,6 +229,9 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
     def store_and_publish(self, dfb_id: int, value) -> None:
         if dfb_id not in self.reserved:
             raise RuntimeError(f"DFB stream {dfb_id} is produced without a reservation")
+        storage_type = self.type_converter.block_type(self.groups[dfb_id])
+        if str(self.groups[dfb_id].storage_format) and value.type != storage_type:
+            value = self.bindings.ttl.typecast(storage_type, value)
         self.bindings.ttl.store(value, self.reserved.pop(dfb_id))
         self.bindings.ttl.cb_push(self.cbs[dfb_id])
         self.assembled.pop(dfb_id, None)
@@ -401,7 +408,7 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
             one = self.bindings.ir.FloatAttr.get(self.bindings.ir.F32Type.get(self.context), 1.0)
             scaler = self.bindings.ttl.fill(scaler_type, one)
             value = self.bindings.ttl.reduce(
-                result_type,
+                self.type_converter.logical_block_type(self.groups[output]),
                 input_value,
                 scaler,
                 reduce_type,
@@ -409,7 +416,7 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
             )
         elif kind == "transpose" and len(call.args) == 2:
             value = self.bindings.ttl.transpose(
-                result_type,
+                self.type_converter.logical_block_type(self.groups[output]),
                 self.value_for_dfb_operand(call.args[1]),
             )
         else:
@@ -507,6 +514,12 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
         output = self.dfb_id(call.args[2])
         lhs = self.assembled.get(left, self.values.get(left))
         rhs = self.values[right]
+        if str(self.groups[left].storage_format):
+            logical_type = self.type_converter.logical_block_type(self.groups[left])
+            if lhs.type != logical_type:
+                lhs = self.bindings.ttl.typecast(logical_type, lhs)
+        if str(self.groups[right].storage_format):
+            rhs = self.bindings.ttl.typecast(self.type_converter.logical_block_type(self.groups[right]), rhs)
         reduction = str(getattr(call.args[3], "value", call.args[3]))
         operations = {
             "sum": self.bindings.ttl.add,

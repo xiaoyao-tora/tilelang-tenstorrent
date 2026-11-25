@@ -480,6 +480,23 @@ std::string ResourceContext(const IRModule &mod, const DFBDescriptor &dfb) {
          " source_span=" + SourceLocation(dfb->source_span) + ": ";
 }
 
+void VerifyStorageFormat(const ffi::String &format, DataType dtype,
+                         const ffi::Array<PrimExpr> &tile_shape,
+                         const std::string &label) {
+  if (format.empty())
+    return;
+  Check(format == "bfp_bf8" || format == "bfp_bf4",
+      label + " has unsupported storage_format `" + std::string(format) +
+          "`");
+  Check(dtype == DataType::BFloat(16),
+      label + " BFP storage_format requires logical bfloat16 dtype");
+  Check(tile_shape.size() == 2 && tirx::as_const_int(tile_shape[0]) &&
+            tirx::as_const_int(tile_shape[1]) &&
+            *tirx::as_const_int(tile_shape[0]) == 32 &&
+            *tirx::as_const_int(tile_shape[1]) == 32,
+      label + " BFP storage_format requires a 32x32 tile");
+}
+
 TensorTable VerifyTensorTable(const ffi::Array<TensorDescriptor> &tensors,
                               const CoreCoord &launch_grid,
                               bool general = false, bool require_span = true) {
@@ -493,6 +510,8 @@ TensorTable VerifyTensorTable(const ffi::Array<TensorDescriptor> &tensors,
           label + " duplicates a global_arg_index");
     VerifyPositiveShape(tensor->shape, label + " shape");
     VerifyPositiveShape(tensor->tile_shape, label + " tile_shape");
+    VerifyStorageFormat(tensor->storage_format, tensor->dtype,
+                        tensor->tile_shape, label);
     VerifyPositiveShape(tensor->tile_grid_shape, label + " tile_grid_shape");
     Check(general ? tensor->tile_shape.size() == 2
                   : tensor->tile_shape.size() == tensor->shape.size(),
@@ -542,6 +561,8 @@ DFBTable VerifyDFBTable(const ffi::Array<DFBDescriptor> &dfbs,
           label + " duplicates source_buffer_identity `" +
               std::string(dfb->source_buffer_identity) + "`");
     Check(!dfb->element_dtype.is_void(), label + " has a void dtype");
+    VerifyStorageFormat(dfb->storage_format, dfb->element_dtype,
+                        dfb->tile_shape, label);
     VerifyPositiveShape(dfb->tile_shape, label + " tile_shape");
     VerifyPositiveShape(dfb->block_shape_in_tiles,
                         label + " block_shape_in_tiles");
@@ -564,6 +585,8 @@ DFBTable VerifyDFBTable(const ffi::Array<DFBDescriptor> &dfbs,
       Check(tensors.count(tensor_index) != 0,
             label + " references missing Tensor " +
                 std::to_string(tensor_index));
+      Check(dfb->storage_format == tensors.at(tensor_index)->storage_format,
+            label + " Tensor backing storage_format mismatch");
       Check(backing->byte_offset.defined(),
             label + " Tensor backing has no byte_offset");
       if (const int64_t *byte_offset =
@@ -679,6 +702,8 @@ void VerifyDFBTensorContract(const DFBDescriptor &dfb,
             " effect must be `" + std::string(effect) + "`");
   Check(dfb->element_dtype == tensor->dtype,
         label + " dtype disagrees with its Tensor backing");
+  Check(dfb->storage_format == tensor->storage_format,
+        label + " storage_format disagrees with its Tensor backing");
   Check(ffi::StructuralEqual()(dfb->tile_shape, tensor->tile_shape),
         label + " tile_shape disagrees with its Tensor backing");
   Check(ffi::StructuralEqual()(dfb->producer_domain, dfb->consumer_domain),
@@ -2518,6 +2543,25 @@ int64_t CheckedProduct(int64_t left, int64_t right, const std::string &label) {
   return left * right;
 }
 
+int64_t PhysicalCapacityBytes(int64_t capacity, DataType dtype,
+                              const ffi::String &format,
+                              const ffi::Array<PrimExpr> &tile_shape,
+                              const ffi::Array<PrimExpr> &block_shape,
+                              const std::string &label) {
+  VerifyStorageFormat(format, dtype, tile_shape, label);
+  int64_t bytes = capacity;
+  if (format.empty()) {
+    for (const PrimExpr &extent : tile_shape)
+      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
+    bytes = CheckedProduct(bytes, dtype.bytes(), label);
+  } else {
+    bytes = CheckedProduct(bytes, format == "bfp_bf8" ? 1088 : 576, label);
+  }
+  for (const PrimExpr &extent : block_shape)
+    bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
+  return bytes;
+}
+
 void VerifyLegacyL1Budget(const IRModule &mod, const DFBTable &dfbs) {
   auto budget = mod->GetAttr<Integer>(kL1CapacityBytesAttr);
   if (!budget.has_value())
@@ -2526,12 +2570,9 @@ void VerifyLegacyL1Budget(const IRModule &mod, const DFBTable &dfbs) {
   int64_t payload = 0;
   for (const auto &[id, dfb] : dfbs) {
     const std::string label = "DFB " + std::to_string(id) + " L1 payload";
-    int64_t bytes = RequireStaticInteger(dfb->block_count, label);
-    for (const PrimExpr &extent : dfb->tile_shape)
-      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
-    for (const PrimExpr &extent : dfb->block_shape_in_tiles)
-      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
-    bytes = CheckedProduct(bytes, dfb->element_dtype.bytes(), label);
+    int64_t bytes = PhysicalCapacityBytes(
+        RequireStaticInteger(dfb->block_count, label), dfb->element_dtype,
+        dfb->storage_format, dfb->tile_shape, dfb->block_shape_in_tiles, label);
     Check(payload <= std::numeric_limits<int64_t>::max() - bytes,
           "L1 payload byte sum overflows static arithmetic");
     payload += bytes;
@@ -2635,6 +2676,7 @@ PipelineResources VerifyPipelineResources(const IRModule &mod,
       DFBDescriptor dfb = dfbs.at(id);
       Check(ffi::StructuralEqual()(first->block_count, dfb->block_count) &&
                 first->element_dtype == dfb->element_dtype &&
+                first->storage_format == dfb->storage_format &&
                 ffi::StructuralEqual()(first->tile_shape, dfb->tile_shape) &&
                 ffi::StructuralEqual()(first->block_shape_in_tiles,
                                        dfb->block_shape_in_tiles) &&
@@ -2648,12 +2690,9 @@ PipelineResources VerifyPipelineResources(const IRModule &mod,
                                        dfb->tensor_backing),
             label + " generations disagree on capacity, layout, or slots");
     }
-    int64_t bytes = capacity;
-    for (const PrimExpr &extent : first->tile_shape)
-      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
-    for (const PrimExpr &extent : first->block_shape_in_tiles)
-      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, label), label);
-    bytes = CheckedProduct(bytes, first->element_dtype.bytes(), label);
+    int64_t bytes = PhysicalCapacityBytes(
+        capacity, first->element_dtype, first->storage_format,
+        first->tile_shape, first->block_shape_in_tiles, label);
     Check(payload_bytes <= std::numeric_limits<int64_t>::max() - bytes,
           "L1 payload byte sum overflows static arithmetic");
     payload_bytes += bytes;
@@ -2758,7 +2797,8 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
                                       dfb->block_count, dfb->tensor_backing,
                                       dfb->producer_slot, dfb->producer_domain,
                                       dfb->consumer_slot, dfb->consumer_domain,
-                                      Integer(1), dfb->source_span));
+                                      Integer(1), dfb->source_span,
+                                      dfb->storage_format));
     }
     VerifyGeneralProgram(iteration, tensors, local);
     return;
@@ -3249,6 +3289,8 @@ CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
           "storage group IDs must be dense and deterministic");
     Check(!group->element_dtype.is_void(),
           "storage group has a void element dtype");
+    VerifyStorageFormat(group->storage_format, group->element_dtype,
+                        group->tile_shape, "storage group");
     VerifyPositiveShape(group->tile_shape, "storage group tile shape");
     VerifyPositiveShape(group->block_shape_in_tiles,
                         "storage group block shape");
@@ -3272,23 +3314,19 @@ CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
       const TensorStorageBacking &backing = group->storage_backing.value();
       Check(tensors.count(backing->global_arg_index),
             "storage backing references a missing Tensor");
+      Check(group->storage_format ==
+            tensors.at(backing->global_arg_index)->storage_format,
+          "storage backing Tensor storage_format mismatch");
       int64_t offset = RequireStaticInteger(backing->byte_offset,
                                             "storage backing byte offset");
       int64_t size =
           RequireStaticInteger(backing->byte_size, "storage backing byte size");
       Check(offset >= 0 && size > 0,
             "storage backing byte range must be positive");
-      int64_t expected = capacity;
-      for (const PrimExpr &extent : group->tile_shape)
-        expected = CheckedProduct(expected,
-                                  RequireStaticInteger(extent, "tile extent"),
-                                  "storage backing byte size");
-      for (const PrimExpr &extent : group->block_shape_in_tiles)
-        expected = CheckedProduct(expected,
-                                  RequireStaticInteger(extent, "block extent"),
-                                  "storage backing byte size");
-      expected = CheckedProduct(expected, group->element_dtype.bytes(),
-                                "storage backing byte size");
+      int64_t expected = PhysicalCapacityBytes(
+          capacity, group->element_dtype, group->storage_format,
+          group->tile_shape, group->block_shape_in_tiles,
+          "storage backing byte size");
       Check(size == expected,
             "storage backing byte size must equal the complete DFB capacity");
     }
@@ -3308,6 +3346,8 @@ void VerifyCurrentL1Budget(
     std::set<CoreKey> cores;
     Check(dfbs.count(group_id),
           "logical stream descriptor references a missing DFB");
+      Check(group->storage_format == dfbs.at(group_id)->storage_format,
+          "storage group and DFB storage_format mismatch");
     auto uses = resource_cores.find(group_id);
     Check(uses != resource_cores.end() && !uses->second.empty(),
           "current Device stream has no body use: " +
@@ -3315,13 +3355,10 @@ void VerifyCurrentL1Budget(
     cores.insert(uses->second.begin(), uses->second.end());
     const std::string label =
         "current Device storage group " + std::to_string(group_id);
-    int64_t bytes =
-        RequireStaticInteger(group->block_count, label + " block_count");
-    for (const PrimExpr &value : group->tile_shape)
-      bytes = CheckedProduct(bytes, RequireStaticInteger(value, label), label);
-    for (const PrimExpr &value : group->block_shape_in_tiles)
-      bytes = CheckedProduct(bytes, RequireStaticInteger(value, label), label);
-    bytes = CheckedProduct(bytes, group->element_dtype.bytes(), label);
+    int64_t bytes = PhysicalCapacityBytes(
+        RequireStaticInteger(group->block_count, label + " block_count"),
+        group->element_dtype, group->storage_format, group->tile_shape,
+        group->block_shape_in_tiles, label);
     Check(total_payload <= std::numeric_limits<int64_t>::max() - bytes,
           "current Device L1 payload byte sum overflows");
     total_payload += bytes;
@@ -3403,16 +3440,9 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     Check(RequireStaticInteger(dfb->transaction_count_or_loop_relation,
                                "DFB transaction count") == 1,
           "Phase 6 immutable DFB generation requires exactly one transaction");
-    int64_t bytes = capacity;
-    for (const PrimExpr &extent : dfb->tile_shape)
-      bytes = CheckedProduct(bytes, RequireStaticInteger(extent, "tile extent"),
-                             "Phase 6 L1 payload");
-    for (const PrimExpr &extent : dfb->block_shape_in_tiles)
-      bytes =
-          CheckedProduct(bytes, RequireStaticInteger(extent, "block extent"),
-                         "Phase 6 L1 payload");
-    bytes =
-        CheckedProduct(bytes, dfb->element_dtype.bytes(), "Phase 6 L1 payload");
+    int64_t bytes = PhysicalCapacityBytes(
+        capacity, dfb->element_dtype, dfb->storage_format, dfb->tile_shape,
+        dfb->block_shape_in_tiles, "Phase 6 L1 payload");
     Check(payload[core] <= std::numeric_limits<int64_t>::max() - bytes,
           "Phase 6 L1 payload byte sum overflows");
     payload[core] += bytes;
@@ -3522,7 +3552,9 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
             destination->producer_slot == "ncrisc",
         "Pipe source requires BRISC affinity or a forwarding NCRISC producer, "
         "and receiver requires NCRISC");
-    Check(source->element_dtype == destination->element_dtype &&
+      Check(source->storage_format == destination->storage_format,
+          "Pipe transfer payload storage_format mismatch");
+      Check(source->element_dtype == destination->element_dtype &&
               ffi::StructuralEqual()(source->tile_shape,
                                      destination->tile_shape) &&
               ffi::StructuralEqual()(source->block_shape_in_tiles,
@@ -4057,6 +4089,19 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   if (diagnostic_expansion.has_value()) {
     Check(diagnostic_expansion.value()->value == 1,
           "invalid current Device diagnostic expansion marker");
+    const auto groups = RequireModuleAttr<ffi::Array<DFBStorageGroupDescriptor>>(
+        mod, kDFBStorageGroupsAttr);
+    for (const DFBDescriptor &dfb :
+         RequireModuleAttr<ffi::Array<DFBDescriptor>>(mod, kDFBTableAttr)) {
+      Check(dfb.defined() && dfb->dfb_id >= 0 &&
+                static_cast<size_t>(dfb->dfb_id) < groups.size() &&
+                groups[dfb->dfb_id].defined(),
+            "expanded DFB references a missing storage group");
+      VerifyStorageFormat(dfb->storage_format, dfb->element_dtype,
+                          dfb->tile_shape, "expanded DFB");
+      Check(dfb->storage_format == groups[dfb->dfb_id]->storage_format,
+            "storage group and DFB storage_format mismatch");
+    }
     IRModule parameterized = ParameterizeCurrentDeviceTables(mod);
     VerifyCurrentDeviceModule(std::move(parameterized));
     return mod;
@@ -4620,6 +4665,8 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               "Tensor transfer references missing DFB");
         const TensorDescriptor &tensor = tensor_table.at(tensor_id);
         const DFBDescriptor &dfb = dfb_table.at(dfb_id);
+        Check(tensor->storage_format == dfb->storage_format,
+              "Tensor transfer storage_format mismatch");
         Check(call->args.size() == 2,
               "current Tensor transfer requires Tensor/DFB operands only");
         auto starts_attr = call->annotations.Get("tt.starts");
@@ -5158,6 +5205,12 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               auto transport = transport_records.find({pipe_net, record});
               Check(transport != transport_records.end(),
                     "Pipe record operation references missing transport");
+              Check(dfb_table.count(id(call, 2)),
+                    "Pipe record operation references missing DFB");
+              Check(dfb_table.at(id(call, 2))->storage_format ==
+                        dfb_table.at(transport->second->payload_dfb_id)
+                            ->storage_format,
+                    "Pipe record payload storage_format mismatch");
               CoreCoord source = transport->second->src_coord;
               if (record_send) {
                 Check(source->x == x && source->y == y,
@@ -5272,6 +5325,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                                                       "Tensor load ABI index");
                 Check(tensor_table.count(tensor),
                       "Tensor load references a missing Tensor");
+                Check(tensor_table.at(tensor)->storage_format ==
+                          dfb_table.at(resource)->storage_format,
+                      "Tensor transfer storage_format mismatch");
                 LocalKey key = producer_key(resource);
                 Check(copy_issues.emplace(key, std::make_pair(event, true))
                           .second,
@@ -5287,6 +5343,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                                                       "Tensor store ABI index");
                 Check(tensor_table.count(tensor),
                       "Tensor store references a missing Tensor");
+                Check(tensor_table.at(tensor)->storage_format ==
+                          dfb_table.at(resource)->storage_format,
+                      "Tensor transfer storage_format mismatch");
                 use(resource);
                 LocalKey key = consumer_key(resource);
                 Check(copy_issues.emplace(key, std::make_pair(event, false))
@@ -5468,6 +5527,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
                 }
               } else if (call->op.same_as(dfb_local_copy()) ||
                          call->op.same_as(dfb_gather_copy())) {
+                Check(dfb_table.at(id(call, 0))->storage_format ==
+                      dfb_table.at(id(call, 1))->storage_format,
+                      "raw DFB transfer storage_format mismatch");
                 use(id(call, 0));
                 produce(id(call, 1), event, /*partial=*/true);
               } else if (call->op.same_as(dfb_collective_reduce())) {

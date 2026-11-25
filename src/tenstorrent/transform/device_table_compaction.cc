@@ -105,6 +105,7 @@ struct DFBEqual {
     return left->dfb_id == right->dfb_id &&
            left->source_buffer_identity == right->source_buffer_identity &&
            left->element_dtype == right->element_dtype &&
+           left->storage_format == right->storage_format &&
            left->tile_shape.same_as(right->tile_shape) &&
            left->block_shape_in_tiles.same_as(right->block_shape_in_tiles) &&
            left->block_count.same_as(right->block_count) &&
@@ -178,7 +179,7 @@ DFBDescriptor RebuildDFB(const DFBDescriptor &prototype, int64_t identifier,
                        prototype->producer_slot, prototype->producer_domain,
                        prototype->consumer_slot, prototype->consumer_domain,
                        prototype->transaction_count_or_loop_relation,
-                       prototype->source_span);
+                       prototype->source_span, prototype->storage_format);
 }
 
 ffi::Array<DeviceIRDescriptorFamily>
@@ -1232,7 +1233,7 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
         stream->block_shape_in_tiles, stream->block_count, std::nullopt,
         stream->producer_slot, stream->producer_domain, stream->consumer_slot,
         stream->consumer_domain, stream->transaction_count_or_loop_relation,
-        stream->source_span));
+        stream->source_span, stream->storage_format));
   mod = WithAttr(mod, kDFBTableAttr, stream_table);
   mod =
       WithAttr(mod, "tt.transport_table",
