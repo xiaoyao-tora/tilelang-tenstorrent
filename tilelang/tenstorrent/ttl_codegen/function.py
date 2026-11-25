@@ -408,7 +408,7 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
             one = self.bindings.ir.FloatAttr.get(self.bindings.ir.F32Type.get(self.context), 1.0)
             scaler = self.bindings.ttl.fill(scaler_type, one)
             value = self.bindings.ttl.reduce(
-                result_type,
+                self.type_converter.logical_block_type(self.groups[output]),
                 input_value,
                 scaler,
                 reduce_type,
@@ -416,7 +416,7 @@ class TTLFunctionEmitter(TTLStatementEmitterMixin):
             )
         elif kind == "transpose" and len(call.args) == 2:
             value = self.bindings.ttl.transpose(
-                result_type,
+                self.type_converter.logical_block_type(self.groups[output]),
                 self.value_for_dfb_operand(call.args[1]),
             )
         else:

@@ -13,6 +13,7 @@ from tilelang.tenstorrent import codegen, lower_tenstorrent_ir
 from tilelang.tenstorrent.ttl_codegen.artifact import TenstorrentTTLModuleNode, build_module_metadata
 from tilelang.tenstorrent.ttl_codegen.bindings import TTLANG_REVISION, load_bindings
 from tilelang.tenstorrent.ttl_codegen.function import TTLFunctionEmitter
+from tilelang.tenstorrent.ttl_codegen.types import TTLTypeConverter
 from testing.python.tenstorrent.frontend.test_tilelang_tenstorrent_storage_format import program
 
 
@@ -124,6 +125,58 @@ def test_store_and_publish_casts_only_mismatched_bfp(storage_format, value_type,
     ttl.cb_push.assert_called_once_with(cb)
     assert emitter.reserved == {}
     assert emitter.assembled == {}
+
+
+@pytest.mark.parametrize("storage_format", ["bfp_bf8", "bfp_bf4"])
+@pytest.mark.parametrize("kind", ["transpose", "sum", "max"])
+def test_bfp_compute_uses_logical_result_before_publication(storage_format, kind):
+    if importlib.util.find_spec("ttl") is None:
+        pytest.skip(f"requires pinned TT-Lang compiler {TTLANG_REVISION}")
+    bindings = load_bindings()
+    with bindings.ir.Context() as context, bindings.ir.Location.unknown():
+        converter = TTLTypeConverter(bindings, context)
+        group = SimpleNamespace(
+            storage_format=storage_format,
+            element_dtype="bfloat16",
+            tile_shape=(32, 32),
+            block_shape_in_tiles=(2, 2) if kind == "transpose" else (1, 2),
+            block_count=2,
+        )
+        physical_type = converter.block_type(group)
+        module = bindings.ir.Module.create()
+        with bindings.ir.InsertionPoint(module.body):
+            function = bindings.func.FuncOp("compute", ([bindings.ir.Type.parse(BF16_BLOCK), converter.circular_buffer_type(group)], []))
+            block = function.add_entry_block()
+            with bindings.ir.InsertionPoint(block):
+                emitter = SimpleNamespace(
+                    bindings=bindings,
+                    context=context,
+                    type_converter=converter,
+                    groups={0: group},
+                    dfb_id=lambda operand: operand,
+                    value_for_dfb_operand=lambda operand: block.arguments[0],
+                    _annotation_string=lambda call, name: call.annotations[name],
+                    reserved={0: bindings.ttl.cb_reserve(physical_type, block.arguments[1])},
+                    cbs={0: block.arguments[1]},
+                    assembled={},
+                )
+                emitter.store_and_publish = lambda output, value: TTLFunctionEmitter.store_and_publish(emitter, output, value)
+                annotations = {"tt.compute_kind": "transpose" if kind == "transpose" else "reduce"}
+                if kind != "transpose":
+                    annotations.update({"tt.reduce_kind": kind, "tt.reduce_axis": 0})
+                TTLFunctionEmitter.emit_dfb_compute(emitter, SimpleNamespace(args=[0, 1], annotations=annotations))
+                bindings.func.ReturnOp([])
+        assert module.operation.verify()
+        operations = list(block.operations)
+        compute = next(op for op in operations if op.operation.name == f"ttl.{'transpose' if kind == 'transpose' else 'reduce'}")
+        assert compute.result.type == converter.logical_block_type(group)
+        store = next(op for op in operations if op.operation.name == "ttl.store")
+        packed = store.operands[0]
+        assert packed.type == physical_type
+        assert packed.owner.name == "ttl.typecast"
+        assert packed.owner.operands[0] == compute.result
+        assert operations[-2].operation.name == "ttl.cb_push"
+        assert emitter.reserved == {}
 
 
 def test_bfp_tensor_abi_preserves_storage_and_logical_dtype(device, formats):
