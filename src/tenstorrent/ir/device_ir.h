@@ -203,6 +203,7 @@ public:
   int64_t global_arg_index;
   ffi::Array<PrimExpr> shape;
   DataType dtype;
+  ffi::String storage_format;
   ffi::Array<PrimExpr> strides;
   ffi::Array<PrimExpr> tile_shape;
   ffi::Array<PrimExpr> tile_grid_shape;
@@ -227,7 +228,7 @@ public:
                            ffi::String memory_space, ffi::String memory_layout,
                            ffi::Optional<ShardSpec> shard_spec,
                            ffi::String effect, int64_t alias_group,
-                           Span source_span);
+                           Span source_span, ffi::String storage_format = "");
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TensorDescriptor, ffi::ObjectRef,
                                              TensorDescriptorNode);
 };
@@ -277,6 +278,7 @@ public:
   int64_t dfb_id;
   ffi::String source_buffer_identity;
   DataType element_dtype;
+  ffi::String storage_format;
   ffi::Array<PrimExpr> tile_shape;
   ffi::Array<PrimExpr> block_shape_in_tiles;
   PrimExpr block_count;
@@ -303,7 +305,7 @@ public:
                         ffi::String producer_slot, CoreDomain producer_domain,
                         ffi::String consumer_slot, CoreDomain consumer_domain,
                         PrimExpr transaction_count_or_loop_relation,
-                        Span source_span);
+                        Span source_span, ffi::String storage_format = "");
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DFBDescriptor, ffi::ObjectRef,
                                              DFBDescriptorNode);
 };
@@ -315,6 +317,7 @@ public:
       kTVMFFISEqHashKindTreeNode;
   int64_t storage_group_id;
   DataType element_dtype;
+  ffi::String storage_format;
   ffi::Array<PrimExpr> tile_shape;
   ffi::Array<PrimExpr> block_shape_in_tiles;
   PrimExpr block_count;
@@ -340,7 +343,8 @@ public:
       ffi::String producer_slot, CoreDomain producer_domain,
       ffi::String consumer_slot, CoreDomain consumer_domain,
       PrimExpr transaction_count_or_loop_relation,
-      ffi::Optional<TensorStorageBacking> storage_backing, Span source_span);
+      ffi::Optional<TensorStorageBacking> storage_backing, Span source_span,
+      ffi::String storage_format = "");
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DFBStorageGroupDescriptor,
                                              ffi::ObjectRef,
                                              DFBStorageGroupDescriptorNode);
@@ -620,6 +624,7 @@ public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
       kTVMFFISEqHashKindTreeNode;
   ffi::String buffer_id;
+  ffi::String storage_format;
   tirx::Buffer buffer;
   ffi::String kind;
   ffi::Optional<Integer> global_arg_index;
@@ -652,7 +657,8 @@ public:
       ffi::Optional<TensorBacking> tensor_backing,
       ffi::Optional<ffi::String> alias_of, ffi::String tile_shape_origin,
       ffi::String block_count_origin, ffi::String tensor_backing_origin,
-      ffi::String layout_origin, Span source_span);
+      ffi::String layout_origin, Span source_span,
+      ffi::String storage_format = "");
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TTBufferMetadata, ffi::ObjectRef,
                                              TTBufferMetadataNode);
 };

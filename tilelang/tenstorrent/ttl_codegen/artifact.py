@@ -26,6 +26,7 @@ class TensorABI:
     memory_layout: str
     effect: str
     alias_group: int
+    storage_format: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,7 @@ def build_module_metadata(device_mod) -> TTLModuleMetadata:
             memory_layout=str(tensor.memory_layout),
             effect=str(tensor.effect),
             alias_group=int(tensor.alias_group),
+            storage_format=str(getattr(tensor, "storage_format", "")),
         )
         for tensor in attrs["tt.tensor_table"]
     )

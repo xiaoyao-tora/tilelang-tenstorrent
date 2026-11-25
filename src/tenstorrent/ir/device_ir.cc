@@ -312,12 +312,14 @@ TensorDescriptor::TensorDescriptor(
     ffi::Array<PrimExpr> strides, ffi::Array<PrimExpr> tile_shape,
     ffi::Array<PrimExpr> tile_grid_shape, ffi::String memory_space,
     ffi::String memory_layout, ffi::Optional<ShardSpec> shard_spec,
-    ffi::String effect, int64_t alias_group, Span source_span) {
+    ffi::String effect, int64_t alias_group, Span source_span,
+    ffi::String storage_format) {
   ffi::ObjectPtr<TensorDescriptorNode> node =
       ffi::make_object<TensorDescriptorNode>();
   node->global_arg_index = global_arg_index;
   node->shape = std::move(shape);
   node->dtype = dtype;
+  node->storage_format = std::move(storage_format);
   node->strides = std::move(strides);
   node->tile_shape = std::move(tile_shape);
   node->tile_grid_shape = std::move(tile_grid_shape);
@@ -336,6 +338,7 @@ void TensorDescriptorNode::RegisterReflection() {
       .def_ro("global_arg_index", &TensorDescriptorNode::global_arg_index)
       .def_ro("shape", &TensorDescriptorNode::shape)
       .def_ro("dtype", &TensorDescriptorNode::dtype)
+      .def_ro("storage_format", &TensorDescriptorNode::storage_format)
       .def_ro("strides", &TensorDescriptorNode::strides)
       .def_ro("tile_shape", &TensorDescriptorNode::tile_shape)
       .def_ro("tile_grid_shape", &TensorDescriptorNode::tile_grid_shape)
@@ -353,10 +356,12 @@ DFBDescriptor::DFBDescriptor(
     PrimExpr block_count, ffi::Optional<TensorBacking> tensor_backing,
     ffi::String producer_slot, CoreDomain producer_domain,
     ffi::String consumer_slot, CoreDomain consumer_domain,
-    PrimExpr transaction_count_or_loop_relation, Span source_span) {
+    PrimExpr transaction_count_or_loop_relation, Span source_span,
+    ffi::String storage_format) {
   ffi::ObjectPtr<DFBDescriptorNode> node =
       ffi::make_object<DFBDescriptorNode>();
   node->dfb_id = dfb_id;
+  node->storage_format = std::move(storage_format);
   node->source_buffer_identity = std::move(source_buffer_identity);
   node->element_dtype = element_dtype;
   node->tile_shape = std::move(tile_shape);
@@ -380,6 +385,7 @@ void DFBDescriptorNode::RegisterReflection() {
       .def_ro("source_buffer_identity",
               &DFBDescriptorNode::source_buffer_identity)
       .def_ro("element_dtype", &DFBDescriptorNode::element_dtype)
+      .def_ro("storage_format", &DFBDescriptorNode::storage_format)
       .def_ro("tile_shape", &DFBDescriptorNode::tile_shape)
       .def_ro("block_shape_in_tiles", &DFBDescriptorNode::block_shape_in_tiles)
       .def_ro("block_count", &DFBDescriptorNode::block_count)
@@ -399,9 +405,11 @@ DFBStorageGroupDescriptor::DFBStorageGroupDescriptor(
     PrimExpr block_count, ffi::String producer_slot, CoreDomain producer_domain,
     ffi::String consumer_slot, CoreDomain consumer_domain,
     PrimExpr transaction_count_or_loop_relation,
-    ffi::Optional<TensorStorageBacking> storage_backing, Span source_span) {
+    ffi::Optional<TensorStorageBacking> storage_backing, Span source_span,
+    ffi::String storage_format) {
   auto node = ffi::make_object<DFBStorageGroupDescriptorNode>();
   node->storage_group_id = storage_group_id;
+  node->storage_format = std::move(storage_format);
   node->element_dtype = element_dtype;
   node->tile_shape = std::move(tile_shape);
   node->block_shape_in_tiles = std::move(block_shape_in_tiles);
@@ -422,6 +430,7 @@ void DFBStorageGroupDescriptorNode::RegisterReflection() {
       .def_ro("storage_group_id",
               &DFBStorageGroupDescriptorNode::storage_group_id)
       .def_ro("element_dtype", &DFBStorageGroupDescriptorNode::element_dtype)
+      .def_ro("storage_format", &DFBStorageGroupDescriptorNode::storage_format)
       .def_ro("tile_shape", &DFBStorageGroupDescriptorNode::tile_shape)
       .def_ro("block_shape_in_tiles",
               &DFBStorageGroupDescriptorNode::block_shape_in_tiles)
@@ -552,10 +561,11 @@ TTBufferMetadata::TTBufferMetadata(
     ffi::Optional<TensorBacking> tensor_backing,
     ffi::Optional<ffi::String> alias_of, ffi::String tile_shape_origin,
     ffi::String block_count_origin, ffi::String tensor_backing_origin,
-    ffi::String layout_origin, Span source_span) {
+    ffi::String layout_origin, Span source_span, ffi::String storage_format) {
   ffi::ObjectPtr<TTBufferMetadataNode> node =
       ffi::make_object<TTBufferMetadataNode>();
   node->buffer_id = std::move(buffer_id);
+  node->storage_format = std::move(storage_format);
   node->buffer = std::move(buffer);
   node->kind = std::move(kind);
   node->global_arg_index = std::move(global_arg_index);
@@ -578,6 +588,7 @@ void TTBufferMetadataNode::RegisterReflection() {
   namespace refl = ffi::reflection;
   refl::ObjectDef<TTBufferMetadataNode>()
       .def_ro("buffer_id", &TTBufferMetadataNode::buffer_id)
+      .def_ro("storage_format", &TTBufferMetadataNode::storage_format)
       .def_ro("buffer", &TTBufferMetadataNode::buffer)
       .def_ro("kind", &TTBufferMetadataNode::kind)
       .def_ro("global_arg_index", &TTBufferMetadataNode::global_arg_index)
@@ -728,13 +739,14 @@ TVM_FFI_STATIC_INIT_BLOCK() {
               ffi::Array<PrimExpr> tile_shape,
               ffi::Array<PrimExpr> tile_grid_shape, ffi::String memory_space,
               ffi::String memory_layout, ffi::Optional<ShardSpec> shard_spec,
-              ffi::String effect, int64_t alias_group, Span source_span) {
+              ffi::String effect, int64_t alias_group, Span source_span,
+              ffi::String storage_format) {
              return TensorDescriptor(
                  global_arg_index, std::move(shape), dtype, std::move(strides),
                  std::move(tile_shape), std::move(tile_grid_shape),
                  std::move(memory_space), std::move(memory_layout),
                  std::move(shard_spec), std::move(effect), alias_group,
-                 std::move(source_span));
+                 std::move(source_span), std::move(storage_format));
            })
       .def("tl.tenstorrent.DFBDescriptor",
            [](int64_t dfb_id, ffi::String source_buffer_identity,
@@ -743,7 +755,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
               ffi::Optional<TensorBacking> tensor_backing,
               ffi::String producer_slot, CoreDomain producer_domain,
               ffi::String consumer_slot, CoreDomain consumer_domain,
-              PrimExpr transaction_count_or_loop_relation, Span source_span) {
+              PrimExpr transaction_count_or_loop_relation, Span source_span,
+              ffi::String storage_format) {
              return DFBDescriptor(
                  dfb_id, std::move(source_buffer_identity), element_dtype,
                  std::move(tile_shape), std::move(block_shape_in_tiles),
@@ -751,7 +764,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(producer_slot), std::move(producer_domain),
                  std::move(consumer_slot), std::move(consumer_domain),
                  std::move(transaction_count_or_loop_relation),
-                 std::move(source_span));
+                 std::move(source_span), std::move(storage_format));
            })
       .def("tl.tenstorrent.DFBStorageGroupDescriptor",
            [](int64_t storage_group_id, DataType element_dtype,
@@ -761,14 +774,15 @@ TVM_FFI_STATIC_INIT_BLOCK() {
               ffi::String consumer_slot, CoreDomain consumer_domain,
               PrimExpr transaction_count_or_loop_relation,
               ffi::Optional<TensorStorageBacking> storage_backing,
-              Span source_span) {
+              Span source_span, ffi::String storage_format) {
              return DFBStorageGroupDescriptor(
                  storage_group_id, element_dtype, std::move(tile_shape),
                  std::move(block_shape_in_tiles), std::move(block_count),
                  std::move(producer_slot), std::move(producer_domain),
                  std::move(consumer_slot), std::move(consumer_domain),
                  std::move(transaction_count_or_loop_relation),
-                 std::move(storage_backing), std::move(source_span));
+                 std::move(storage_backing), std::move(source_span),
+                 std::move(storage_format));
            })
       .def("tl.tenstorrent.IsSupportedAccumulatorDTypeTriple",
            IsSupportedAccumulatorDTypeTriple)
@@ -839,7 +853,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
               ffi::Optional<ffi::String> alias_of,
               ffi::String tile_shape_origin, ffi::String block_count_origin,
               ffi::String tensor_backing_origin, ffi::String layout_origin,
-              Span source_span) {
+              Span source_span, ffi::String storage_format) {
              return TTBufferMetadata(
                  std::move(buffer_id), std::move(buffer), std::move(kind),
                  std::move(global_arg_index), std::move(tile_shape),
@@ -848,7 +862,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(tensor_backing), std::move(alias_of),
                  std::move(tile_shape_origin), std::move(block_count_origin),
                  std::move(tensor_backing_origin), std::move(layout_origin),
-                 std::move(source_span));
+                 std::move(source_span), std::move(storage_format));
            })
       .def("tl.tenstorrent.DeviceModuleMetadata",
            [](int64_t device_ir_version, ffi::String target_arch,

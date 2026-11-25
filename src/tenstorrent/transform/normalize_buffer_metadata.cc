@@ -30,6 +30,7 @@ constexpr const char *kAllocBufferAnnotations = "tl.alloc_buffer_annotations";
 constexpr const char *kDFBBlockCount = "tt.dfb_block_count";
 constexpr const char *kTileShape = "tt.tile_shape";
 constexpr const char *kTensorBacked = "tt.tensor_backed";
+constexpr const char *kTensorStorageFormats = "tt.tensor_storage_formats";
 
 using BufferSet =
     std::unordered_set<Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
@@ -127,6 +128,7 @@ ffi::String ClassifyBuffer(const Buffer &buffer) {
 }
 
 struct ParsedAnnotations {
+  ffi::String storage_format;
   ffi::Array<PrimExpr> tile_shape;
   ffi::Optional<PrimExpr> block_count;
   ffi::String tile_shape_origin{"unset"};
@@ -139,6 +141,19 @@ ParseAnnotations(const Buffer &buffer,
   ParsedAnnotations result;
   for (const auto &[key, value] : annotations) {
     const std::string name = key;
+    if (name == "tt.storage_format") {
+      auto format = value.as<ffi::String>();
+      if (!format.has_value())
+        ThrowMalformed("'tt.storage_format' must be a string");
+      result.storage_format = format.value();
+      if (result.storage_format != "" && result.storage_format != "bfp_bf8" &&
+          result.storage_format != "bfp_bf4")
+        ThrowUnsupported("unknown storage_format '" +
+                         std::string(result.storage_format) + "'");
+      if (!result.storage_format.empty() && buffer->dtype != DataType::BFloat(16))
+        ThrowMalformed("BFP storage_format requires logical bfloat16");
+      continue;
+    }
     if (name == kTensorBacked) {
       ThrowUnsupported("'tt.tensor_backed' is deferred beyond Phase 1");
     }
@@ -184,6 +199,10 @@ PrimFunc NormalizeBufferMetadata(PrimFunc func) {
   ffi::Array<TTBufferMetadata> table;
   BufferSet seen_buffers;
   VarStringMap first_id_by_data;
+  auto tensor_formats =
+      func->GetAttr<ffi::Map<Var, ffi::Any>>(kTensorStorageFormats)
+          .value_or(ffi::Map<Var, ffi::Any>{});
+  std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual> tensor_data;
 
   for (size_t index = 0; index < func->params.size(); ++index) {
     const Var &parameter = func->params[index];
@@ -193,6 +212,13 @@ PrimFunc NormalizeBufferMetadata(PrimFunc func) {
                      "' has no Buffer");
     }
     const Buffer &buffer = (*buffer_it).second;
+    tensor_data.insert(buffer->data);
+    ParsedAnnotations annotations;
+    auto format = tensor_formats.find(buffer->data);
+    if (format != tensor_formats.end()) {
+      annotations = ParseAnnotations(
+          buffer, {{"tt.storage_format", (*format).second}});
+    }
     if (!seen_buffers.insert(buffer).second) {
       ThrowMalformed("the same Buffer object is bound to multiple ABI "
                      "parameters");
@@ -209,7 +235,13 @@ PrimFunc NormalizeBufferMetadata(PrimFunc func) {
         buffer_id, buffer, "tensor", Integer(index), {}, {}, "",
         /*shard_spec=*/std::nullopt, /*dfb_block_count=*/std::nullopt,
         /*tensor_backing=*/std::nullopt, std::move(alias_of), "unset", "unset",
-        "unset", "unset", buffer->span));
+        "unset", "unset", buffer->span, annotations.storage_format));
+  }
+
+  for (const auto &[data, format] : tensor_formats) {
+    if (!tensor_data.count(data))
+      ThrowMalformed("tt.tensor_storage_formats references a non-parameter "
+                     "Buffer data Var");
   }
 
   std::vector<AllocationRecord> allocations =
@@ -233,7 +265,8 @@ PrimFunc NormalizeBufferMetadata(PrimFunc func) {
         ParseAnnotations(buffer, allocations[index].annotations);
     if (kind != "logical_dfb_candidate" &&
         (!annotations.tile_shape.empty() ||
-         annotations.block_count.has_value())) {
+         annotations.block_count.has_value() ||
+         !annotations.storage_format.empty())) {
       ThrowMalformed("Tenstorrent DFB annotations are attached to non-shared "
                      "buffer '" +
                      std::string(buffer->name) + "'");
@@ -245,9 +278,10 @@ PrimFunc NormalizeBufferMetadata(PrimFunc func) {
         /*tensor_backing=*/std::nullopt, std::move(alias_of),
         std::move(annotations.tile_shape_origin),
         std::move(annotations.block_count_origin), "unset", "unset",
-        buffer->span));
+        buffer->span, annotations.storage_format));
   }
 
+  func = WithoutAttr(std::move(func), kTensorStorageFormats);
   return WithAttr(std::move(func), kBufferMetadataTableAttr, std::move(table));
 }
 

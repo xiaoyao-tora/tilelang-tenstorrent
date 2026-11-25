@@ -35,10 +35,12 @@ from .proxy import Tensor, ptr as _ptr_sentinel
 _ALLOC_BUFFER_ANNOTATIONS = "tl.alloc_buffer_annotations"
 _TT_DFB_BLOCK_COUNT = "tt.dfb_block_count"
 _TT_TILE_SHAPE = "tt.tile_shape"
+_TT_STORAGE_FORMAT = "tt.storage_format"
 _TT_TENSOR_BACKED = "tt.tensor_backed"
 _SUPPORTED_TT_ALLOC_SHARED_ANNOTATIONS = {
     _TT_DFB_BLOCK_COUNT,
     _TT_TILE_SHAPE,
+    _TT_STORAGE_FORMAT,
 }
 
 
@@ -92,6 +94,15 @@ def _normalize_alloc_shared_annotations(
     if buffer.scope() not in ("shared", "shared.dyn"):
         raise ValueError("Tenstorrent DFB metadata requires a shared or shared.dyn buffer.")
 
+    if _TT_STORAGE_FORMAT in normalized:
+        storage_format = normalized[_TT_STORAGE_FORMAT]
+        if not isinstance(storage_format, str):
+            raise TypeError("`tt.storage_format` must be a string.")
+        if storage_format not in ("", "bfp_bf8", "bfp_bf4"):
+            raise ValueError(f"Unsupported Tenstorrent storage_format: {storage_format!r}.")
+        if storage_format and str(buffer.dtype) != "bfloat16":
+            raise ValueError("BFP storage_format requires logical bfloat16.")
+
     if _TT_DFB_BLOCK_COUNT in normalized:
         block_count = _compile_time_int(normalized[_TT_DFB_BLOCK_COUNT], _TT_DFB_BLOCK_COUNT)
         if not 1 <= block_count <= 32:
@@ -139,8 +150,9 @@ def alloc_shared(
         dtype (str): The data type of the buffer (e.g., 'float32', 'int32')
         scope (str, optional): The memory scope. Defaults to "shared.dyn"
         annotations (Mapping, optional): Per-buffer allocation metadata. The
-            Phase 1 Tenstorrent path supports ``tt.dfb_block_count`` and
-            ``tt.tile_shape``.
+            Tenstorrent path supports ``tt.dfb_block_count``, ``tt.tile_shape``
+            and ``tt.storage_format`` (``""``, ``"bfp_bf8"``, ``"bfp_bf4"``).
+            BFP storage requires logical ``bfloat16``.
 
     Returns:
         T.Buffer: A TVM buffer object allocated in shared memory

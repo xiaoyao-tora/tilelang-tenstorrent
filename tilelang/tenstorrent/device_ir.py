@@ -264,6 +264,7 @@ class TensorDescriptor(Node):
         effect: str,
         alias_group: int,
         source_span: Span,
+        storage_format: str = "",
     ):
         self.__init_handle_by_constructor__(
             _ffi_api.TensorDescriptor,
@@ -279,6 +280,7 @@ class TensorDescriptor(Node):
             effect,
             int(alias_group),
             source_span,
+            storage_format,
         )
 
 
@@ -335,6 +337,7 @@ class DFBDescriptor(Node):
         consumer_domain: CoreDomain,
         transaction_count_or_loop_relation,
         source_span: Span,
+        storage_format: str = "",
     ):
         self.__init_handle_by_constructor__(
             _ffi_api.DFBDescriptor,
@@ -351,6 +354,7 @@ class DFBDescriptor(Node):
             consumer_domain,
             _expr(transaction_count_or_loop_relation),
             source_span,
+            storage_format,
         )
 
 
@@ -372,6 +376,7 @@ class DFBStorageGroupDescriptor(Node):
         transaction_count_or_loop_relation,
         storage_backing: TensorStorageBacking | None,
         source_span: Span,
+        storage_format: str = "",
     ):
         self.__init_handle_by_constructor__(
             _ffi_api.DFBStorageGroupDescriptor,
@@ -387,6 +392,7 @@ class DFBStorageGroupDescriptor(Node):
             _expr(transaction_count_or_loop_relation),
             storage_backing,
             source_span,
+            storage_format,
         )
 
 
@@ -548,6 +554,7 @@ class TTBufferMetadata(Node):
         tensor_backing_origin: str = "unset",
         layout_origin: str = "unset",
         source_span: Span | None = None,
+        storage_format: str = "",
     ):
         self.__init_handle_by_constructor__(
             _ffi_api.TTBufferMetadata,
@@ -567,6 +574,7 @@ class TTBufferMetadata(Node):
             tensor_backing_origin,
             layout_origin,
             source_span,
+            storage_format,
         )
 
 

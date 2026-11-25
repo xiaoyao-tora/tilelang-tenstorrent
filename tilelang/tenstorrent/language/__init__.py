@@ -7,6 +7,7 @@ from tilelang.language.common import __all__ as _COMMON_ALL
 from tilelang.language.loop import Tiles as Tiles
 
 from . import comm as comm
+from .annotations import annotate_storage_format as annotate_storage_format
 from .copy import copy as copy
 from .reduce import reduce as reduce
 from .reduce import reduce_max as reduce_max
@@ -15,7 +16,7 @@ from .reduce import reduce_sum as reduce_sum
 from . import script as _script  # Register internal T.tt TVMScript constructors.
 
 __tilelang_dialect__ = "tenstorrent"
-__all__ = tuple(dict.fromkeys((*_COMMON_ALL, "Tiles", "comm")))
+__all__ = tuple(dict.fromkeys((*_COMMON_ALL, "Tiles", "comm", "annotate_storage_format")))
 
 del _COMMON_ALL
 del _script

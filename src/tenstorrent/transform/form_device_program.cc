@@ -225,7 +225,7 @@ ffi::Array<TensorDescriptor> BuildTensorTable(
         metadata->tile_shape, metadata->tile_grid_shape, "dram",
         metadata->memory_layout, metadata->shard_spec,
         effects[expected_tensor_index], global_arg_index,
-        std::move(source_span)));
+        std::move(source_span), metadata->storage_format));
     ++expected_tensor_index;
   }
   if (expected_tensor_index != func->params.size()) {
@@ -617,7 +617,8 @@ public:
                                       ? resource.metadata->buffer_id
                                       : resource.storage_identity;
     return std::string(identity) + "|" + std::string(resource.producer) + "|" +
-           std::string(resource.consumer);
+           std::string(resource.consumer) + "|" +
+           std::string(resource.metadata->storage_format);
   }
   bool ResourceIsLive(int64_t id) const { return live_.count(id) != 0; }
   int64_t AccumulatorCount() const { return accumulators_.size(); }
@@ -984,7 +985,7 @@ public:
           resource.producer, domain, resource.consumer, domain,
           Integer(resource.transaction_count),
           RequireSourceSpan(metadata->source_span, frontend_->span,
-                            "DFB generation")));
+                            "DFB generation"), metadata->storage_format));
     }
     return result;
   }
@@ -4357,6 +4358,7 @@ struct LogicalStreamPlan {
 bool SameLogicalStreamContract(const DFBStorageGroupDescriptor &stream,
                                const DFBDescriptor &resource) {
   return stream->element_dtype == resource->element_dtype &&
+        stream->storage_format == resource->storage_format &&
          ffi::StructuralEqual()(stream->tile_shape, resource->tile_shape) &&
          ffi::StructuralEqual()(stream->block_shape_in_tiles,
                                 resource->block_shape_in_tiles) &&
@@ -4399,7 +4401,7 @@ BuildLogicalStreamPlan(const ffi::Array<DFBDescriptor> &resources,
           resource->producer_slot, resource->producer_domain,
           resource->consumer_slot, resource->consumer_domain,
           resource->transaction_count_or_loop_relation, std::nullopt,
-          resource->source_span));
+          resource->source_span, resource->storage_format));
     } else if (!SameLogicalStreamContract(result.descriptors[stream_id],
                                           resource)) {
       ThrowMalformed("logical stream transactions disagree on capacity, "
@@ -4449,7 +4451,8 @@ void FinalizeLogicalStreamTransactionCounts(
                        stream->block_count, stream->producer_slot,
                        stream->producer_domain, stream->consumer_slot,
                        stream->consumer_domain, Integer(maxima[stream_id]),
-                       stream->storage_backing, stream->source_span));
+                       stream->storage_backing, stream->source_span,
+                       stream->storage_format));
   }
 }
 
@@ -4542,7 +4545,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                               ? dfb->transaction_count_or_loop_relation
                               : dfb->transaction_count_or_loop_relation *
                                     transaction_relation,
-                          dfb->source_span));
+                          dfb->source_span, dfb->storage_format));
       } else if (resource_storage_keys.at(global_id) != storage_key) {
         ThrowMalformed("one logical DFB has inconsistent storage identity");
       }

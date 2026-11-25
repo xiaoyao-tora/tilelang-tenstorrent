@@ -57,7 +57,14 @@ class TTNNKernelAdapter(BaseKernelAdapter):
         self._call_lock = threading.Lock()
         super().__init__(func_or_mod, params=params, result_idx=normalized)
 
-    def _dtype(self, dtype: str):
+    def _dtype(self, dtype: str, storage_format: str = ""):
+        if storage_format:
+            if dtype != "bfloat16":
+                raise ValueError("BFP storage_format requires logical bfloat16")
+            formats = {"bfp_bf8": "bfloat8_b", "bfp_bf4": "bfloat4_b"}
+            if storage_format not in formats:
+                raise NotImplementedError(f"TTNN runtime storage_format {storage_format!r} is not supported")
+            return getattr(self._ttnn, formats[storage_format])
         mapping = {
             "bfloat16": self._ttnn.bfloat16,
             "float32": self._ttnn.float32,
@@ -85,8 +92,14 @@ class TTNNKernelAdapter(BaseKernelAdapter):
             raise ValueError(f"Tenstorrent argument {index} is not device-resident")
         if tuple(map(int, tensor.shape)) != abi.shape:
             raise ValueError(f"Tenstorrent argument {index} shape mismatch: expected {abi.shape}, got {tuple(tensor.shape)}")
-        if tensor.dtype != self._dtype(abi.dtype):
-            raise ValueError(f"Tenstorrent argument {index} dtype mismatch: expected {abi.dtype}, got {tensor.dtype}")
+        expected_dtype = self._dtype(abi.dtype, abi.storage_format)
+        if tensor.dtype != expected_dtype:
+            if not abi.storage_format:
+                raise ValueError(f"Tenstorrent argument {index} dtype mismatch: expected {abi.dtype}, got {tensor.dtype}")
+            raise ValueError(
+                f"Tenstorrent argument {index} dtype mismatch: expected {expected_dtype} "
+                f"(logical dtype {abi.dtype}, storage_format {abi.storage_format!r}), got {tensor.dtype}"
+            )
         if tensor.layout != self._ttnn.TILE_LAYOUT:
             raise ValueError(f"Tenstorrent argument {index} must use ttnn.TILE_LAYOUT")
         get_tile = getattr(tensor, "get_tile", None)
@@ -139,7 +152,7 @@ class TTNNKernelAdapter(BaseKernelAdapter):
             raise NotImplementedError("TTNN output allocation currently requires interleaved Tensor layout")
         return self._ttnn.empty(
             abi.shape,
-            dtype=self._dtype(abi.dtype),
+            dtype=self._dtype(abi.dtype, abi.storage_format),
             layout=self._ttnn.TILE_LAYOUT,
             device=device,
             memory_config=self._memory_config(abi.memory_space),
