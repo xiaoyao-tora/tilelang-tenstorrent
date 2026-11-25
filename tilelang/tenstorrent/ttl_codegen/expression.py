@@ -122,9 +122,14 @@ class ExpressionEmitter:
                 raise NotImplementedError(
                     "pinned TT-Lang cannot lower BF16 broadcast in a kernel that requires 32-bit destination registers"
                 )
+            operand = self.emit(expr.args[0])
+            target_shape = tuple(int(extent) for extent in self.shape)
+            if tuple(int(extent) for extent in operand.type.shape) == target_shape:
+                # Identity broadcast: the operand already spans the result block.
+                return operand
             dims_attr = self.b.ir.DenseI64ArrayAttr.get([int(axis) for axis in expr.args[1:]])
             shape_attr = self.b.ir.DenseI64ArrayAttr.get(self.shape)
-            return ttl.block_broadcast(self.tensor_type(expr.dtype), self.emit(expr.args[0]), dims_attr, shape_attr)
+            return ttl.block_broadcast(self.tensor_type(expr.dtype), operand, dims_attr, shape_attr)
         operation = _UNARY[expr.op.name]
         value = self.emit(expr.args[0])
         if operation == "log2":
